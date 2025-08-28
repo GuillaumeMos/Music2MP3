@@ -3,6 +3,8 @@ import os
 import csv
 import platform
 import tempfile
+import threading
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
@@ -28,6 +30,11 @@ class Spotify2MP3GUI:
         self._loaded_playlist_name_from_spotify: str | None = None
         self.config = load_config()
 
+        # worker state (thread + queue pour UI)
+        self._worker: threading.Thread | None = None
+        self._uiq: queue.Queue | None = None
+        self._worker_done = False
+
         # default directory
         if platform.system() == "Windows":
             self.last_directory = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -50,8 +57,7 @@ class Spotify2MP3GUI:
                 icon_path = resource_path('icon.ico')
                 self.root.iconbitmap(icon_path)
         except Exception:
-            # no icon available
-            pass
+            pass  # pas d'icône dispo
 
     def _build_ui(self):
         instr = tk.Label(
@@ -145,7 +151,7 @@ class Spotify2MP3GUI:
             self.spotify_load_btn.config(state=tk.DISABLED)
             self.status_label.config(text='Ouverture du navigateur pour autorisation Spotify…')
 
-            # Auth PKCE (scopes pour playlists privées/collab)
+            # Auth PKCE
             auth = PKCEAuth(
                 client_id=client_id,
                 redirect_uri="http://127.0.0.1:8765/callback",
@@ -154,7 +160,7 @@ class Spotify2MP3GUI:
             sp = SpotifyClient(token_supplier=auth.get_token)
 
             self.status_label.config(text='Récupération de la playlist Spotify…')
-            rows, name = sp.fetch_playlist(pid)  # <-- version "simple" (pas d’audio-features/artists)
+            rows, name = sp.fetch_playlist(pid)  # version simple (pas d’audio-features)
             if not rows:
                 messagebox.showerror('Erreur', 'Aucune piste trouvée.')
                 return
@@ -177,7 +183,6 @@ class Spotify2MP3GUI:
             self.update_convert_button_state()
 
         except Exception as e:
-            # Affiche le message d'erreur brut (utile si token expiré)
             messagebox.showerror('Erreur Spotify', str(e))
         finally:
             self.root.config(cursor='')
@@ -235,33 +240,92 @@ class Spotify2MP3GUI:
         self.convert_button.config(state=tk.NORMAL if ok else tk.DISABLED)
         self.clear_button.config(state=tk.NORMAL if self.csv_path else tk.DISABLED)
 
+    # ------------------ Non-blocking conversion (worker thread) ------------------
+
     def start_conversion(self):
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Erreur', 'Sélectionne un CSV et un dossier de sortie.')
             return
 
+        # Prépare l’UI
         self.convert_button.config(state=tk.DISABLED)
         self.clear_button.config(state=tk.DISABLED)
+        self.folder_button.config(state=tk.DISABLED)
+        self.spotify_load_btn.config(state=tk.DISABLED)
         self.root.config(cursor='watch')
+        self.status_label.config(text='Démarrage de la conversion…')
+        self.progress.configure(value=0)
 
+        # Queue pour messages UI + thread de fond
+        self._uiq = queue.Queue()
+        self._worker_done = False
+        self._worker = threading.Thread(target=self._run_conversion_worker, daemon=True)
+        self._worker.start()
+
+        # Lancer le polling UI
+        self.root.after(100, self._poll_worker_queue)
+
+    def _run_conversion_worker(self):
+        """
+        Thread de fond : lance Converter.convert_from_csv et envoie des events dans la queue.
+        NE JAMAIS toucher aux widgets Tk dans ce thread !
+        """
         try:
             conv = Converter(
                 config=self.config,
-                status_cb=lambda s: self.status_label.config(text=s),
-                progress_cb=lambda cur, maxi: (
-                    self.progress.configure(maximum=maxi, value=cur),
-                    self.root.update_idletasks()
-                )
+                status_cb=lambda s: self._uiq.put(('status', s)),
+                progress_cb=lambda cur, maxi: self._uiq.put(('progress', (cur, maxi)))
             )
             playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
             out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
-            self.last_output_dir = out_dir
-            self.progress['value'] = self.progress['maximum']
-            self.status_label.config(text='✅ Conversion terminée')
-            self.root.bell()
+            self._uiq.put(('done', out_dir))
         except Exception as e:
-            messagebox.showerror('Erreur', f'Erreur inattendue: {e}')
-        finally:
-            self.root.config(cursor='')
-            self.convert_button.config(state=tk.NORMAL)
-            self.clear_button.config(state=tk.NORMAL)
+            self._uiq.put(('error', str(e)))
+
+    def _poll_worker_queue(self):
+        """
+        Récupère les messages du worker et met à jour l’UI sur le thread principal.
+        """
+        if not self._uiq:
+            return
+
+        try:
+            while True:
+                kind, payload = self._uiq.get_nowait()
+                if kind == 'status':
+                    self.status_label.config(text=payload)
+                elif kind == 'progress':
+                    cur, maxi = payload
+                    # initialise max si besoin
+                    if self.progress['maximum'] != maxi:
+                        self.progress.configure(maximum=maxi)
+                    self.progress.configure(value=cur)
+                elif kind == 'done':
+                    self._worker_done = True
+                    self.last_output_dir = payload
+                    self.progress.configure(value=self.progress['maximum'])
+                    self.status_label.config(text='✅ Conversion terminée')
+                    self._reset_ui_after_worker()
+                    self.root.bell()
+                elif kind == 'error':
+                    self._worker_done = True
+                    messagebox.showerror('Erreur', f'Erreur inattendue: {payload}')
+                    self._reset_ui_after_worker()
+        except queue.Empty:
+            pass
+
+        # Continuer à poll tant que le thread est vivant et pas "done"
+        if self._worker and self._worker.is_alive() and not self._worker_done:
+            self.root.after(100, self._poll_worker_queue)
+        else:
+            # thread fini mais pas d’événement "done"/"error" (cas rare)
+            if not self._worker_done:
+                self._reset_ui_after_worker()
+
+    def _reset_ui_after_worker(self):
+        self.root.config(cursor='')
+        self.convert_button.config(state=tk.NORMAL)
+        self.clear_button.config(state=tk.NORMAL)
+        self.folder_button.config(state=tk.NORMAL)
+        self.spotify_load_btn.config(state=tk.NORMAL)
+        # on laisse la progressbar là où elle est
