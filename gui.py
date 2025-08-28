@@ -157,68 +157,90 @@ class Spotify2MP3GUI:
         if not open_folder(target):
             messagebox.showerror('Erreur', 'Aucun dossier valide à ouvrir.')
 
-    def load_from_spotify_link_wrapper(self):
-        """
-        Auth PKCE (pas de secret), charge la playlist (privée/publique),
-        génère un CSV temporaire et branche self.csv_path sur le pipeline.
-        """
-        url = self.spotify_entry.get().strip()
-        pid = SpotifyClient.extract_playlist_id(url)
-        if not pid:
-            messagebox.showerror('Erreur', 'Lien de playlist invalide.')
+def load_from_spotify_link_wrapper(self):
+    """
+    Auth PKCE (pas de secret), charge la playlist (privée/publique),
+    génère un CSV TEMPORAIRE enrichi (colonnes complètes) et branche self.csv_path.
+    Nécessite:
+      - spotify_auth.PKCEAuth
+      - spotify_api.SpotifyClient.fetch_playlist_detailed(...)
+      - config.json avec "spotify_client_id"
+    """
+    import tempfile, os, csv
+    from tkinter import messagebox
+    from spotify_auth import PKCEAuth
+    from spotify_api import SpotifyClient
+
+    url = self.spotify_entry.get().strip()
+    pid = SpotifyClient.extract_playlist_id(url)
+    if not pid:
+        messagebox.showerror('Erreur', 'Lien de playlist invalide.')
+        return
+
+    client_id = self.config.get('spotify_client_id')
+    if not client_id:
+        messagebox.showerror(
+            'Manque Client ID',
+            'Ajoute "spotify_client_id" dans config.json (PKCE ne nécessite pas de secret).'
+        )
+        return
+
+    try:
+        # UI: busy
+        self.root.config(cursor='watch')
+        self.convert_button.config(state=tk.DISABLED)
+        self.clear_button.config(state=tk.DISABLED)
+        self.spotify_load_btn.config(state=tk.DISABLED)
+        self.status_label.config(text='Ouverture du navigateur pour autorisation Spotify…')
+
+        # Auth PKCE (scopes pour playlists privées/collab)
+        auth = PKCEAuth(
+            client_id=client_id,
+            redirect_uri="http://127.0.0.1:8765/callback",
+            scopes=["playlist-read-private", "playlist-read-collaborative"]
+        )
+        sp = SpotifyClient(token_supplier=auth.get_token)
+
+        # Récup détaillée (items + audio-features + genres artistes)
+        self.status_label.config(text='Récupération détaillée de la playlist Spotify…')
+        rows, name = sp.fetch_playlist_detailed(pid)
+        if not rows:
+            messagebox.showerror('Erreur', 'Aucune piste trouvée.')
             return
 
-        client_id = self.config.get('spotify_client_id')
-        if not client_id:
-            messagebox.showerror(
-                'Manque Client ID',
-                'Ajoute "spotify_client_id" dans config.json (PKCE ne nécessite pas de secret).'
-            )
-            return
+        # Écrire le CSV TEMPORAIRE avec les colonnes complètes (comme ton exemple)
+        fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv')
+        os.close(fd)
+        fieldnames = [
+            "Track URI","Track Name","Album Name","Artist Name(s)","Release Date","Duration (ms)",
+            "Popularity","Explicit","Added By","Added At","Genres","Record Label",
+            "Danceability","Energy","Key","Loudness","Mode","Speechiness","Acousticness",
+            "Instrumentalness","Liveness","Valence","Tempo","Time Signature"
+        ]
+        with open(tmp, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            w.writeheader()
+            w.writerows(rows)
 
-        try:
-            self.root.config(cursor='watch')
-            self.convert_button.config(state=tk.DISABLED)
-            self.clear_button.config(state=tk.DISABLED)
-            self.spotify_load_btn.config(state=tk.DISABLED)
-            self.status_label.config(text='Ouverture du navigateur pour autorisation Spotify…')
+        # Brancher le CSV généré au pipeline existant
+        self.csv_path = tmp
+        self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
+        self.drop_label.config(text=f'CSV (généré) : {os.path.basename(tmp)}')
+        self.drop_frame.config(bg=LOADED_DROP_BG)
+        self.drop_label.config(bg=LOADED_DROP_BG)
+        self.status_label.config(
+            text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({len(rows)} titres)'
+        )
+        self.update_convert_button_state()
 
-            # Auth PKCE (scopes pour playlists privées/collab)
-            auth = PKCEAuth(
-                client_id=client_id,
-                redirect_uri="http://127.0.0.1:8765/callback",
-                scopes=["playlist-read-private", "playlist-read-collaborative"]
-            )
-            sp = SpotifyClient(token_supplier=auth.get_token)
+    except Exception as e:
+        messagebox.showerror('Erreur Spotify', str(e))
+    finally:
+        # UI: idle
+        self.root.config(cursor='')
+        self.clear_button.config(state=tk.NORMAL)
+        self.spotify_load_btn.config(state=tk.NORMAL)
 
-            self.status_label.config(text='Récupération de la playlist Spotify…')
-            rows, name = sp.fetch_playlist(pid)
-            if not rows:
-                messagebox.showerror('Erreur', 'Aucune piste trouvée.')
-                return
-
-            # écrire un CSV temporaire compatible avec le converter
-            fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv')
-            os.close(fd)
-            with open(tmp, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"])
-                w.writeheader()
-                w.writerows(rows)
-
-            self.csv_path = tmp
-            self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
-            self.drop_label.config(text=f'CSV (généré) : {os.path.basename(tmp)}')
-            self.drop_frame.config(bg=LOADED_DROP_BG)
-            self.drop_label.config(bg=LOADED_DROP_BG)
-            self.status_label.config(text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({len(rows)} titres)')
-            self.update_convert_button_state()
-
-        except Exception as e:
-            messagebox.showerror('Erreur Spotify', str(e))
-        finally:
-            self.root.config(cursor='')
-            self.clear_button.config(state=tk.NORMAL)
-            self.spotify_load_btn.config(state=tk.NORMAL)
 
     def update_convert_button_state(self):
         ok = (
