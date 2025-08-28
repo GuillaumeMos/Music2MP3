@@ -1,8 +1,9 @@
 {
-    "variants": [],
-    "duration_min": 60,
-    "duration_max": 600,
-    "transcode_mp3": false,
-    "generate_m3u": true,
-    "exclude_instrumentals": false
+  "spotify_client_id": "a95304cfabe043f49ab04668b635d01d",
+  "variants": [],
+  "duration_min": 30,
+  "duration_max": 600,
+  "transcode_mp3": false,
+  "generate_m3u": true,
+  "exclude_instrumentals": false
 }
