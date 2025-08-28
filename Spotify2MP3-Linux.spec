@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 
 a = Analysis(
-    ['spotify2media.py'],
+     ['app.py'],
     pathex=['.'],
     binaries=[],
     datas=[

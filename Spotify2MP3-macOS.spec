@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['spotify2media.py'],
+     ['app.py'],
     pathex=[],
     binaries=[],
     datas=[('ffmpeg/ffmpeg', 'ffmpeg'), ('yt-dlp/yt-dlp', 'yt-dlp'), ('config.json', '.'), ('icon.icns', '.')],
