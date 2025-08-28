@@ -11,7 +11,7 @@ from config import load_config, resource_path
 from utils import Tooltip, DEFAULT_DROP_BG, LOADED_DROP_BG, open_folder
 from converter import Converter
 from spotify_api import SpotifyClient
-from spotify_auth import PKCEAuth  # PKCE: login utilisateur (pas de secret)
+from spotify_auth import PKCEAuth  # PKCE: pas de secret, login utilisateur
 
 
 class Spotify2MP3GUI:
@@ -28,7 +28,7 @@ class Spotify2MP3GUI:
         self._loaded_playlist_name_from_spotify: str | None = None
         self.config = load_config()
 
-        # default directory (Downloads)
+        # default directory
         if platform.system() == "Windows":
             self.last_directory = os.path.join(os.path.expanduser("~"), "Downloads")
         else:
@@ -116,16 +116,13 @@ class Spotify2MP3GUI:
         self.open_folder_btn.pack(pady=5)
         Tooltip(self.open_folder_btn, 'Ouvre le dossier contenant les fichiers convertis.')
 
-    # ------------------ Spotify loader (PKCE + CSV enrichi) ------------------
+    # ------------------ Spotify loader (PKCE, CSV simple) ------------------
 
     def load_from_spotify_link_wrapper(self):
         """
         Auth PKCE (pas de secret), charge la playlist (privée/publique),
-        génère un CSV TEMPORAIRE enrichi (colonnes complètes) et branche self.csv_path.
-        Nécessite:
-          - spotify_auth.PKCEAuth
-          - spotify_api.SpotifyClient.fetch_playlist_detailed(...)
-          - config.json avec "spotify_client_id"
+        génère un CSV TEMPORAIRE minimal et branche self.csv_path.
+        Colonnes: Track Name, Artist Name(s), Album Name, Duration (ms)
         """
         url = self.spotify_entry.get().strip()
         pid = SpotifyClient.extract_playlist_id(url)
@@ -142,7 +139,6 @@ class Spotify2MP3GUI:
             return
 
         try:
-            # UI: busy
             self.root.config(cursor='watch')
             self.convert_button.config(state=tk.DISABLED)
             self.clear_button.config(state=tk.DISABLED)
@@ -157,42 +153,33 @@ class Spotify2MP3GUI:
             )
             sp = SpotifyClient(token_supplier=auth.get_token)
 
-            # Récup détaillée (items + audio-features + genres artistes)
-            self.status_label.config(text='Récupération détaillée de la playlist Spotify…')
-            rows, name = sp.fetch_playlist_detailed(pid)
+            self.status_label.config(text='Récupération de la playlist Spotify…')
+            rows, name = sp.fetch_playlist(pid)  # <-- version "simple" (pas d’audio-features/artists)
             if not rows:
                 messagebox.showerror('Erreur', 'Aucune piste trouvée.')
                 return
 
-            # Écrire le CSV TEMPORAIRE avec les colonnes complètes (comme ton exemple)
+            # écrire un CSV temporaire
             fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv')
             os.close(fd)
-            fieldnames = [
-                "Track URI","Track Name","Album Name","Artist Name(s)","Release Date","Duration (ms)",
-                "Popularity","Explicit","Added By","Added At","Genres","Record Label",
-                "Danceability","Energy","Key","Loudness","Mode","Speechiness","Acousticness",
-                "Instrumentalness","Liveness","Valence","Tempo","Time Signature"
-            ]
+            fieldnames = ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"]
             with open(tmp, 'w', newline='', encoding='utf-8') as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 w.writeheader()
                 w.writerows(rows)
 
-            # Brancher le CSV généré au pipeline existant
             self.csv_path = tmp
             self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
             self.drop_label.config(text=f'CSV (généré) : {os.path.basename(tmp)}')
             self.drop_frame.config(bg=LOADED_DROP_BG)
             self.drop_label.config(bg=LOADED_DROP_BG)
-            self.status_label.config(
-                text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({len(rows)} titres)'
-            )
+            self.status_label.config(text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({len(rows)} titres)')
             self.update_convert_button_state()
 
         except Exception as e:
+            # Affiche le message d'erreur brut (utile si token expiré)
             messagebox.showerror('Erreur Spotify', str(e))
         finally:
-            # UI: idle
             self.root.config(cursor='')
             self.clear_button.config(state=tk.NORMAL)
             self.spotify_load_btn.config(state=tk.NORMAL)
