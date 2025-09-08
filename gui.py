@@ -20,8 +20,8 @@ class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('540x650')
-        self.root.minsize(300, 500)
+        self.root.geometry('560x680')
+        self.root.minsize(340, 520)
 
         # state
         self.csv_path: str | None = None
@@ -30,22 +30,25 @@ class Spotify2MP3GUI:
         self._loaded_playlist_name_from_spotify: str | None = None
         self.config = load_config()
 
-        # worker state (thread + queue pour UI)
-        self._worker: threading.Thread | None = None
-        self._uiq: queue.Queue | None = None
-        self._worker_done = False
+        # workers
+        self._conv_thread: threading.Thread | None = None
+        self._conv_q: queue.Queue | None = None
+        self._conv_done = False
 
-        # default directory
+        self._sp_thread: threading.Thread | None = None
+        self._sp_q: queue.Queue | None = None
+        self._sp_done = False
+
+        # last dir (Downloads)
         if platform.system() == "Windows":
             self.last_directory = os.path.join(os.path.expanduser("~"), "Downloads")
         else:
             self.last_directory = os.path.expanduser("~/Downloads")
 
-        # UI
         self._build_ui()
         self._load_icons()
 
-    # ------------------ UI building ------------------
+    # ------------------ UI helpers ------------------
 
     def _load_icons(self):
         try:
@@ -59,26 +62,62 @@ class Spotify2MP3GUI:
         except Exception:
             pass  # pas d'icône dispo
 
+    def _set_controls_enabled(self, enabled: bool):
+        # Active/désactive les contrôles pendant un travail
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for w in (
+            self.convert_button,
+            self.clear_button,
+            self.folder_button,
+            self.spotify_load_btn,
+            self.drop_label,
+            self.spotify_entry,
+        ):
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
+
+    def _start_indeterminate(self, text: str):
+        self.status_label.config(text=text)
+        # configure en mode indéterminé (marquee)
+        self.progress.configure(mode='indeterminate')
+        # démarrer l'animation
+        try:
+            self.progress.start(80)  # interval ms
+        except tk.TclError:
+            pass
+
+    def _stop_indeterminate(self):
+        try:
+            self.progress.stop()
+        except tk.TclError:
+            pass
+        self.progress.configure(mode='determinate')
+
+    # ------------------ UI building ------------------
+
     def _build_ui(self):
         instr = tk.Label(
             self.root,
             text='1) Glissez un CSV (Exportify/TuneMyMusic) ou collez un lien Spotify',
             font=("Arial", 12)
         )
-        instr.pack(fill='x', padx=20, pady=(10, 0))
+        instr.pack(fill='x', padx=20, pady=(12, 0))
 
         # CSV drop/browse
         tk.Label(self.root, text='CSV de playlist :', anchor='w').pack(fill='x', padx=20)
-        self.drop_frame = tk.Frame(self.root, bg=DEFAULT_DROP_BG, height=60, width=400)
-        self.drop_frame.pack(pady=5, padx=20)
+        self.drop_frame = tk.Frame(self.root, bg=DEFAULT_DROP_BG, height=64, width=420)
+        self.drop_frame.pack(pady=6, padx=20)
         self.drop_frame.pack_propagate(False)
         self.drop_label = tk.Label(
             self.drop_frame,
             text='CSV file: None',
             bg=DEFAULT_DROP_BG,
             font=("Arial", 12),
-            wraplength=380,
-            justify='center'
+            wraplength=400,
+            justify='center',
+            cursor='hand2'
         )
         self.drop_label.pack(expand=True, fill='both')
         self.drop_label.bind('<Button-1>', self.browse_csv)
@@ -114,7 +153,7 @@ class Spotify2MP3GUI:
         tk.Label(self.root, text='4) Actions :', anchor='w').pack(fill='x', padx=20, pady=(10, 0))
         self.status_label = tk.Label(self.root, text='Status: Waiting...', anchor='w', font=('Arial', 12))
         self.status_label.pack(fill='x', padx=20)
-        self.progress = ttk.Progressbar(self.root, orient='horizontal', length=500, mode='determinate')
+        self.progress = ttk.Progressbar(self.root, orient='horizontal', length=520, mode='determinate')
         self.progress.pack(pady=10)
 
         # open output folder
@@ -144,52 +183,79 @@ class Spotify2MP3GUI:
             )
             return
 
+        # Lancer le worker Spotify (auth + fetch) en thread → UI fluide
+        self._sp_q = queue.Queue()
+        self._sp_done = False
+        self._set_controls_enabled(False)
+        self.progress.configure(value=0, maximum=100)
+        self._start_indeterminate("Ouverture du navigateur pour autorisation Spotify…")
+
+        def _spotify_worker():
+            try:
+                auth = PKCEAuth(
+                    client_id=client_id,
+                    redirect_uri="http://127.0.0.1:8765/callback",
+                    scopes=["playlist-read-private", "playlist-read-collaborative"]
+                )
+                # Le get_token peut prendre un peu de temps → thread
+                token_supplier = auth.get_token
+                sp = SpotifyClient(token_supplier=token_supplier)
+
+                self._sp_q.put(('status', 'Récupération de la playlist Spotify…'))
+                rows, name = sp.fetch_playlist(pid)  # version simple (stable)
+                if not rows:
+                    self._sp_q.put(('error', 'Aucune piste trouvée.'))
+                    return
+
+                # écrire un CSV temporaire
+                fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv')
+                os.close(fd)
+                fieldnames = ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"]
+                with open(tmp, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                    w.writeheader()
+                    w.writerows(rows)
+
+                self._sp_q.put(('done', (tmp, name, len(rows))))
+            except Exception as e:
+                self._sp_q.put(('error', str(e)))
+
+        self._sp_thread = threading.Thread(target=_spotify_worker, daemon=True)
+        self._sp_thread.start()
+        self.root.after(100, self._poll_spotify_queue)
+
+    def _poll_spotify_queue(self):
+        if not self._sp_q:
+            return
         try:
-            self.root.config(cursor='watch')
-            self.convert_button.config(state=tk.DISABLED)
-            self.clear_button.config(state=tk.DISABLED)
-            self.spotify_load_btn.config(state=tk.DISABLED)
-            self.status_label.config(text='Ouverture du navigateur pour autorisation Spotify…')
+            while True:
+                kind, payload = self._sp_q.get_nowait()
+                if kind == 'status':
+                    self.status_label.config(text=payload)
+                elif kind == 'done':
+                    tmp, name, n = payload
+                    self.csv_path = tmp
+                    self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
+                    self.drop_label.config(text=f'CSV (généré) : {os.path.basename(tmp)}')
+                    self.drop_frame.config(bg=LOADED_DROP_BG)
+                    self.drop_label.config(bg=LOADED_DROP_BG)
+                    self.status_label.config(text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({n} titres)')
+                    self._stop_indeterminate()
+                    self._set_controls_enabled(True)
+                    self.update_convert_button_state()
+                    self._sp_done = True
+                elif kind == 'error':
+                    self._stop_indeterminate()
+                    self._set_controls_enabled(True)
+                    messagebox.showerror('Erreur Spotify', payload)
+                    self._sp_done = True
+        except queue.Empty:
+            pass
 
-            # Auth PKCE
-            auth = PKCEAuth(
-                client_id=client_id,
-                redirect_uri="http://127.0.0.1:8765/callback",
-                scopes=["playlist-read-private", "playlist-read-collaborative"]
-            )
-            sp = SpotifyClient(token_supplier=auth.get_token)
+        if self._sp_thread and self._sp_thread.is_alive() and not self._sp_done:
+            self.root.after(100, self._poll_spotify_queue)
 
-            self.status_label.config(text='Récupération de la playlist Spotify…')
-            rows, name = sp.fetch_playlist(pid)  # version simple (pas d’audio-features)
-            if not rows:
-                messagebox.showerror('Erreur', 'Aucune piste trouvée.')
-                return
-
-            # écrire un CSV temporaire
-            fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv')
-            os.close(fd)
-            fieldnames = ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"]
-            with open(tmp, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                w.writeheader()
-                w.writerows(rows)
-
-            self.csv_path = tmp
-            self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
-            self.drop_label.config(text=f'CSV (généré) : {os.path.basename(tmp)}')
-            self.drop_frame.config(bg=LOADED_DROP_BG)
-            self.drop_label.config(bg=LOADED_DROP_BG)
-            self.status_label.config(text=f'Playlist chargée : {self._loaded_playlist_name_from_spotify} ({len(rows)} titres)')
-            self.update_convert_button_state()
-
-        except Exception as e:
-            messagebox.showerror('Erreur Spotify', str(e))
-        finally:
-            self.root.config(cursor='')
-            self.clear_button.config(state=tk.NORMAL)
-            self.spotify_load_btn.config(state=tk.NORMAL)
-
-    # ------------------ Other handlers ------------------
+    # ------------------ File handlers ------------------
 
     def browse_csv(self, event=None):
         path = filedialog.askopenfilename(
@@ -248,22 +314,16 @@ class Spotify2MP3GUI:
             return
 
         # Prépare l’UI
-        self.convert_button.config(state=tk.DISABLED)
-        self.clear_button.config(state=tk.DISABLED)
-        self.folder_button.config(state=tk.DISABLED)
-        self.spotify_load_btn.config(state=tk.DISABLED)
-        self.root.config(cursor='watch')
+        self._set_controls_enabled(False)
         self.status_label.config(text='Démarrage de la conversion…')
-        self.progress.configure(value=0)
+        self.progress.configure(value=0, maximum=100, mode='determinate')
 
-        # Queue pour messages UI + thread de fond
-        self._uiq = queue.Queue()
-        self._worker_done = False
-        self._worker = threading.Thread(target=self._run_conversion_worker, daemon=True)
-        self._worker.start()
-
-        # Lancer le polling UI
-        self.root.after(100, self._poll_worker_queue)
+        # Queue + thread
+        self._conv_q = queue.Queue()
+        self._conv_done = False
+        self._conv_thread = threading.Thread(target=self._run_conversion_worker, daemon=True)
+        self._conv_thread.start()
+        self.root.after(100, self._poll_conversion_queue)
 
     def _run_conversion_worker(self):
         """
@@ -273,59 +333,41 @@ class Spotify2MP3GUI:
         try:
             conv = Converter(
                 config=self.config,
-                status_cb=lambda s: self._uiq.put(('status', s)),
-                progress_cb=lambda cur, maxi: self._uiq.put(('progress', (cur, maxi)))
+                status_cb=lambda s: self._conv_q.put(('status', s)),
+                progress_cb=lambda cur, maxi: self._conv_q.put(('progress', (cur, maxi)))
             )
             playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
             out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
-            self._uiq.put(('done', out_dir))
+            self._conv_q.put(('done', out_dir))
         except Exception as e:
-            self._uiq.put(('error', str(e)))
+            self._conv_q.put(('error', str(e)))
 
-    def _poll_worker_queue(self):
-        """
-        Récupère les messages du worker et met à jour l’UI sur le thread principal.
-        """
-        if not self._uiq:
+    def _poll_conversion_queue(self):
+        if not self._conv_q:
             return
-
         try:
             while True:
-                kind, payload = self._uiq.get_nowait()
+                kind, payload = self._conv_q.get_nowait()
                 if kind == 'status':
                     self.status_label.config(text=payload)
                 elif kind == 'progress':
                     cur, maxi = payload
-                    # initialise max si besoin
                     if self.progress['maximum'] != maxi:
                         self.progress.configure(maximum=maxi)
                     self.progress.configure(value=cur)
                 elif kind == 'done':
-                    self._worker_done = True
                     self.last_output_dir = payload
                     self.progress.configure(value=self.progress['maximum'])
                     self.status_label.config(text='✅ Conversion terminée')
-                    self._reset_ui_after_worker()
+                    self._set_controls_enabled(True)
+                    self._conv_done = True
                     self.root.bell()
                 elif kind == 'error':
-                    self._worker_done = True
                     messagebox.showerror('Erreur', f'Erreur inattendue: {payload}')
-                    self._reset_ui_after_worker()
+                    self._set_controls_enabled(True)
+                    self._conv_done = True
         except queue.Empty:
             pass
 
-        # Continuer à poll tant que le thread est vivant et pas "done"
-        if self._worker and self._worker.is_alive() and not self._worker_done:
-            self.root.after(100, self._poll_worker_queue)
-        else:
-            # thread fini mais pas d’événement "done"/"error" (cas rare)
-            if not self._worker_done:
-                self._reset_ui_after_worker()
-
-    def _reset_ui_after_worker(self):
-        self.root.config(cursor='')
-        self.convert_button.config(state=tk.NORMAL)
-        self.clear_button.config(state=tk.NORMAL)
-        self.folder_button.config(state=tk.NORMAL)
-        self.spotify_load_btn.config(state=tk.NORMAL)
-        # on laisse la progressbar là où elle est
+        if self._conv_thread and self._conv_thread.is_alive() and not self._conv_done:
+            self.root.after(100, self._poll_conversion_queue)
