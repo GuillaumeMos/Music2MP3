@@ -1,234 +1,256 @@
-import os, csv, re, time, json, subprocess, platform
-from datetime import timedelta
-from mutagen.mp4 import MP4, MP4Tags
-from mutagen.easyid3 import EasyID3
+# converter.py
+from __future__ import annotations
+import os, re, csv, glob, platform, subprocess, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional
 
-from utils import safe_name
+from mutagen.easyid3 import EasyID3
+from mutagen.mp4 import MP4, MP4Tags
+
+try:
+    from config import resource_path
+except Exception:
+    def resource_path(p: str) -> str:
+        return os.path.join(os.path.abspath("."), p)
+
 
 class Converter:
-    def __init__(self, config: dict, status_cb=lambda s: None, progress_cb=lambda cur,maxi: None):
-        self.cfg = config
-        self.status = status_cb
-        self.progress = progress_cb
+    def __init__(
+        self,
+        config: dict,
+        status_cb: Optional[Callable[[str], None]] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        item_cb: Optional[Callable[[str, dict], None]] = None,  # NEW: per-track events
+    ):
+        self.config = config or {}
+        self.status_cb = status_cb or (lambda s: None)
+        self.progress_cb = progress_cb or (lambda c, m: None)
+        self.item_cb = item_cb or (lambda _k, _d: None)
 
-    def _binaries(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        if platform.system() == "Darwin":
-            ffmpeg = os.path.join(base_dir, "ffmpeg", "ffmpeg")
-            ytdlp = os.path.join(base_dir, "yt-dlp", "yt-dlp")
+    def _status(self, txt: str):
+        try: self.status_cb(txt)
+        except Exception: pass
+
+    def _progress(self, cur: int, maxi: int):
+        try: self.progress_cb(cur, maxi)
+        except Exception: pass
+
+    def _item(self, kind: str, data: dict):
+        try: self.item_cb(kind, data)
+        except Exception: pass
+
+    def _bin_paths(self):
+        system = platform.system()
+        if system == "Windows":
+            ffmpeg_exe = resource_path(os.path.join("ffmpeg", "ffmpeg.exe"))
+            ytdlp_exe = resource_path(os.path.join("yt-dlp", "yt-dlp.exe"))
+            creationflags = subprocess.CREATE_NO_WINDOW
         else:
-            ffmpeg = os.path.join(base_dir, "ffmpeg", "ffmpeg.exe")
-            ytdlp = os.path.join(base_dir, "yt-dlp", "yt-dlp.exe")
-        return ffmpeg, ytdlp
+            ffmpeg_exe = resource_path(os.path.join("ffmpeg", "ffmpeg"))
+            ytdlp_exe = resource_path(os.path.join("yt-dlp", "yt-dlp"))
+            creationflags = 0
 
-    def _yt_cmd(self, ytdlp, ffmpeg_dir, cookies_path, extra_args, search_spec):
-        cmd = [ytdlp, f"--ffmpeg-location={ffmpeg_dir}", "--no-config"]
-        if cookies_path:
-            cmd += ["--cookies", cookies_path]
-        cmd += extra_args + [search_spec]
-        return cmd
+        if not os.path.isfile(ffmpeg_exe):
+            ffmpeg_exe = os.path.join("ffmpeg", os.path.basename(ffmpeg_exe))
+        if not os.path.isfile(ytdlp_exe):
+            ytdlp_exe = os.path.join("yt-dlp", os.path.basename(ytdlp_exe))
+        return ffmpeg_exe, ytdlp_exe, creationflags
 
-    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_name_hint: str | None = None):
-        start = time.time()
-        rows = list(csv.DictReader(open(csv_path, newline='', encoding='utf-8')))
+    @staticmethod
+    def _sanitize(s: str) -> str:
+        return re.sub(r"[^\w\s.-]", "", s).strip()
+
+    @staticmethod
+    def _find_output_by_base(out_dir: str, base: str) -> Optional[str]:
+        matches = glob.glob(os.path.join(out_dir, base + ".*"))
+        if not matches:
+            return None
+        for pref in (".mp3", ".m4a", ".m4b", ".mka", ".opus", ".webm"):
+            for m in matches:
+                if m.lower().endswith(pref):
+                    return m
+        return matches[0]
+
+    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_name_hint: Optional[str] = None) -> str:
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
         total = len(rows)
-        playlist_name = playlist_name_hint or os.path.splitext(os.path.basename(csv_path))[0]
+        if total == 0:
+            self._status("Aucune ligne dans le CSV.")
+            return output_folder
+
+        playlist_name = (playlist_name_hint or os.path.splitext(os.path.basename(csv_path))[0]).strip()
         out_dir = os.path.join(output_folder, playlist_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        ffmpeg, ytdlp = self._binaries()
-        if not (os.path.isfile(ffmpeg) and os.path.isfile(ytdlp)):
-            raise RuntimeError("ffmpeg ou yt-dlp introuvable.")
+        ffmpeg_exe, ytdlp_exe, creationflags = self._bin_paths()
+        if not os.path.isfile(ffmpeg_exe) or not os.path.isfile(ytdlp_exe):
+            missing = []
+            if not os.path.isfile(ffmpeg_exe): missing.append("ffmpeg")
+            if not os.path.isfile(ytdlp_exe): missing.append("yt-dlp")
+            raise RuntimeError(f"Binaires manquants: {', '.join(missing)}")
 
-        archive_file = os.path.join(out_dir, 'downloaded.txt')
-        creationflags = subprocess.CREATE_NO_WINDOW if platform.system()== 'Windows' else 0
-        duration_min = self.cfg.get("duration_min", 0)
-        duration_max = self.cfg.get("duration_max", 10**9)
-        deep_search = True  # tu peux exposer ce flag via l'UI
-        cookies_path = self.cfg.get('cookies_path')
+        transcode_mp3 = bool(self.config.get("transcode_mp3", False))
+        m3u_enabled   = bool(self.config.get("generate_m3u", True))
+        exclude_instr = bool(self.config.get("exclude_instrumentals", False))
+        cookies_path  = self.config.get("cookies_path") or None
+        deep_search   = bool(self.config.get("deep_search", True))
 
-        downloaded = []
-        not_found = []
+        default_workers = 3
+        if transcode_mp3:
+            default_workers = max(2, min(4, (os.cpu_count() or 4) // 4 or 2))
+        max_workers = int(self.config.get("concurrency", default_workers))
 
-        for i, row in enumerate(rows, start=1):
+        self._status(f"Lancement : {total} titres • {max_workers} téléchargements en parallèle")
+        # côté GUI, on utilise une barre globale lissée via les pourcentages → on émet une init
+        self._item('conv_init', {'total': total, 'playlist': playlist_name})
+
+        lock = threading.Lock()
+        done = 0
+        results: list[tuple[int, bool, Optional[str], Optional[str]]] = []
+
+        def process_one(i: int, row: dict) -> tuple[int, bool, Optional[str], Optional[str]]:
             title = row.get('Track Name') or row.get('Track name') or 'Unknown'
             artist_raw = row.get('Artist Name(s)') or row.get('Artist name') or 'Unknown'
             artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
             album = row.get('Album Name') or row.get('Album') or playlist_name
-            ms = row.get('Duration (ms)')
-            spotify_sec = int(ms)/1000 if ms and str(ms).isdigit() else None
 
-            safe_title = safe_name(title)
-            variants = self.cfg.get('variants') or ['']
-            if 'instrumental' in (title or '').lower():
-                variants = ['instrumental'] + variants
+            file_title = self._sanitize(title)
+            safe_artist = self._sanitize(artist_primary)
+            base = f"{i:03d} - {file_title}"
+            out_template = os.path.join(out_dir, base + ".%(ext)s")
 
-            best_file = None
-            for variant in variants:
-                parts = [safe_title]
-                if artist_primary and artist_primary.lower() != 'unknown':
-                    parts.append(safe_name(artist_primary))
-                if variant:
-                    parts.append(variant)
-                q = ' '.join(parts)
-                self.status(f"[{i}/{total}] Recherche: {q}")
+            # notify UI : init row
+            self._item('init', {'idx': i, 'title': f"{title} — {artist_primary}"})
 
-                def normalize(t: str):
-                    import re
-                    return re.sub(r"[^\w\s]", "", (t or "").lower())
+            # Already downloaded ?
+            already = self._find_output_by_base(out_dir, base)
+            if already and os.path.isfile(already):
+                # push 100% instantly
+                self._item('progress', {'idx': i, 'percent': 100.0, 'speed': None, 'eta': None})
+                return (i, True, already, None)
 
-                def contains_keywords_in_order(candidate: str, keywords: list[str]):
-                    txt = normalize(candidate)
-                    pos = 0
-                    for kw in keywords:
-                        idx = txt.find(kw, pos)
-                        if idx < 0:
-                            return False
-                        pos = idx + len(kw)
-                    return True
+            def yt_cmd(extra_args: list[str], search_spec: str):
+                cmd = [ytdlp_exe, f"--ffmpeg-location={os.path.dirname(ffmpeg_exe)}", "--no-config", "--newline"]
+                if cookies_path and os.path.isfile(cookies_path):
+                    cmd += ["--cookies", cookies_path]
+                cmd += extra_args + [search_spec]
+                return cmd
 
-                def pick_download_spec():
-                    ffdir = os.path.dirname(ffmpeg)
-                    if deep_search:
-                        # phase rapide 1
-                        proc_q = subprocess.run(
-                            self._yt_cmd(ytdlp, ffdir, cookies_path, ["--flat-playlist","--dump-single-json","--no-playlist"], f"ytsearch1:{q}"),
-                            capture_output=True, text=True, creationflags=creationflags
-                        )
-                        try:
-                            data_q = json.loads(proc_q.stdout) or {}
-                        except Exception:
-                            data_q = {}
-                        entries_q = data_q.get('entries') if isinstance(data_q.get('entries'), list) else []
-                        top = entries_q[0] if entries_q else {}
-                        title_top = top.get('title','')
-                        up = (top.get('uploader') or '').lower()
-                        dur = top.get('duration') or 0
-                        ok = (
-                            safe_title.lower() in title_top.lower()
-                            and (not artist_primary or artist_primary.lower() in up)
-                            and (not spotify_sec or abs(dur-spotify_sec) <= 10)
-                            and (duration_min <= dur <= duration_max)
-                        )
-                        if ok:
-                            return top.get('webpage_url', f"https://www.youtube.com/watch?v={top.get('id','')}")
+            q = ' '.join([file_title, safe_artist]).strip()
+            download_spec = f"ytsearch2:{q}" if deep_search else f"ytsearch1:{q}"
 
-                        # phase approfondie 2
-                        proc_ids = subprocess.run(
-                            self._yt_cmd(ytdlp, ffdir, cookies_path, ["--flat-playlist","--dump-single-json","--no-playlist"], f"ytsearch3:{q}"),
-                            capture_output=True, text=True, creationflags=creationflags
-                        )
-                        try:
-                            data_ids = json.loads(proc_ids.stdout) or {}
-                        except Exception:
-                            data_ids = {}
-                        entries_ids = data_ids.get('entries') if isinstance(data_ids.get('entries'), list) else []
-                        ids = [e for e in entries_ids if isinstance(e, dict)][:3]
+            args = ['-f', 'bestaudio[ext=m4a]/bestaudio', '--output', out_template, '--no-playlist']
+            if exclude_instr:
+                args += ['--reject-title', 'instrumental']
+            if transcode_mp3:
+                args += ['--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0']
+            else:
+                args += ['--remux-video', 'm4a']
 
-                        scored = []
-                        first_words = normalize(title).split()[:5]
-                        for entry in ids:
-                            vid = entry.get('id')
-                            if not vid:
-                                continue
-                            url = f"https://www.youtube.com/watch?v={vid}"
-                            proc_i = subprocess.run(
-                                self._yt_cmd(ytdlp, ffdir, cookies_path, ["--dump-single-json","--no-playlist"], url),
-                                capture_output=True, text=True, creationflags=creationflags
-                            )
-                            if "Sign in to confirm your age" in (proc_i.stderr or ''):
-                                continue
-                            try:
-                                info = json.loads(proc_i.stdout) or {}
-                            except Exception:
-                                continue
-                            raw_title = info.get('title','')
-                            up2 = (info.get('uploader') or '').lower()
-                            dur2 = info.get('duration') or 0
-                            if dur2 < duration_min or dur2 > duration_max:
-                                continue
-                            if 'shorts/' in info.get('webpage_url','') or '#shorts' in raw_title.lower():
-                                continue
-                            if artist_primary and artist_primary.lower() not in up2:
-                                continue
-                            if variant and variant.lower() not in raw_title.lower():
-                                continue
-                            if not contains_keywords_in_order(raw_title, first_words):
-                                continue
-                            score = 100 if raw_title.lower().startswith(safe_title.lower()) else 80
-                            if spotify_sec:
-                                score -= abs(dur2 - spotify_sec)
-                            scored.append((score, url))
-                        return scored and max(scored, key=lambda x: x[0])[1] or f"ytsearch1:{q}"
+            # stream stdout pour parser le pourcentage
+            proc = subprocess.Popen(
+                yt_cmd(args, download_spec),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=creationflags
+            )
+
+            try:
+                for line in proc.stdout:
+                    # [download]  12.3% of ...
+                    m = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)%', line)
+                    if m:
+                        pct = float(m.group(1))
+                        # speed & eta (optionnel)
+                        sp = re.search(r'at\s+([\d.]+[A-Za-z]+\/s)', line)
+                        eta = re.search(r'ETA\s+(\d{1,2}:\d{2})', line)
+                        self._item('progress', {
+                            'idx': i,
+                            'percent': pct,
+                            'speed': sp.group(1) if sp else None,
+                            'eta': eta.group(1) if eta else None
+                        })
+            finally:
+                proc.wait()
+
+            if proc.returncode != 0:
+                err = proc.stdout.read() if proc.stdout else ''
+                return (i, False, None, (err or "yt-dlp error")[:700])
+
+            outfile = self._find_output_by_base(out_dir, base)
+            if not outfile or not os.path.isfile(outfile):
+                return (i, False, None, "Fichier de sortie introuvable après téléchargement.")
+
+            # tags
+            try:
+                if outfile.lower().endswith(".mp3"):
+                    audio = EasyID3()
+                    try: audio.load(outfile)
+                    except: pass
+                    audio.update({'artist': artist_primary, 'title': title, 'album': album, 'tracknumber': str(i)})
+                    audio.save()
+                elif outfile.lower().endswith((".m4a", ".m4b")):
+                    mp4 = MP4(outfile)
+                    tags = mp4.tags or MP4Tags()
+                    tags['\xa9nam']=[title]; tags['\xa9ART']=[artist_primary]; tags['\xa9alb']=[album]
+                    mp4.save()
+            except Exception:
+                pass
+
+            self._item('progress', {'idx': i, 'percent': 100.0, 'speed': None, 'eta': None})
+            return (i, True, outfile, None)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(process_one, i, row): (i, row) for i, row in enumerate(rows, start=1)}
+            for fut in as_completed(futures):
+                i, row = futures[fut]
+                ok, path, err = False, None, None
+                try:
+                    i2, ok, path, err = fut.result()
+                except Exception as e:
+                    err = str(e)
+
+                with lock:
+                    done += 1
+                    # on conserve ce progress "par titre terminé" au cas où,
+                    # mais l’UI calcule la barre globale via la somme des %
+                    self._progress(done, total)
+
+                    if ok:
+                        results.append((i, True, path, None))
+                        self._item('done', {'idx': i, 'path': path})
+                        self._status(f"[{done}/{total}] OK : {row.get('Track Name') or ''}")
                     else:
-                        return f"ytsearch1:{q}"
+                        results.append((i, False, None, err))
+                        self._item('error', {'idx': i, 'error': err})
+                        self._status(f"[{done}/{total}] ÉCHEC : {row.get('Track Name') or ''}")
 
-                download_spec = pick_download_spec()
+        if self.config.get("generate_m3u", True):
+            m3u_name = playlist_name.replace('_', ' ')
+            m3u_path = os.path.join(out_dir, f"{m3u_name}.m3u")
+            with open(m3u_path, 'w', encoding='utf-8') as m3u:
+                m3u.write('#EXTM3U\n')
+                for (idx, ok, path, _) in sorted(results, key=lambda x: x[0]):
+                    if ok and path and os.path.isfile(path):
+                        fn = os.path.basename(path)
+                        m3u.write(f'#EXTINF:-1,{os.path.splitext(fn)[0]}\n')
+                        m3u.write(f'{fn}\n')
 
-                file_title = safe_name(title)
-                base = f"{i:03d} - {file_title}" + (f" - {variant}" if variant else "")
-                tmpl = base + ".%(ext)s"
-                args = [
-                    '--download-archive', archive_file,
-                    '-f', 'bestaudio[ext=m4a]/bestaudio',
-                    '--output', os.path.join(out_dir, tmpl),
-                    '--no-playlist'
-                ]
-                if self.cfg.get('thumb', False):
-                    args += ['--embed-thumbnail','--add-metadata']
-                if self.cfg.get('transcode_mp3', False):
-                    args += ['--extract-audio','--audio-format','mp3','--audio-quality','0']
-                else:
-                    args += ['--remux-video','m4a']
-                if self.cfg.get('exclude_instrumentals', False):
-                    args += ['--reject-title','instrumental']
-
-                ret = subprocess.run(self._yt_cmd(ytdlp, os.path.dirname(ffmpeg), cookies_path, args, download_spec),
-                                     capture_output=True, text=True, creationflags=creationflags)
-                if ret.returncode != 0:
-                    if 'Sign in to confirm your age' in (ret.stderr or ''):
-                        not_found.append({"Track Name": title, "Artist Name(s)": artist_primary, "Album Name": album, "Track Number": i, "Error": "Age-restricted"})
-                        break
-                    continue
-
-                out_ext = '.mp3' if self.cfg.get('transcode_mp3', False) else '.m4a'
-                candidate = os.path.join(out_dir, base + out_ext)
-                if os.path.isfile(candidate):
-                    best_file = candidate
-                    if out_ext == '.m4a':
-                        audio = MP4(best_file); tags = audio.tags or MP4Tags()
-                        tags['\xa9nam']=[title]; tags['\xa9ART']=[artist_primary]; tags['\xa9alb']=[album]; audio.save()
-                    else:
-                        audio = EasyID3()
-                        try: audio.load(best_file)
-                        except Exception: pass
-                        audio.update({'artist':artist_primary,'title':title,'album':album,'tracknumber':str(i)}); audio.save()
-                    downloaded.append(os.path.basename(best_file))
-                    break
-
-            if not best_file:
-                not_found.append({'Track Name': title, 'Artist Name(s)': artist_primary, 'Album Name': album, 'Track Number': i, 'Error': 'No valid download'})
-
-            elapsed = time.time() - start
-            eta = timedelta(seconds=int((elapsed/i)*(total-i)))
-            self.progress(i, total)
-            self.status(f"Téléchargé {i}/{total}, ETA: {eta}")
-
-        # Fichiers annexes
-        if not_found:
+        # rapport des ratés
+        fails = [(idx, err) for (idx, ok, _p, err) in results if not ok]
+        if fails:
             nf_path = os.path.join(out_dir, f"{playlist_name}_not_found.csv")
             with open(nf_path, 'w', newline='', encoding='utf-8') as cf:
-                writer = csv.DictWriter(cf, fieldnames=['Track Name','Artist Name(s)','Album Name','Track Number','Error'])
-                writer.writeheader(); writer.writerows(not_found)
+                w = csv.writer(cf); w.writerow(["#", "Title", "Error"])
+                for idx, err in fails:
+                    title = rows[idx-1].get('Track Name') or ''
+                    w.writerow([idx, title, err or 'unknown'])
 
-        if self.cfg.get('generate_m3u', True):
-            m3u_filename = playlist_name.replace('_',' ')
-            m3u_path = os.path.join(out_dir, f"{m3u_filename}.m3u")
-            with open(m3u_path,'w',encoding='utf-8') as m3u:
-                m3u.write('#EXTM3U\n')
-                audio_files = sorted([f for f in os.listdir(out_dir) if f.lower().endswith(('.mp3','.m4a'))], key=lambda x: os.path.getctime(os.path.join(out_dir,x)))
-                for fn in audio_files:
-                    m3u.write(f'#EXTINF:-1,{os.path.splitext(fn)[0]}\n')
-                    m3u.write(f'{fn}\n')
-
+        self._status("✅ Terminé")
         return out_dir
