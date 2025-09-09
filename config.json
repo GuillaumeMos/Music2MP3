@@ -8,5 +8,6 @@
   "exclude_instrumentals": false,
   "concurrency": 3,
   "deep_search": true,
-  "incremental_update": true
+  "incremental_update": true,
+  "prefix_numbers": false
 }
