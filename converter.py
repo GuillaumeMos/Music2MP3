@@ -202,8 +202,16 @@ class Converter:
             return output_folder
 
         # Dossier playlist
+
         playlist_name = (playlist_name_hint or os.path.splitext(os.path.basename(csv_path))[0]).strip()
-        out_dir = os.path.join(output_folder, playlist_name)
+
+        base_out = os.path.normpath(output_folder)
+        # si le dossier choisi s'appelle déjà comme la playlist → on ne recrée pas un sous-dossier
+        if os.path.basename(base_out).lower() == playlist_name.lower():
+            out_dir = base_out
+        else:
+            out_dir = os.path.join(base_out, playlist_name)
+
         os.makedirs(out_dir, exist_ok=True)
 
         # Binaries
