@@ -3,12 +3,9 @@ import os
 import re
 import csv
 import sys
-import math
 import time
 import json
-import glob
 import queue
-import shutil
 import platform
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,9 +15,6 @@ from config import resource_path
 
 
 def _find_binaries():
-    """
-    Resolve yt-dlp and ffmpeg paths (bundled first, fallback to PATH).
-    """
     base = getattr(sys, "_MEIPASS", os.path.abspath("."))
     if platform.system() == "Windows":
         ff = os.path.join(resource_path("ffmpeg"), "ffmpeg.exe")
@@ -40,19 +34,12 @@ def _norm(s: str) -> str:
 
 
 def _strip_leading_index(name: str) -> str:
-    """
-    Remove a leading numeric index like '001 - ', '12_', '07. ' etc.
-    """
     base = os.path.splitext(name)[0]
     base = re.sub(r"^\s*\d+\s*[-_\.]\s*", "", base)
     return base
 
 
 def _track_key(title: str, artist: str) -> str:
-    """
-    Normalize to compare an existing filename with a CSV row.
-    """
-    # keep only primary artist (before comma/feat/&)
     a0 = re.split(r'[,/&]| feat\.| ft\.', artist, flags=re.I)[0].strip()
     return _norm(f"{title}::{a0}")
 
@@ -63,8 +50,6 @@ def _existing_keys_in_folder(folder: str) -> set[str]:
         if not fn.lower().endswith((".mp3", ".m4a")):
             continue
         base = _strip_leading_index(fn)
-        # attempt to split "Title - Artist" if present
-        # otherwise just use base as title, unknown artist
         if " - " in base:
             t, a = base.rsplit(" - ", 1)
         else:
@@ -79,9 +64,6 @@ def _safe_filename(s: str) -> str:
 
 
 def _choose_best_youtube(ytdlp_exe: str, query: str, duration_ms: int | None, artist_primary: str | None, cookies_path: str | None):
-    """
-    Deep-search: fetch 3 candidates and score by duration proximity + artist mention.
-    """
     cmd = [ytdlp_exe, "--flat-playlist", "--dump-single-json", "--no-warnings", "-q", f"ytsearch3:{query}"]
     if cookies_path:
         cmd += ["--cookies", cookies_path]
@@ -110,24 +92,26 @@ def _choose_best_youtube(ytdlp_exe: str, query: str, duration_ms: int | None, ar
 
 class Converter:
     """
-    Heavy worker. Runs downloads in background and reports progress via callbacks.
+    Heavy worker with cooperative cancel support.
 
     Callbacks:
       - status_cb(str)
-      - progress_cb(cur, max)             # (kept for compatibility, not used strongly here)
-      - item_cb(event: str, data: dict)   # per-item lifecycle:
-           'conv_init': {'total': N, 'new': M, 'existing': N-M}
-           'init':      {'idx': i, 'title': 'Song - Artist'}
-           'progress':  {'idx': i, 'percent': 42.0, 'speed': '1.2MiB/s', 'eta': '00:12'}
-           'done':      {'idx': i}
-           'error':     {'idx': i, 'message': '...'}
+      - progress_cb(cur, max)
+      - item_cb(event, data)
+        * 'conv_init' {'total': N, 'new': M, 'existing': N-M}
+        * 'init' {'idx': i, 'title': '…'}
+        * 'progress' {'idx': i, 'percent': 0..100, 'speed': '…', 'eta': '…'}
+        * 'done' {'idx': i}
+        * 'error' {'idx': i, 'message': '…'}
+        * 'cancel_all' {}
     """
 
-    def __init__(self, config: dict, status_cb=None, progress_cb=None, item_cb=None):
+    def __init__(self, config: dict, status_cb=None, progress_cb=None, item_cb=None, cancel_event: threading.Event | None = None):
         self.cfg = config or {}
         self.status_cb = status_cb or (lambda s: None)
         self.progress_cb = progress_cb or (lambda a, b: None)
         self.item_cb = item_cb or (lambda k, d: None)
+        self.cancel = cancel_event or threading.Event()
         self.ffmpeg_exe, self.ytdlp_exe = _find_binaries()
 
     # --------------------------- Public API ---------------------------
@@ -137,15 +121,14 @@ class Converter:
         if not rows:
             raise RuntimeError("CSV is empty or malformed.")
 
-        # Playlist name
+        # Playlist name / output path (avoid double-nesting)
         playlist_name = playlist_hint or os.path.splitext(os.path.basename(csv_path))[0]
-        # Avoid double nesting (if user already picked a folder named like the playlist).
         out_dir = output_folder
         if os.path.basename(os.path.normpath(output_folder)).lower() != playlist_name.lower():
             out_dir = os.path.join(output_folder, playlist_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        # incremental filtering
+        # incremental
         existing_keys = _existing_keys_in_folder(out_dir) if self.cfg.get("incremental_update", True) else set()
 
         todo = []
@@ -163,32 +146,41 @@ class Converter:
             'existing': len(rows) - len(todo),
         })
 
+        if self.cancel.is_set():
+            self.status_cb("Cancelled.")
+            self.item_cb('cancel_all', {})
+            return out_dir
+
         if not todo:
             self.status_cb("Everything already up to date.")
-            # still build M3U if requested from current files
             if self.cfg.get("generate_m3u", True):
                 self._write_m3u(out_dir, playlist_name)
             return out_dir
 
         self.status_cb(f"Starting downloads: {len(todo)} tracks…")
 
-        # concurrency
         workers = max(1, min(8, int(self.cfg.get("concurrency", 3))))
         cookies_path = self.cfg.get("cookies_path")
 
-        # submit tasks
+        # thread pool
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = []
+            futures = []
             for idx, row in todo:
-                futs.append(ex.submit(self._download_one, idx, row, out_dir, playlist_name, cookies_path, len(rows)))
-            # Optionally iterate to surface exceptions early
-            for f in as_completed(futs):
-                exc = f.exception()
-                if exc:
-                    # we don't crash all; we just report error (already done by _download_one)
-                    pass
+                if self.cancel.is_set():
+                    break
+                futures.append(ex.submit(self._download_one, idx, row, out_dir, playlist_name, cookies_path, len(rows)))
+            for f in as_completed(futures):
+                _ = f.exception()  # surfaces exceptions
+                if self.cancel.is_set():
+                    # let the running tasks notice cancel; don't wait for all
+                    break
 
-        # playlist file as last step
+        if self.cancel.is_set():
+            self.status_cb("Cancelled.")
+            self.item_cb('cancel_all', {})
+            # don't write M3U on cancel
+            return out_dir
+
         if self.cfg.get("generate_m3u", True):
             self._write_m3u(out_dir, playlist_name)
 
@@ -207,10 +199,8 @@ class Converter:
         title = row.get("Track Name") or row.get("Track name") or "Unknown"
         artist_raw = row.get("Artist Name(s)") or row.get("Artist name") or ""
         artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
-
         base_title = _safe_filename(title)
         base_artist = _safe_filename(artist_primary)
-
         name = f"{base_title} - {base_artist}"
         if self.cfg.get("prefix_numbers", False):
             width = len(str(max(1, total_tracks)))
@@ -218,13 +208,18 @@ class Converter:
         return name
 
     def _download_one(self, idx: int, row: dict, out_dir: str, playlist_name: str, cookies_path: str | None, total_tracks: int):
+        # Cancel before starting
+        if self.cancel.is_set():
+            self.item_cb('error', {'idx': idx, 'message': 'Cancelled'})
+            return
+
         # init event
         title = row.get("Track Name") or "Track"
         artist = row.get("Artist Name(s)") or ""
         nice_title = f"{title} - {artist}" if artist else title
         self.item_cb('init', {'idx': idx, 'title': nice_title})
 
-        # figure out source (direct URL for SoundCloud, else YouTube search)
+        # select source spec
         src_url = (row.get("Source URL") or "").strip()
         dur_ms = None
         try:
@@ -234,39 +229,32 @@ class Converter:
         except Exception:
             dur_ms = None
 
-        # Build filename template
         base = self._make_base_name(seq_index=idx, total_tracks=total_tracks, row=row)
         out_tmpl = os.path.join(out_dir, base + ".%(ext)s")
 
-        # yt-dlp base cmd
         ffmpeg_exe, ytdlp_exe = self.ffmpeg_exe, self.ytdlp_exe
         cmd = [
             ytdlp_exe,
             f"--ffmpeg-location={os.path.dirname(ffmpeg_exe)}",
             "--no-config",
-            "--newline",            # progress lines
+            "--newline",
         ]
         if cookies_path:
             cmd += ["--cookies", cookies_path]
 
-        # formats / transcode options
         if self.cfg.get("transcode_mp3", False):
             cmd += ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
         else:
-            # prefer native m4a when possible (YouTube), fallback to bestaudio
             cmd += ["-f", "bestaudio[ext=m4a]/bestaudio", "--remux-video", "m4a"]
 
-        # title filtering
         if self.cfg.get("exclude_instrumentals", False):
             cmd += ["--reject-title", "instrumental"]
 
         cmd += ["-o", out_tmpl, "--no-playlist"]
 
-        # URL or search spec
         if src_url:
             spec = src_url
         else:
-            # YouTube search
             title = row.get("Track Name") or row.get("Track name") or ""
             artist_raw = row.get("Artist Name(s)") or row.get("Artist name") or ""
             artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
@@ -275,13 +263,11 @@ class Converter:
                 spec = _choose_best_youtube(self.ytdlp_exe, q, dur_ms, artist_primary, cookies_path)
             else:
                 spec = f"ytsearch1:{q}"
-
         cmd += [spec]
 
-        # Start process (hidden) and parse progress from stderr
+        # Spawn yt-dlp (hidden) and parse progress
         p = popen_quiet(cmd, text=True)
-        # Consume both streams to avoid deadlocks
-        reader_threads = []
+
         stderr_q = queue.Queue()
         stdout_q = queue.Queue()
 
@@ -296,10 +282,27 @@ class Converter:
 
         prog_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:at\s+([^\s]+/s))?.*?(?:ETA\s+([\d:\.]+))?", re.I)
 
-        # Poll queues while process alive
+        # progress loop with cancel
         while True:
+            if self.cancel.is_set():
+                # Terminate process nicely, then force kill if needed
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                try:
+                    for _ in range(20):
+                        if p.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    if p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+                self.item_cb('error', {'idx': idx, 'message': 'Cancelled'})
+                return
+
             try:
-                # stderr first (progress lives here)
                 while True:
                     line = stderr_q.get_nowait()
                     m = prog_re.search(line)
@@ -312,7 +315,6 @@ class Converter:
                 pass
 
             try:
-                # drain stdout (not used much here, but prevents blocking)
                 while True:
                     _ = stdout_q.get_nowait()
             except queue.Empty:
@@ -326,7 +328,7 @@ class Converter:
         if rc == 0:
             self.item_cb('done', {'idx': idx})
         else:
-            # try read last stderr chunk
+            # pull last error line
             err = ""
             try:
                 while True:
@@ -336,13 +338,11 @@ class Converter:
             self.item_cb('error', {'idx': idx, 'message': err.strip()})
 
     def _write_m3u(self, out_dir: str, playlist_name: str):
-        # Sort by index prefix if any, else by ctime
         files = [f for f in os.listdir(out_dir) if f.lower().endswith((".mp3", ".m4a"))]
         def sort_key(fn):
             m = re.match(r"^\s*(\d+)\s*[-_\.]\s*", fn)
             if m:
                 return (0, int(m.group(1)))
-            # fallback: creation time
             return (1, os.path.getctime(os.path.join(out_dir, fn)))
         files.sort(key=sort_key)
 

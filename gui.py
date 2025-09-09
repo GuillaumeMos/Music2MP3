@@ -9,9 +9,6 @@ from converter import Converter
 from spotify_api import SpotifyClient
 from soundcloud_api import SoundCloudClient
 
-# IMPORTANT:
-# - No import of spotify_auth at module level.
-#   (PKCEAuth is imported lazily only inside the Spotify handler.)
 try:
     from config import CONFIG_FILE
 except Exception:
@@ -32,10 +29,12 @@ class Spotify2MP3GUI:
         self._loaded_playlist_name_from_spotify = None
         self.config = load_config()
 
-        # workers
+        # background threads/queues
         self._conv_thread = None
         self._conv_q: queue.Queue | None = None
         self._conv_done = False
+        self._conv_obj: Converter | None = None  # keep a ref to converter
+        self._cancel_event: threading.Event | None = None
 
         self._sp_thread = None
         self._sp_q: queue.Queue | None = None
@@ -54,7 +53,7 @@ class Spotify2MP3GUI:
         self._t0 = None
         self._timer_running = False
 
-        # options UI (defaults from config)
+        # options
         self.prefix_numbers_var  = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
         self.concurrency_var     = tk.IntVar(value=int(self.config.get("concurrency", 3)))
         self.deep_search_var     = tk.BooleanVar(value=bool(self.config.get("deep_search", True)))
@@ -100,6 +99,9 @@ class Spotify2MP3GUI:
         self.style.configure('TButton', padding=(10, 6))
         self.style.configure('Accent.TButton', padding=(12, 8), foreground='white', background=PRIMARY)
         self.style.map('Accent.TButton', background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')])
+
+        self.style.configure('Danger.TButton', padding=(12, 8), foreground='white', background=ERR)
+        self.style.map('Danger.TButton', background=[('active', '#be123c'), ('disabled', '#fda4af')])
 
         self.style.configure('Card.TLabelframe', background=CARD_BG, borderwidth=1, relief='solid')
         self.style.configure('Card.TLabelframe.Label', background=CARD_BG, foreground=SUB, padding=(6, 0))
@@ -159,7 +161,7 @@ class Spotify2MP3GUI:
         self.sc_entry = ttk.Entry(row_sc); self.sc_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
         self.sc_load_btn = ttk.Button(row_sc, text='Load from SoundCloud', command=self.load_from_soundcloud_link)
         self.sc_load_btn.pack(side='left')
-        ttk.Label(body_sc, text="Works with public playlists or private links that include a secret token. No login required.",
+        ttk.Label(body_sc, text="Works with public playlists or private links (secret token). No login required.",
                   style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
         # Right column: CSV
@@ -201,7 +203,7 @@ class Spotify2MP3GUI:
         ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=2, column=1, sticky='w', padx=(20,0))
 
-        # Threads + Convert
+        # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
         row_actions.pack(fill='x', pady=(10, 2))
         row_actions.grid_columnconfigure(0, weight=1)
@@ -218,9 +220,13 @@ class Spotify2MP3GUI:
         self.thread_spin.pack(side='left', padx=(8, 12))
         Tooltip(self.thread_spin, 'Number of parallel downloads (1–8). 2–4 recommended.')
 
-        self.convert_button = ttk.Button(row_actions, text='Convert', style='Accent.TButton',
+        btns = ttk.Frame(row_actions, style='CardBody.TFrame'); btns.grid(row=0, column=1, sticky='e')
+        self.convert_button = ttk.Button(btns, text='Convert', style='Accent.TButton',
                                          command=self.start_conversion, state=tk.DISABLED)
-        self.convert_button.grid(row=0, column=1, sticky='e')
+        self.convert_button.pack(side='left', padx=(0, 8))
+        self.stop_button = ttk.Button(btns, text='Stop', style='Danger.TButton',
+                                      command=self.stop_conversion, state=tk.DISABLED)
+        self.stop_button.pack(side='left')
 
         # Downloads card
         lf_dl = ttk.Labelframe(self.root, text="Downloads", style='Card.TLabelframe')
@@ -257,9 +263,8 @@ class Spotify2MP3GUI:
         self.canvas.pack(side='left', fill='both', expand=True)
         vscroll.pack(side='right', fill='y')
 
-    # ---------- Spotify loader (OAuth PKCE — only here) ----------
+    # ---------- Spotify loader ----------
     def load_from_spotify_link_wrapper(self):
-        # Lazy import so SoundCloud never touches OAuth code.
         try:
             from spotify_auth import PKCEAuth
         except Exception as e:
@@ -336,7 +341,7 @@ class Spotify2MP3GUI:
         self._set_controls(False)
         self._start_indeterminate("Fetching SoundCloud playlist…")
 
-        cookies_path = self.config.get("cookies_path")  # optional, for edge cases; NOT auth
+        cookies_path = self.config.get("cookies_path")  # optional
 
         def _sc_worker():
             try:
@@ -429,7 +434,7 @@ class Spotify2MP3GUI:
         self.convert_button.config(state=tk.NORMAL if ok else tk.DISABLED)
         self.clear_button.config(state=tk.NORMAL if self.csv_path else tk.DISABLED)
 
-    # ---------- Conversion (thread) ----------
+    # ---------- Conversion ----------
     def start_conversion(self):
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Error', 'Select a CSV and an output folder.'); return
@@ -442,7 +447,6 @@ class Spotify2MP3GUI:
         self.config['exclude_instrumentals'] = bool(self.exclude_instr_var.get())
         self.config['incremental_update']    = bool(self.incremental_var.get())
 
-        # threads (bounded)
         try:
             threads = int(self.concurrency_var.get())
         except Exception:
@@ -465,29 +469,45 @@ class Spotify2MP3GUI:
         try: self.progress.configure(style='Active.Horizontal.TProgressbar')
         except Exception: pass
 
+        # controls
         self._set_controls(False)
+        self.stop_button.config(state=tk.NORMAL)  # keep Stop enabled while running
         self.status_label.config(text='Starting conversion…')
         self.progress.configure(value=0, maximum=100, mode='determinate')
         self._clear_track_list()
 
+        # Create cancel event
+        self._cancel_event = threading.Event()
+
         self._conv_q = queue.Queue(); self._conv_done = False
-        self._conv_thread = threading.Thread(target=self._run_conversion_worker, daemon=True)
+        def _worker():
+            try:
+                conv = Converter(
+                    config=self.config,
+                    status_cb=lambda s: self._conv_q.put(('status', s)),
+                    progress_cb=lambda cur, maxi: self._conv_q.put(('progress', (cur, maxi))),
+                    item_cb=lambda k, d: self._conv_q.put(('item', (k, d))),
+                    cancel_event=self._cancel_event
+                )
+                self._conv_obj = conv
+                playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
+                out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
+                self._conv_q.put(('done', out_dir))
+            except Exception as e:
+                self._conv_q.put(('error', str(e)))
+            finally:
+                self._conv_obj = None
+
+        self._conv_thread = threading.Thread(target=_worker, daemon=True)
         self._conv_thread.start()
         self.root.after(80, self._poll_conversion_queue)
 
-    def _run_conversion_worker(self):
-        try:
-            conv = Converter(
-                config=self.config,
-                status_cb=lambda s: self._conv_q.put(('status', s)),
-                progress_cb=lambda cur, maxi: self._conv_q.put(('progress', (cur, maxi))),
-                item_cb=lambda k, d: self._conv_q.put(('item', (k, d))),
-            )
-            playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
-            out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
-            self._conv_q.put(('done', out_dir))
-        except Exception as e:
-            self._conv_q.put(('error', str(e)))
+    def stop_conversion(self):
+        """User pressed Stop: request cancellation."""
+        if self._cancel_event and not self._cancel_event.is_set():
+            self._cancel_event.set()
+            self.stop_button.config(state=tk.DISABLED)
+            self.status_label.config(text='Cancelling…')
 
     def _poll_conversion_queue(self):
         if not self._conv_q: return
@@ -500,23 +520,42 @@ class Spotify2MP3GUI:
                     _cur, _maxi = payload
                 elif kind == 'item':
                     ev, data = payload
-                    self._handle_item_event(ev, data)
+                    if ev == 'cancel_all':
+                        # Global cancel signal from converter
+                        self._stop_timer()
+                        try: self.progress.configure(style='Error.Horizontal.TProgressbar')
+                        except Exception: pass
+                        self.status_label.config(text='⛔ Cancelled')
+                        self.stop_button.config(state=tk.DISABLED)
+                        # keep listening for 'done' to re-enable UI
+                    else:
+                        self._handle_item_event(ev, data)
                 elif kind == 'done':
                     self.last_output_dir = payload
                     if self._total_tracks > 0:
                         self.progress.configure(maximum=self._total_tracks * 100, value=self._total_tracks * 100)
                     elapsed = int(time.time() - self._t0) if self._t0 else 0
-                    self._stop_timer(final_text=f"⏱ Total download time: {self._format_duration(elapsed)}")
-                    self.status_label.config(text='✅ Conversion complete')
-                    try: self.progress.configure(style='Ok.Horizontal.TProgressbar')
-                    except Exception: pass
-                    self._set_controls(True); self._conv_done = True; self.root.bell()
+                    if self._cancel_event and self._cancel_event.is_set():
+                        self._stop_timer(final_text=f"⏱ Cancelled after: {self._format_duration(elapsed)}")
+                        self.status_label.config(text='⛔ Cancelled')
+                        try: self.progress.configure(style='Error.Horizontal.TProgressbar')
+                        except Exception: pass
+                    else:
+                        self._stop_timer(final_text=f"⏱ Total download time: {self._format_duration(elapsed)}")
+                        self.status_label.config(text='✅ Conversion complete')
+                        try: self.progress.configure(style='Ok.Horizontal.TProgressbar')
+                        except Exception: pass
+                    self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
+                    self._conv_done = True; self.root.bell()
+                    self._cancel_event = None
                 elif kind == 'error':
                     self._stop_timer()
                     try: self.progress.configure(style='Error.Horizontal.TProgressbar')
                     except Exception: pass
                     messagebox.showerror('Error', f'Unexpected error: {payload}')
-                    self._set_controls(True); self._conv_done = True
+                    self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
+                    self._conv_done = True
+                    self._cancel_event = None
         except queue.Empty:
             pass
         if self._conv_thread and self._conv_thread.is_alive() and not self._conv_done:
@@ -631,6 +670,8 @@ class Spotify2MP3GUI:
                   self.thread_spin):
             try: w.config(state=state)
             except Exception: pass
+        if enabled:
+            self.stop_button.config(state=tk.DISABLED)  # Stop only enabled during runs
 
     def _start_indeterminate(self, text: str):
         self.status_label.config(text=text)
