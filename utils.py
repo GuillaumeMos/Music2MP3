@@ -37,9 +37,29 @@ class Tooltip:
             self.tip = None
 
 
+# -----------------------------
+# OS open helpers
+# -----------------------------
 def open_folder(path: str | None) -> bool:
     """Open a folder in the OS file browser."""
     if not path or not os.path.isdir(path):
+        return False
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(path)  # noqa: P204
+        elif system == "Darwin":
+            subprocess.run(["open", path])
+        else:
+            subprocess.run(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+def open_path(path: str | None) -> bool:
+    """Open a file or folder with the default OS handler."""
+    if not path or not os.path.exists(path):
         return False
     try:
         system = platform.system()

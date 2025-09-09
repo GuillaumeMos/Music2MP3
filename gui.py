@@ -4,7 +4,7 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 from config import load_config, resource_path
-from utils import Tooltip, open_folder
+from utils import Tooltip, open_folder, open_path
 from converter import Converter
 from spotify_api import SpotifyClient
 from soundcloud_api import SoundCloudClient
@@ -17,10 +17,10 @@ except Exception:
     CONFIG_FILE = resource_path("config.json")
 
 
-class Music2MP3GUI:
+class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title('Music2MP3')
+        self.root.title('Spotify2MP3')
         self.root.geometry('980x880')
         self.root.minsize(880, 740)
 
@@ -64,9 +64,8 @@ class Music2MP3GUI:
         self.m3u_var             = tk.BooleanVar(value=bool(self.config.get("generate_m3u", True)))
         self.exclude_instr_var   = tk.BooleanVar(value=bool(self.config.get("exclude_instrumentals", False)))
         self.incremental_var     = tk.BooleanVar(value=bool(self.config.get("incremental_update", True)))
-        self.remember_default_var= tk.BooleanVar(value=True)
 
-        # default dir (persisted)
+        # default dir (persisted automatically)
         self._apply_persisted_default_output()
 
         # default directory for file dialogs
@@ -152,7 +151,7 @@ class Music2MP3GUI:
 
         header = ttk.Frame(self.root)
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
-        ttk.Label(header, text="Music2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
+        ttk.Label(header, text="Spotify2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
         ttk.Label(header, text="Convert playlists to local audio (M4A/MP3)", style='Sub.TLabel').pack(side='left', padx=(12, 0))
 
         cols = ttk.Frame(self.root)
@@ -195,8 +194,8 @@ class Music2MP3GUI:
         self.drop_label = tk.Label(self.drop_frame, text='Drop a CSV here or click to browse',
                                    bg='#eef2ff', fg='#1f2937', font=("Segoe UI", 11))
         self.drop_label.pack(expand=True, fill='both')
-        self.drop_label.bind('<Button-1>', self.browse_csv)
-        Tooltip(self.drop_label, 'Export with Exportify/TuneMyMusic. Click to select.')
+        self.drop_label.bind('<Button-1>', self._click_csv_label)
+        Tooltip(self.drop_label, 'Click to select a CSV. Once loaded, click again to open it.')
 
         self.clear_button = ttk.Button(body_csv, text='Clear CSV', command=self.clear_selection, state=tk.DISABLED)
         self.clear_button.pack(pady=(8, 0))
@@ -228,11 +227,6 @@ class Music2MP3GUI:
         ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=1, column=1, sticky='w', padx=(20,0))
         ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=2, column=1, sticky='w', padx=(20,0))
-
-        # Persist default output
-        row_def = ttk.Frame(body_out, style='CardBody.TFrame'); row_def.pack(fill='x', pady=(8, 0))
-        ttk.Checkbutton(row_def, text='Remember this as default output folder', variable=self.remember_default_var)\
-            .pack(side='left')
 
         # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
@@ -293,6 +287,14 @@ class Music2MP3GUI:
 
         self.canvas.pack(side='left', fill='both', expand=True)
         vscroll.pack(side='right', fill='y')
+
+    # ---------- click CSV label ----------
+    def _click_csv_label(self, _=None):
+        if self.csv_path and os.path.isfile(self.csv_path):
+            if not open_path(self.csv_path):
+                messagebox.showerror('Error', 'Unable to open CSV.')
+        else:
+            self.browse_csv()
 
     # ---------- Spotify loader ----------
     def load_from_spotify_link_wrapper(self):
@@ -417,15 +419,14 @@ class Music2MP3GUI:
 
     # ---------- File handlers ----------
     def _style_drop_loaded(self, name: str):
-        self.drop_label.config(text=f'CSV (generated): {name}', bg='#dcfce7', fg='#065f46')
+        self.drop_label.config(text=f'CSV: {name}  (click to open)', bg='#dcfce7', fg='#065f46')
         self.drop_frame.config(bg='#dcfce7')
 
     def browse_csv(self, _=None):
         path = filedialog.askopenfilename(initialdir=self.last_directory, filetypes=[('CSV files','*.csv')])
         if path:
             self.csv_path = path; self.last_directory = os.path.dirname(path)
-            self.drop_label.config(text=f'CSV: {os.path.basename(path)}', bg='#dcfce7', fg='#065f46')
-            self.drop_frame.config(bg='#dcfce7')
+            self._style_drop_loaded(os.path.basename(path))
             self.status_label.config(text='CSV loaded.')
             self._loaded_playlist_name_from_spotify = None
             self.update_convert_button_state()
@@ -448,17 +449,12 @@ class Music2MP3GUI:
         if path:
             self.output_folder = path
             self.last_directory = path
-            self.out_entry.config(state='normal')
-            self.out_entry.delete(0, 'end')
-            self.out_entry.insert(0, path)
-            self.out_entry.config(state='readonly')
+            self.out_entry.config(state='normal'); self.out_entry.delete(0, 'end')
+            self.out_entry.insert(0, path); self.out_entry.config(state='readonly')
             self.status_label.config(text='Output folder selected.')
-
-            # Persist as default if asked
-            if self.remember_default_var.get():
-                self.config['default_output_dir'] = path
-                self._save_config()
-
+            # Always persist the last selected output folder
+            self.config['default_output_dir'] = path
+            self._save_config()
             self.update_convert_button_state()
 
     def open_output_folder(self):
@@ -485,10 +481,9 @@ class Music2MP3GUI:
         self.config['incremental_update']    = bool(self.incremental_var.get())
         self.config['concurrency']           = int(self.concurrency_var.get())
 
-        # persist default folder if checkbox checked
-        if self.remember_default_var.get() and self.output_folder:
+        # always persist last output folder
+        if self.output_folder:
             self.config['default_output_dir'] = self.output_folder
-
         self._save_config()
 
         self._t0 = time.time()
@@ -762,5 +757,5 @@ class Music2MP3GUI:
 
 if __name__ == '__main__':
     root = tk.Tk()
-    app = Music2MP3GUI(root)
+    app = Spotify2MP3GUI(root)
     root.mainloop()
