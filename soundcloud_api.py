@@ -1,84 +1,92 @@
 # soundcloud_api.py
 import json
 import os
+import sys
 import platform
-import re
-import subprocess
+from typing import Tuple, List, Dict
 
-try:
-    from config import resource_path
-except Exception:
-    def resource_path(p: str) -> str:
-        return os.path.join(os.path.abspath("."), p)
+from utils import run_quiet
+from config import resource_path
 
 
-def _bin_ytdlp() -> str:
+def _find_ytdlp() -> str:
+    """
+    Try to use the bundled yt-dlp first, then fallback to PATH.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
     if platform.system() == "Windows":
-        cand = resource_path(os.path.join("yt-dlp", "yt-dlp.exe"))
-        return cand if os.path.isfile(cand) else os.path.join("yt-dlp", "yt-dlp.exe")
+        cand = os.path.join(resource_path("yt-dlp"), "yt-dlp.exe")
+        return cand if os.path.isfile(cand) else "yt-dlp.exe"
     else:
-        cand = resource_path(os.path.join("yt-dlp", "yt-dlp"))
-        return cand if os.path.isfile(cand) else os.path.join("yt-dlp", "yt-dlp")
+        cand = os.path.join(resource_path("yt-dlp"), "yt-dlp")
+        return cand if os.path.isfile(cand) else "yt-dlp"
 
 
 class SoundCloudClient:
-    @staticmethod
-    def is_playlist_url(url: str) -> bool:
-        # ex: https://soundcloud.com/<user>/sets/<playlist-slug>
-        return bool(re.search(r"soundcloud\.com/.+?/sets/.+", url or "", re.I))
+    """
+    Build a CSV-ready list of rows from a SoundCloud playlist (or single track) URL,
+    without any authentication. Private links with secret token also work.
+    """
 
-    def fetch_playlist(self, playlist_url: str, cookies_path: str | None = None):
+    def fetch_playlist(self, url: str, cookies_path: str | None = None) -> Tuple[List[Dict], str]:
         """
-        Retourne (rows, playlist_name)
-        rows: dicts compatibles avec le converter + 'Source URL' (pour download direct)
-        Colonnes:
-          - Track Name
-          - Artist Name(s)
-          - Album Name  (nom du set/playlist SoundCloud)
-          - Duration (ms)
-          - Source URL  (URL directe SoundCloud de la piste)
-          - Track URI   (clé stable pour dédup : URL ou soundcloud:track:<id>)
+        Returns (rows, name)
+
+        Each row:
+          Track Name, Artist Name(s), Album Name, Duration (ms), Source URL, Track URI
         """
-        ytdlp = _bin_ytdlp()
+        data = self._dump_sc_json(url, cookies_path=cookies_path)
+        rows: List[Dict] = []
+        title = data.get("title") or data.get("playlist_title") or "SoundCloud"
 
-        # Playlist SoundCloud → JSON complet avec entries
-        if self.is_playlist_url(playlist_url):
-            cmd = [ytdlp, "--dump-single-json", "--no-warnings", playlist_url]
-        else:
-            # URL piste unique → un seul objet
-            cmd = [ytdlp, "--dump-single-json", "--no-warnings", "--no-playlist", playlist_url]
+        # Playlist with entries
+        entries = data.get("entries")
+        if isinstance(entries, list) and entries:
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                rows.append(self._row_from_info(e))
+            return rows, title
 
-        if cookies_path and os.path.isfile(cookies_path):
+        # Single track
+        rows.append(self._row_from_info(data))
+        return rows, title
+
+    def _row_from_info(self, info: Dict) -> Dict:
+        name = info.get("title") or "Unknown"
+        artist = info.get("uploader") or info.get("uploader_id") or "Unknown"
+        duration_sec = info.get("duration") or 0
+        dur_ms = int(float(duration_sec) * 1000) if duration_sec else ""
+        url = info.get("webpage_url") or ""
+        tid = info.get("id") or ""
+        album = info.get("album") or ""  # SoundCloud rarely set
+
+        return {
+            "Track Name": name,
+            "Artist Name(s)": artist,
+            "Album Name": album,
+            "Duration (ms)": dur_ms,
+            "Source URL": url,
+            "Track URI": f"soundcloud:track:{tid}" if tid else "",
+        }
+
+    def _dump_sc_json(self, url: str, cookies_path: str | None = None) -> Dict:
+        ytdlp = _find_ytdlp()
+        cmd = [
+            ytdlp,
+            "--flat-playlist",
+            "--dump-single-json",
+            "--no-warnings",
+            "-q",
+            url,
+        ]
+        if cookies_path:
             cmd += ["--cookies", cookies_path]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = run_quiet(cmd, text=True, capture_output=True)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr or "yt-dlp failed on SoundCloud URL")
-
-        data = json.loads(proc.stdout or "{}")
-        playlist_title = data.get("title") or "SoundCloud"
-        entries = data.get("entries") or [data]
-
-        rows = []
-        for e in entries:
-            if not e:
-                continue
-            title = e.get("title") or "Unknown"
-            artist = e.get("uploader") or e.get("artist") or e.get("uploader_id") or "Unknown"
-            dur_ms = int(float(e.get("duration") or 0) * 1000)
-            webpage = e.get("webpage_url") or e.get("url") or ""
-            track_id = e.get("id")
-
-            # clé de dédup
-            track_uri = webpage or (track_id and f"soundcloud:track:{track_id}") or ""
-
-            rows.append({
-                "Track Name": title,
-                "Artist Name(s)": artist,
-                "Album Name": playlist_title,
-                "Duration (ms)": str(dur_ms),
-                "Source URL": webpage,
-                "Track URI": track_uri,
-            })
-
-        return rows, playlist_title
+        try:
+            return json.loads(proc.stdout or "{}")
+        except Exception as e:
+            raise RuntimeError(f"Invalid JSON from yt-dlp: {e}")
