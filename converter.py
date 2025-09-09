@@ -15,7 +15,7 @@ from config import resource_path
 
 
 def _find_binaries():
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    _ = getattr(sys, "_MEIPASS", os.path.abspath("."))
     if platform.system() == "Windows":
         ff = os.path.join(resource_path("ffmpeg"), "ffmpeg.exe")
         yd = os.path.join(resource_path("yt-dlp"), "yt-dlp.exe")
@@ -30,11 +30,25 @@ def _find_binaries():
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+    """
+    Robust normalization so keys match filenames even with punctuation/dashes.
+    - Lowercase, unify en/em dashes to '-'
+    - Remove most punctuation except hyphen (we standardize ' - ' delimiter)
+    - Collapse spaces, normalize ' - ' spacing
+    """
+    s = (s or "").lower()
+    s = s.replace("–", "-").replace("—", "-")  # en/em dash -> hyphen
+    # keep word chars, spaces, and hyphen
+    s = re.sub(r"[^\w\s\-]", "", s, flags=re.U)
+    # normalize hyphen spacing
+    s = re.sub(r"\s*-\s*", " - ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _strip_leading_index(name: str) -> str:
     base = os.path.splitext(name)[0]
+    # strip leading "001 - ", "01.", "12_ ", etc.
     base = re.sub(r"^\s*\d+\s*[-_\.]\s*", "", base)
     return base
 
@@ -50,6 +64,7 @@ def _existing_keys_in_folder(folder: str) -> set[str]:
         if not fn.lower().endswith((".mp3", ".m4a")):
             continue
         base = _strip_leading_index(fn)
+        # expect "<title> - <artist>"
         if " - " in base:
             t, a = base.rsplit(" - ", 1)
         else:
@@ -128,7 +143,7 @@ class Converter:
             out_dir = os.path.join(output_folder, playlist_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        # incremental
+        # incremental snapshot
         existing_keys = _existing_keys_in_folder(out_dir) if self.cfg.get("incremental_update", True) else set()
 
         todo = []
@@ -162,7 +177,6 @@ class Converter:
         workers = max(1, min(8, int(self.cfg.get("concurrency", 3))))
         cookies_path = self.cfg.get("cookies_path")
 
-        # thread pool
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = []
             for idx, row in todo:
@@ -170,15 +184,13 @@ class Converter:
                     break
                 futures.append(ex.submit(self._download_one, idx, row, out_dir, playlist_name, cookies_path, len(rows)))
             for f in as_completed(futures):
-                _ = f.exception()  # surfaces exceptions
+                _ = f.exception()
                 if self.cancel.is_set():
-                    # let the running tasks notice cancel; don't wait for all
                     break
 
         if self.cancel.is_set():
             self.status_cb("Cancelled.")
             self.item_cb('cancel_all', {})
-            # don't write M3U on cancel
             return out_dir
 
         if self.cfg.get("generate_m3u", True):
@@ -208,18 +220,15 @@ class Converter:
         return name
 
     def _download_one(self, idx: int, row: dict, out_dir: str, playlist_name: str, cookies_path: str | None, total_tracks: int):
-        # Cancel before starting
         if self.cancel.is_set():
             self.item_cb('error', {'idx': idx, 'message': 'Cancelled'})
             return
 
-        # init event
         title = row.get("Track Name") or "Track"
         artist = row.get("Artist Name(s)") or ""
         nice_title = f"{title} - {artist}" if artist else title
         self.item_cb('init', {'idx': idx, 'title': nice_title})
 
-        # select source spec
         src_url = (row.get("Source URL") or "").strip()
         dur_ms = None
         try:
@@ -265,7 +274,6 @@ class Converter:
                 spec = f"ytsearch1:{q}"
         cmd += [spec]
 
-        # Spawn yt-dlp (hidden) and parse progress
         p = popen_quiet(cmd, text=True)
 
         stderr_q = queue.Queue()
@@ -282,18 +290,13 @@ class Converter:
 
         prog_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:at\s+([^\s]+/s))?.*?(?:ETA\s+([\d:\.]+))?", re.I)
 
-        # progress loop with cancel
         while True:
             if self.cancel.is_set():
-                # Terminate process nicely, then force kill if needed
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+                try: p.terminate()
+                except Exception: pass
                 try:
                     for _ in range(20):
-                        if p.poll() is not None:
-                            break
+                        if p.poll() is not None: break
                         time.sleep(0.05)
                     if p.poll() is None:
                         p.kill()
@@ -328,14 +331,18 @@ class Converter:
         if rc == 0:
             self.item_cb('done', {'idx': idx})
         else:
-            # pull last error line
-            err = ""
+            # Collect last stderr lines for a meaningful error
+            err_lines = []
             try:
                 while True:
-                    err = stderr_q.get_nowait()
+                    err_lines.append(stderr_q.get_nowait().strip())
             except queue.Empty:
                 pass
-            self.item_cb('error', {'idx': idx, 'message': err.strip()})
+            tail = [ln for ln in err_lines[-20:] if ln]
+            concise = next((ln for ln in reversed(tail)
+                            if "ERROR" in ln or "HTTP" in ln or "403" in ln or "404" in ln or "SSL" in ln), None)
+            msg = concise or ("\n".join(tail) if tail else "Unknown download error")
+            self.item_cb('error', {'idx': idx, 'message': msg})
 
     def _write_m3u(self, out_dir: str, playlist_name: str):
         files = [f for f in os.listdir(out_dir) if f.lower().endswith((".mp3", ".m4a"))]
