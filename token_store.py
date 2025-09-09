@@ -5,7 +5,7 @@ except ImportError:
     keyring = None
 
 class RefreshTokenStore:
-    def __init__(self, service="spotify2mp3", user="default"):
+    def __init__(self, service="Music2MP3", user="default"):
         self.service, self.user = service, user
     def get(self):
         if not keyring: return None

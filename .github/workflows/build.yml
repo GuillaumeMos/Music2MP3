@@ -1,4 +1,4 @@
-name: Build Spotify2MP3
+name: Build Music2MP3
 
 permissions:
   contents: write
@@ -27,18 +27,18 @@ jobs:
           - os: windows
             runner: windows-latest
             py: "3.13"
-            spec: Spotify2MP3-Windows.spec
-            artifact: Spotify2MP3_Windows.exe
+            spec: Music2MP3-Windows.spec
+            artifact: Music2MP3_Windows.exe
           - os: macos
             runner: macos-latest
             py: "3.13"
-            spec: Spotify2MP3-macOS.spec
-            artifact: Spotify2MP3_macOS.zip
+            spec: Music2MP3-macOS.spec
+            artifact: Music2MP3_macOS.zip
           - os: linux
             runner: ubuntu-22.04
             py: "3.13"
-            spec: Spotify2MP3-Linux.spec
-            artifact: Spotify2MP3_Linux_x86-64.AppImage
+            spec: Music2MP3-Linux.spec
+            artifact: Music2MP3_Linux_x86-64.AppImage
 
     steps:
       - uses: actions/checkout@v4
@@ -113,23 +113,23 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          Rename-Item -Path "dist/Spotify2MP3.exe" -NewName "Spotify2MP3_Windows.exe"
+          Rename-Item -Path "dist/Music2MP3.exe" -NewName "Music2MP3_Windows.exe"
 
       - name: Zip macOS .app
         if: matrix.os == 'macos'
         run: |
           cd dist
-          ditto -c -k --keepParent Spotify2MP3.app Spotify2MP3_macOS.zip
+          ditto -c -k --keepParent Music2MP3.app Music2MP3_macOS.zip
 
       - name: Build Linux AppImage
         if: matrix.os == 'linux'
         run: |
           set -e
-          chmod +x dist/Spotify2MP3/Spotify2MP3
+          chmod +x dist/Music2MP3/Music2MP3
 
           # Préparer AppDir
           mkdir -p AppDir/usr/bin
-          cp -r dist/Spotify2MP3 AppDir/Spotify2MP3
+          cp -r dist/Music2MP3 AppDir/Music2MP3
           cp ffmpeg/ffmpeg AppDir/usr/bin/ffmpeg
           cp yt-dlp/yt-dlp AppDir/usr/bin/yt-dlp
           # assets optionnels si présents
@@ -137,11 +137,11 @@ jobs:
           if [ -f icon.png ]; then cp icon.png AppDir/icon.png; fi
 
           # Desktop file
-          cat > AppDir/Spotify2MP3.desktop <<'EOF'
+          cat > AppDir/Music2MP3.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
-          Name=Spotify2MP3
-          Exec=Spotify2MP3/Spotify2MP3
+          Name=Music2MP3
+          Exec=Music2MP3/Music2MP3
           Icon=icon
           Categories=AudioVideo;Audio;Music;
           EOF
@@ -150,24 +150,24 @@ jobs:
           cat > AppDir/AppRun <<'EOF'
           #!/bin/sh
           APPDIR="$(dirname "$(readlink -f "$0")")"
-          exec "$APPDIR/Spotify2MP3/Spotify2MP3" "$@"
+          exec "$APPDIR/Music2MP3/Music2MP3" "$@"
           EOF
           chmod +x AppDir/AppRun
 
           # appimagetool
           wget -c "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool.AppImage
           chmod +x appimagetool.AppImage
-          ./appimagetool.AppImage AppDir Spotify2MP3_Linux_x86-64.AppImage
-          chmod +x Spotify2MP3_Linux_x86-64.AppImage
+          ./appimagetool.AppImage AppDir Music2MP3_Linux_x86-64.AppImage
+          chmod +x Music2MP3_Linux_x86-64.AppImage
 
       # ---- Upload as build artifacts (useful for debugging) ----
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/Spotify2MP3_Windows.exe
-            dist/Spotify2MP3_macOS.zip
-            Spotify2MP3_Linux_x86-64.AppImage
+            dist/Music2MP3_Windows.exe
+            dist/Music2MP3_macOS.zip
+            Music2MP3_Linux_x86-64.AppImage
           if-no-files-found: ignore
 
       # ---- Create/Update GitHub Draft Release (one per matrix run) ----
@@ -175,10 +175,10 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ env.LEVEL }}
-          name: Spotify2MP3 v${{ env.LEVEL }}
+          name: Music2MP3 v${{ env.LEVEL }}
           draft: true
           prerelease: false
           files: |
-            dist/Spotify2MP3_Windows.exe
-            dist/Spotify2MP3_macOS.zip
-            Spotify2MP3_Linux_x86-64.AppImage
+            dist/Music2MP3_Windows.exe
+            dist/Music2MP3_macOS.zip
+            Music2MP3_Linux_x86-64.AppImage

@@ -52,7 +52,7 @@ with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
 
 # Launch the real GUI class but prefill paths
 root = tk.Tk()
-app = appgui.Spotify2MP3GUI(root)
+app = appgui.Music2MP3GUI(root)
 
 # Set the CSV and an output temp folder to enable the Convert button
 app.csv_path = tmp_csv

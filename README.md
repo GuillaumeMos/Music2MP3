@@ -1,6 +1,6 @@
-# Spotify2MP3
+# Music2MP3
 
-**Spotify2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
+**Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
 You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others) **or paste a Spotify playlist link** and sign in (PKCE, **no client secret**).
 
 The app downloads each track via **yt-dlp** as:
@@ -42,9 +42,9 @@ Everything is bundled—no Python or external installs required.
 
 Grab the latest build from the **Releases** page:
 
-- **Windows**: download the ZIP, extract, run `Spotify2MP3.exe`
-- **macOS**: download the ZIP, unzip, open `Spotify2MP3.app` - stanbdy
-- **Linux**: download `Spotify2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run - stanbdy
+- **Windows**: download the ZIP, extract, run `Music2MP3.exe`
+- **macOS**: download the ZIP, unzip, open `Music2MP3.app` - stanbdy
+- **Linux**: download `Music2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run - stanbdy
 
 ---
 
@@ -132,9 +132,9 @@ Grab the latest build from the **Releases** page:
    - macOS: `ffmpeg/ffmpeg`, `yt-dlp/yt-dlp`
    - Linux: same as macOS (or use the AppImage workflow)
 4. Run the platform spec, e.g.:
-   - Windows: `pyinstaller Spotify2MP3-Windows.spec`
-   - macOS: `pyinstaller Spotify2MP3-macOS.spec`
-   - Linux: `pyinstaller Spotify2MP3-Linux.spec` (AppImage packaging script included in CI)
+   - Windows: `pyinstaller Music2MP3-Windows.spec`
+   - macOS: `pyinstaller Music2MP3-macOS.spec`
+   - Linux: `pyinstaller Music2MP3-Linux.spec` (AppImage packaging script included in CI)
 
 The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the single-folder app in `dist/`.
 
