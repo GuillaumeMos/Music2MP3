@@ -7,10 +7,11 @@ from config import load_config, resource_path
 from utils import Tooltip, open_folder
 from converter import Converter
 from spotify_api import SpotifyClient
-from spotify_auth import PKCEAuth
 from soundcloud_api import SoundCloudClient
 
-# Optionnel: chemin du config pour persister les choix UI
+# IMPORTANT:
+# - No import of spotify_auth at module level.
+#   (PKCEAuth is imported lazily only inside the Spotify handler.)
 try:
     from config import CONFIG_FILE
 except Exception:
@@ -21,8 +22,8 @@ class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('980x820')
-        self.root.minsize(880, 700)
+        self.root.geometry('980x860')
+        self.root.minsize(880, 720)
 
         # state
         self.csv_path = None
@@ -53,9 +54,14 @@ class Spotify2MP3GUI:
         self._t0 = None
         self._timer_running = False
 
-        # options UI
-        self.prefix_numbers_var = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
-        self.concurrency_var   = tk.IntVar(value=int(self.config.get("concurrency", 3)))  # NEW: threads
+        # options UI (defaults from config)
+        self.prefix_numbers_var  = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
+        self.concurrency_var     = tk.IntVar(value=int(self.config.get("concurrency", 3)))
+        self.deep_search_var     = tk.BooleanVar(value=bool(self.config.get("deep_search", True)))
+        self.transcode_mp3_var   = tk.BooleanVar(value=bool(self.config.get("transcode_mp3", False)))
+        self.m3u_var             = tk.BooleanVar(value=bool(self.config.get("generate_m3u", True)))
+        self.exclude_instr_var   = tk.BooleanVar(value=bool(self.config.get("exclude_instrumentals", False)))
+        self.incremental_var     = tk.BooleanVar(value=bool(self.config.get("incremental_update", True)))
 
         # default dir
         if platform.system() == "Windows":
@@ -93,8 +99,7 @@ class Spotify2MP3GUI:
 
         self.style.configure('TButton', padding=(10, 6))
         self.style.configure('Accent.TButton', padding=(12, 8), foreground='white', background=PRIMARY)
-        self.style.map('Accent.TButton',
-                       background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')])
+        self.style.map('Accent.TButton', background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')])
 
         self.style.configure('Card.TLabelframe', background=CARD_BG, borderwidth=1, relief='solid')
         self.style.configure('Card.TLabelframe.Label', background=CARD_BG, foreground=SUB, padding=(6, 0))
@@ -120,7 +125,7 @@ class Spotify2MP3GUI:
     # ---------- UI ----------
     def _build_ui(self):
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(3, weight=1)
+        self.root.grid_rowconfigure(4, weight=1)
 
         header = ttk.Frame(self.root)
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
@@ -144,7 +149,7 @@ class Spotify2MP3GUI:
         self.spotify_load_btn.pack(side='left')
         ttk.Label(body_sp, text="Sign-in opens in your browser (OAuth PKCE).", style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
-        # Left column: SoundCloud (sans auth — liens publics/privés via token secret OK)
+        # Left column: SoundCloud (NO auth)
         lf_sc = ttk.Labelframe(cols, text="From SoundCloud playlist", style='Card.TLabelframe')
         lf_sc.grid(row=1, column=0, sticky='nsew', padx=(0, 12), pady=(6, 6))
         body_sc = ttk.Frame(lf_sc, style='CardBody.TFrame'); body_sc.pack(fill='both', expand=True, padx=12, pady=10)
@@ -154,7 +159,7 @@ class Spotify2MP3GUI:
         self.sc_entry = ttk.Entry(row_sc); self.sc_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
         self.sc_load_btn = ttk.Button(row_sc, text='Load from SoundCloud', command=self.load_from_soundcloud_link)
         self.sc_load_btn.pack(side='left')
-        ttk.Label(body_sc, text="Public playlists or private links with secret token supported (no login).",
+        ttk.Label(body_sc, text="Works with public playlists or private links that include a secret token. No login required.",
                   style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
         # Right column: CSV
@@ -187,10 +192,16 @@ class Spotify2MP3GUI:
         self.open_folder_btn = ttk.Button(row_out, text='Open', command=self.open_output_folder)
         self.open_folder_btn.pack(side='left', padx=(6, 0))
 
-        opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x')
-        ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).pack(side='left')
+        # Options group
+        opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x', pady=(4, 0))
+        ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).grid(row=0, column=0, sticky='w')
+        ttk.Checkbutton(opt, text='Deep search (more accurate, slower)', variable=self.deep_search_var).grid(row=0, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Transcode to MP3 (VBR 0)', variable=self.transcode_mp3_var).grid(row=1, column=0, sticky='w')
+        ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=1, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=0, sticky='w')
+        ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=2, column=1, sticky='w', padx=(20,0))
 
-        # --- NEW: ligne Threads + Convert ---
+        # Threads + Convert
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
         row_actions.pack(fill='x', pady=(10, 2))
         row_actions.grid_columnconfigure(0, weight=1)
@@ -213,8 +224,8 @@ class Spotify2MP3GUI:
 
         # Downloads card
         lf_dl = ttk.Labelframe(self.root, text="Downloads", style='Card.TLabelframe')
-        lf_dl.grid(row=3, column=0, sticky='nsew', padx=24, pady=(10, 16))
-        self.root.grid_rowconfigure(3, weight=1)
+        lf_dl.grid(row=4, column=0, sticky='nsew', padx=24, pady=(10, 16))
+        self.root.grid_rowconfigure(4, weight=1)
 
         body_dl = ttk.Frame(lf_dl, style='CardBody.TFrame'); body_dl.pack(fill='both', expand=True, padx=12, pady=10)
         body_dl.grid_columnconfigure(0, weight=1)
@@ -246,8 +257,15 @@ class Spotify2MP3GUI:
         self.canvas.pack(side='left', fill='both', expand=True)
         vscroll.pack(side='right', fill='y')
 
-    # ---------- Spotify loader ----------
+    # ---------- Spotify loader (OAuth PKCE — only here) ----------
     def load_from_spotify_link_wrapper(self):
+        # Lazy import so SoundCloud never touches OAuth code.
+        try:
+            from spotify_auth import PKCEAuth
+        except Exception as e:
+            messagebox.showerror('Missing dependency', f'spotify_auth.PKCEAuth not available:\n{e}')
+            return
+
         url = self.spotify_entry.get().strip()
         pid = SpotifyClient.extract_playlist_id(url)
         if not pid:
@@ -307,7 +325,7 @@ class Spotify2MP3GUI:
         if self._sp_thread and self._sp_thread.is_alive() and not self._sp_done:
             self.root.after(100, self._poll_spotify_queue)
 
-    # ---------- SoundCloud loader (sans auth) ----------
+    # ---------- SoundCloud loader (NO auth) ----------
     def load_from_soundcloud_link(self):
         url = self.sc_entry.get().strip()
         if not url or "soundcloud.com" not in url:
@@ -318,7 +336,7 @@ class Spotify2MP3GUI:
         self._set_controls(False)
         self._start_indeterminate("Fetching SoundCloud playlist…")
 
-        cookies_path = self.config.get("cookies_path")  # optionnel, ex: si l’utilisateur préfère un cookies.txt
+        cookies_path = self.config.get("cookies_path")  # optional, for edge cases; NOT auth
 
         def _sc_worker():
             try:
@@ -416,9 +434,15 @@ class Spotify2MP3GUI:
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Error', 'Select a CSV and an output folder.'); return
 
-        # options à persister
-        self.config['prefix_numbers'] = bool(self.prefix_numbers_var.get())
-        # NEW: read/bound/persist concurrency
+        # persist options from UI
+        self.config['prefix_numbers']        = bool(self.prefix_numbers_var.get())
+        self.config['deep_search']           = bool(self.deep_search_var.get())
+        self.config['transcode_mp3']         = bool(self.transcode_mp3_var.get())
+        self.config['generate_m3u']          = bool(self.m3u_var.get())
+        self.config['exclude_instrumentals'] = bool(self.exclude_instr_var.get())
+        self.config['incremental_update']    = bool(self.incremental_var.get())
+
+        # threads (bounded)
         try:
             threads = int(self.concurrency_var.get())
         except Exception:
@@ -427,7 +451,7 @@ class Spotify2MP3GUI:
         self.concurrency_var.set(threads)
         self.config['concurrency'] = threads
 
-        # Sauvegarde config si possible
+        # save config
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
