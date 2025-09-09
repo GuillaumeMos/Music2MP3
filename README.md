@@ -43,8 +43,8 @@ Everything is bundled—no Python or external installs required.
 Grab the latest build from the **Releases** page:
 
 - **Windows**: download the ZIP, extract, run `Spotify2MP3.exe`
-- **macOS**: download the ZIP, unzip, open `Spotify2MP3.app`
-- **Linux**: download `Spotify2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run
+- **macOS**: download the ZIP, unzip, open `Spotify2MP3.app` - stanbdy
+- **Linux**: download `Spotify2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run - stanbdy
 
 ---
 
