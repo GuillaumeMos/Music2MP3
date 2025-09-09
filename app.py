@@ -5,7 +5,7 @@ try:
 except Exception:
     DND_AVAILABLE = False
 
-from gui import Spotify2MP3GUI
+from gui import Music2MP3GUI
 
 def main():
     if DND_AVAILABLE:
@@ -16,7 +16,7 @@ def main():
     else:
         root = tk.Tk()
 
-    app = Spotify2MP3GUI(root)
+    app = Music2MP3GUI(root)
     root.mainloop()
 
 if __name__ == "__main__":

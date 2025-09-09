@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Spotify2MP3',
+    name='Music2MP3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

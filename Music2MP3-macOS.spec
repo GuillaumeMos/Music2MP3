@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Spotify2MP3',
+    name='Music2MP3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,11 +41,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Spotify2MP3',
+    name='Music2MP3',
 )
 app = BUNDLE(
     coll,
-    name='Spotify2MP3.app',
+    name='Music2MP3.app',
     icon='icon.icns',
     bundle_identifier=None,
 )
