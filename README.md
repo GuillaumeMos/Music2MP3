@@ -1,56 +1,158 @@
 # Spotify2MP3
 
-Spotify2MP3 is a cross-platform standalone app (Windows EXE, macOS .app) that takes a playlist CSV exported from Spotify via [Exportify](https://exportify.net), Apple Music/YouTube Music via [TuneMyMusic](https://tunemymusic.com), or any other service and batch downloads every track as **M4A** (remuxed at up to the original 128 kbps AAC bitrate) or **high-quality MP3** (VBR 0). Everything’s bundled, no Python or external installs required.
+**Spotify2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
+You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others) **or paste a Spotify playlist link** and sign in (PKCE, **no client secret**).
+
+The app downloads each track via **yt-dlp** as:
+
+- **M4A** (remux; keeps source AAC when available), or
+- **MP3 VBR0** (high quality re-encode via FFmpeg).
+
+Everything is bundled—no Python or external installs required.
 
 ---
 
-##  Download
+## ✨ Highlights
 
-Grab the latest build from the [Releases page](https://github.com/angall1/Spotify2MP3/releases):
-
-- **Windows**: Download the ZIP, extract, and run `Spotify2MP3.exe`  
-- **macOS**: Download the ZIP, unzip, and open `Spotify2MP3.app`  
-
----
-
-##  How to Use
-
-1. **Export your CSV**  
-   - Spotify → [Exportify](https://exportify.net)  
-   - Apple/YouTube/other → [TuneMyMusic](https://tunemymusic.com)  
-2. **Launch the app**.  
-3. **Drag & drop** your CSV (or click the box to browse).  
-4. **Select an output folder**.  
-5. (Optional) Click **Settings** to toggle:  
-   - **Transcode to MP3 (VBR 0)**  
-   - **Generate M3U playlist**  
-   - **Exclude instrumental versions**  
-   - **Other tweaks**  
-6. Hit **Convert Playlist**.  
-
-It will fetch each track remuxing to M4A or re-encoding to MP3 VBR 0—automatically tag title/artist/album/track number, and (if enabled) create a `.m3u` file.
+- **Load directly from a Spotify playlist URL**  
+  Uses **OAuth PKCE** in your browser (scopes: `playlist-read-private`, `playlist-read-collaborative`). Works for **public, private, and collaborative** playlists. No client secret stored.
+- **CSV still supported**  
+  Any CSV with the usual headers (`Track Name`, `Artist Name(s)`, `Album Name`, `Duration (ms)`…) works (Exportify, TuneMyMusic…).
+- **Incremental updates**  
+  If the target playlist folder already exists, the app **adds only new tracks** (no duplicates).  
+  Dedup uses (in order): **Track URI**, then **title+artist tags**, then **filename (title) ignoring any `001 -` prefix**. A small `manifest.json` helps future runs.
+- **Parallel downloads (2–4 workers)**  
+  Faster end-to-end with a safe concurrency level.
+- **Great live UI**
+  - Global progress bar + **per-track progress bars**
+  - **Speed & ETA** per track when available
+  - **Live elapsed time** and **total time** at the end
+- **Optional file numbering**  
+  Toggle **“Number files (001, 002…)”** if you want a fixed order in filenames.  
+  (M3U is generated and sorted by number when present, otherwise by time.)
+- **Extras**
+  - Generate **.m3u** playlist
+  - **MP3 VBR0** re-encode toggle
+  - **Exclude instrumental** versions
+  - “Deep search” mode for more accurate matches
 
 ---
 
-##  Importing to an iPod (MediaMonkey)
+## ⬇️ Download
 
-1. In MediaMonkey, **File → Add/Rescan files to the Library**, and pick your output folder.  
-2. Plug in your iPod.  
-3. Under **Playlists → Imported Playlists**, drag the generated `.m3u` onto your device.  
-4. Sync
+Grab the latest build from the **Releases** page:
 
----
-
-## Notes
-
-- **Any CSV** with the usual headers (`Track Name`, `Artist Name`, `Album Name`) will work.  
-- **M4A mode** uses the original AAC stream (usually capped at 128 kbps).  
-- **MP3 mode** always uses ffmpeg’s best VBR 0 setting for maximum quality.  
-- FFmpeg and yt-dlp are bundled—no extra installs.  
-- If a track fails, tweak its title/artist or flip settings and retry.
+- **Windows**: download the ZIP, extract, run `Spotify2MP3.exe`
+- **macOS**: download the ZIP, unzip, open `Spotify2MP3.app`
+- **Linux**: download `Spotify2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run
 
 ---
 
-## License
+## 🚀 How to Use
 
-MIT  
+### Option A — From a CSV
+
+1. Export your playlist:
+   - Spotify → [Exportify](https://exportify.net)
+   - Apple/YouTube/others → [TuneMyMusic](https://tunemymusic.com)
+2. Launch the app.
+3. **Drag & drop** the CSV (or click to browse).
+4. Choose an **output folder**.
+5. (Optional) Toggle settings (see below).
+6. Click **Convert**.
+
+### Option B — From a Spotify playlist URL
+
+1. Copy a playlist link from Spotify (e.g., `https://open.spotify.com/playlist/...`).
+2. Paste it in the app and click **Load from Spotify**.
+3. Your browser opens for **OAuth PKCE** sign-in (no secret; local redirect to `http://127.0.0.1:8765/callback`).
+4. The app builds a temp CSV internally and shows the track count.
+5. Choose an **output folder**, then click **Convert**.
+
+> Tip: Public **and** private/collaborative playlists are supported after sign-in.
+
+---
+
+## ⚙️ Settings (quick overview)
+
+- **Number files (001, 002…)**  
+  Adds a numeric prefix to filenames. Useful to enforce order.  
+  If unchecked, files are named without the prefix.
+- **Transcode to MP3 (VBR 0)**  
+  Re-encode for maximum compatibility. Otherwise M4A remux keeps the source AAC (commonly ~128 kbps).
+- **Generate M3U playlist**  
+  Creates a `.m3u` in the playlist folder (sorted by number if present, else by time).
+- **Exclude instrumental versions**  
+  Rejects videos with “instrumental” in title.
+- **Deep search**  
+  Slower but more accurate search (tries multiple candidates).
+- **Incremental update** _(enabled internally)_  
+  Skips tracks that already exist in the playlist folder using URI/tags/filename matching. Maintains a `manifest.json`.
+
+---
+
+## 📂 Output
+
+- Files are saved under:  
+  `/<YourOutputFolder>/<PlaylistName>/`
+- Filenames follow either:
+  - `001 - Track Name.m4a` (if numbering is enabled), or
+  - `Track Name.m4a` (if disabled).
+- Basic tags are written (Title, Artist, Album, Track # when numbered).
+- A `.m3u` playlist is generated if enabled.
+
+---
+
+## 💡 Notes
+
+- This tool **does not rip Spotify audio**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded.
+- **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
+- If a track fails, try toggling **Deep search** or adjusting query variants.
+
+---
+
+## 🔐 Privacy & Auth
+
+- Spotify sign-in uses **OAuth PKCE**: no client secret, no data sent to any server we control.
+- The local redirect runs on `http://127.0.0.1:8765/callback` just for the auth code exchange.
+- Tokens are kept in memory for the current session.
+- When loading from a playlist URL, the generated CSV is **temporary** (used internally by the converter).
+
+---
+
+## 🛠️ Build from Source (optional)
+
+> You don’t need this to use the app—releases are prebuilt.  
+> For contributors:
+
+1. Install Python 3.10+ and `pip`.
+2. `pip install -r requirements.txt pyinstaller`
+3. Place platform binaries:
+   - Windows: `ffmpeg/ffmpeg.exe`, `yt-dlp/yt-dlp.exe`
+   - macOS: `ffmpeg/ffmpeg`, `yt-dlp/yt-dlp`
+   - Linux: same as macOS (or use the AppImage workflow)
+4. Run the platform spec, e.g.:
+   - Windows: `pyinstaller Spotify2MP3-Windows.spec`
+   - macOS: `pyinstaller Spotify2MP3-macOS.spec`
+   - Linux: `pyinstaller Spotify2MP3-Linux.spec` (AppImage packaging script included in CI)
+
+The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the single-folder app in `dist/`.
+
+---
+
+## 🧰 Troubleshooting
+
+- **“(Not Responding)” on Windows while downloading**  
+  The UI now runs long tasks in worker threads; per-track progress bars keep updating. If you still see UI freezes, ensure GPU overlays/AV scanners aren’t throttling file writes.
+- **Age-restricted videos on YouTube**  
+  yt-dlp might refuse them without cookies. Add a cookies file to `config.json` if needed.
+- **Too many duplicates**  
+  Make sure you’re running the latest version. The app compares by URI → tags → filename (without numeric prefix) and keeps a `manifest.json`.
+- **ffmpeg/yt-dlp missing (source builds)**  
+  Confirm the platform-specific binaries are in `ffmpeg/` and `yt-dlp/` next to the executable/spec.
+
+---
+
+## 📜 License
+
+MIT
