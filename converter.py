@@ -183,6 +183,7 @@ class Converter:
         playlist_name = (playlist_name_hint or os.path.splitext(os.path.basename(csv_path))[0]).strip()
 
         base_out = os.path.normpath(output_folder)
+        # évite /Playlist/Playlist si le dossier cible porte déjà le bon nom
         if os.path.basename(base_out).lower() == playlist_name.lower():
             out_dir = base_out
         else:
@@ -196,15 +197,14 @@ class Converter:
             if not os.path.isfile(ytdlp_exe): missing.append("yt-dlp")
             raise RuntimeError(f"Missing binaries: {', '.join(missing)}")
 
-        transcode_mp3  = bool(self.config.get("transcode_mp3", False))
-        m3u_enabled    = bool(self.config.get("generate_m3u", True))
-        exclude_instr  = bool(self.config.get("exclude_instrumentals", False))
-        cookies_path   = self.config.get("cookies_path") or None
-        cookies_browser = (self.config.get("sc_cookies_from_browser") or "").strip() or None
-        deep_search    = bool(self.config.get("deep_search", True))
-        max_workers    = int(self.config.get("concurrency", 3))
-        incremental    = bool(self.config.get("incremental_update", True))
-        prefix_numbers = bool(self.config.get("prefix_numbers", False))  # default unchecked
+        transcode_mp3 = bool(self.config.get("transcode_mp3", False))
+        m3u_enabled   = bool(self.config.get("generate_m3u", True))
+        exclude_instr = bool(self.config.get("exclude_instrumentals", False))
+        cookies_path  = self.config.get("cookies_path") or None
+        deep_search   = bool(self.config.get("deep_search", True))
+        max_workers   = int(self.config.get("concurrency", 3))
+        incremental   = bool(self.config.get("incremental_update", True))
+        prefix_numbers = bool(self.config.get("prefix_numbers", False))  # défaut = décoché
 
         existing_keys: Set[Tuple] = set()
         to_download: List[Tuple[int, dict, List[Tuple]]] = []
@@ -242,24 +242,26 @@ class Converter:
             base = self._make_base_name(file_title=file_title, index=new_idx, prefix_numbers=prefix_numbers)
             out_template = os.path.join(out_dir, base + ".%(ext)s")
 
+            # UI init
             self._item('init', {'idx': new_idx, 'title': f"{title} — {artist_primary}"})
 
+            # Détermine si on a une URL directe (SoundCloud) :
             source_url = (row.get('Source URL') or row.get('source url') or "").strip()
 
+            # Construction de la commande yt-dlp
             def yt_cmd(extra_args: list[str], search_spec: str):
                 cmd = [ytdlp_exe, f"--ffmpeg-location={os.path.dirname(ffmpeg_exe)}", "--no-config", "--newline"]
-                # Auth: privilégie cookies-from-browser, sinon cookies.txt
-                if cookies_browser:
-                    cmd += ["--cookies-from-browser", cookies_browser]
-                elif cookies_path and os.path.isfile(cookies_path):
+                if cookies_path and os.path.isfile(cookies_path):
                     cmd += ["--cookies", cookies_path]
                 cmd += extra_args + [search_spec]
                 return cmd
 
             if source_url:
+                # Download direct depuis SoundCloud (ou toute URL supportée)
                 download_spec = source_url
-                fmt_args = ['-f', 'bestaudio']
+                fmt_args = ['-f', 'bestaudio']  # laisser yt-dlp choisir le meilleur flux
             else:
+                # Fallback: recherche YouTube
                 q = ' '.join([file_title, safe_artist]).strip()
                 download_spec = f"ytsearch2:{q}" if deep_search else f"ytsearch1:{q}"
                 fmt_args = ['-f', 'bestaudio[ext=m4a]/bestaudio']
@@ -271,6 +273,7 @@ class Converter:
             if transcode_mp3:
                 args += ['--extract-audio','--audio-format','mp3','--audio-quality','0']
             else:
+                # Remux m4a utile surtout via YouTube
                 if not source_url:
                     args += ['--remux-video','m4a']
 
@@ -310,6 +313,7 @@ class Converter:
                 self._item('error', {'idx': new_idx, 'error': "Output file not found after download."})
                 return
 
+            # tags best-effort (mp3/m4a)
             try:
                 if outfile.lower().endswith(".mp3"):
                     audio = EasyID3()

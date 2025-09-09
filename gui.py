@@ -1,16 +1,16 @@
 # gui.py
-import os, csv, platform, tempfile, threading, queue, time, tkinter as tk, webbrowser, json
+import os, csv, platform, tempfile, threading, queue, time, tkinter as tk, json
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 from config import load_config, resource_path
-from utils import Tooltip, DEFAULT_DROP_BG, LOADED_DROP_BG, open_folder
+from utils import Tooltip, open_folder
 from converter import Converter
 from spotify_api import SpotifyClient
 from spotify_auth import PKCEAuth
 from soundcloud_api import SoundCloudClient
 
-# Optional CONFIG_FILE handle (for saving UI choices)
+# Optionnel: chemin du config pour persister les choix UI
 try:
     from config import CONFIG_FILE
 except Exception:
@@ -21,8 +21,8 @@ class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('980x840')
-        self.root.minsize(880, 720)
+        self.root.geometry('980x820')
+        self.root.minsize(880, 700)
 
         # state
         self.csv_path = None
@@ -55,7 +55,7 @@ class Spotify2MP3GUI:
 
         # options UI
         self.prefix_numbers_var = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
-        self.sc_browser_var = tk.StringVar(value=(self.config.get("sc_cookies_from_browser") or ""))
+        self.concurrency_var   = tk.IntVar(value=int(self.config.get("concurrency", 3)))  # NEW: threads
 
         # default dir
         if platform.system() == "Windows":
@@ -144,26 +144,18 @@ class Spotify2MP3GUI:
         self.spotify_load_btn.pack(side='left')
         ttk.Label(body_sp, text="Sign-in opens in your browser (OAuth PKCE).", style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
-        # Left column: SoundCloud (auth + URL)
+        # Left column: SoundCloud (sans auth — liens publics/privés via token secret OK)
         lf_sc = ttk.Labelframe(cols, text="From SoundCloud playlist", style='Card.TLabelframe')
         lf_sc.grid(row=1, column=0, sticky='nsew', padx=(0, 12), pady=(6, 6))
         body_sc = ttk.Frame(lf_sc, style='CardBody.TFrame'); body_sc.pack(fill='both', expand=True, padx=12, pady=10)
 
-        auth_row = ttk.Frame(body_sc, style='CardBody.TFrame'); auth_row.pack(fill='x', pady=(0,6))
-        ttk.Label(auth_row, text="Browser:", style='Sub.TLabel').pack(side='left')
-        self.sc_browser_combo = ttk.Combobox(auth_row, textvariable=self.sc_browser_var, state='readonly',
-                                             values=['', 'chrome', 'firefox', 'edge', 'brave', 'safari'], width=12)
-        self.sc_browser_combo.pack(side='left', padx=(8, 8))
-        ttk.Button(auth_row, text="Sign in to SoundCloud", command=self.open_sc_login).pack(side='left')
-        Tooltip(self.sc_browser_combo, "Pick the browser where you are signed in.\nWe’ll use its session (no cookie file).")
-        ttk.Label(body_sc, text="Private playlists supported via your browser session (no plaintext cookies).",
-                  style='Muted.TLabel').pack(anchor='w')
-
-        row_sc = ttk.Frame(body_sc, style='CardBody.TFrame'); row_sc.pack(fill='x', pady=(8,0))
+        row_sc = ttk.Frame(body_sc, style='CardBody.TFrame'); row_sc.pack(fill='x')
         ttk.Label(row_sc, text='URL:', style='Sub.TLabel').pack(side='left')
         self.sc_entry = ttk.Entry(row_sc); self.sc_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
         self.sc_load_btn = ttk.Button(row_sc, text='Load from SoundCloud', command=self.load_from_soundcloud_link)
         self.sc_load_btn.pack(side='left')
+        ttk.Label(body_sc, text="Public playlists or private links with secret token supported (no login).",
+                  style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
         # Right column: CSV
         lf_csv = ttk.Labelframe(cols, text="From CSV file", style='Card.TLabelframe')
@@ -198,9 +190,26 @@ class Spotify2MP3GUI:
         opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x')
         ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).pack(side='left')
 
-        self.convert_button = ttk.Button(body_out, text='Convert', style='Accent.TButton',
+        # --- NEW: ligne Threads + Convert ---
+        row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
+        row_actions.pack(fill='x', pady=(10, 2))
+        row_actions.grid_columnconfigure(0, weight=1)
+
+        grp_threads = ttk.Frame(row_actions, style='CardBody.TFrame')
+        grp_threads.grid(row=0, column=0, sticky='w')
+        ttk.Label(grp_threads, text='Threads:', style='Sub.TLabel').pack(side='left')
+        try:
+            self.thread_spin = ttk.Spinbox(grp_threads, from_=1, to=8,
+                                           textvariable=self.concurrency_var, width=5, wrap=False)
+        except AttributeError:
+            self.thread_spin = tk.Spinbox(grp_threads, from_=1, to=8,
+                                          textvariable=self.concurrency_var, width=5, wrap=False)
+        self.thread_spin.pack(side='left', padx=(8, 12))
+        Tooltip(self.thread_spin, 'Number of parallel downloads (1–8). 2–4 recommended.')
+
+        self.convert_button = ttk.Button(row_actions, text='Convert', style='Accent.TButton',
                                          command=self.start_conversion, state=tk.DISABLED)
-        self.convert_button.pack(pady=(10, 2))
+        self.convert_button.grid(row=0, column=1, sticky='e')
 
         # Downloads card
         lf_dl = ttk.Labelframe(self.root, text="Downloads", style='Card.TLabelframe')
@@ -298,29 +307,7 @@ class Spotify2MP3GUI:
         if self._sp_thread and self._sp_thread.is_alive() and not self._sp_done:
             self.root.after(100, self._poll_spotify_queue)
 
-    # ---------- SoundCloud auth helpers ----------
-    def open_sc_login(self):
-        """Ouvre la page de login et mémorise le navigateur choisi (cookies-from-browser)."""
-        browser = (self.sc_browser_var.get() or "").strip()
-        # Persiste le choix
-        self.config['sc_cookies_from_browser'] = browser
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-        # Ouvre la page de login dans le navigateur par défaut
-        # (Important: l'utilisateur doit s'auth dans le MÊME type de navigateur choisi)
-        webbrowser.open("https://soundcloud.com/signin")
-        messagebox.showinfo(
-            "SoundCloud",
-            "Sign in on SoundCloud in your browser.\n\n"
-            "Then paste the playlist URL and click “Load from SoundCloud”.\n"
-            f"(Selected browser: {browser or 'default'})"
-        )
-
-    # ---------- SoundCloud loader ----------
+    # ---------- SoundCloud loader (sans auth) ----------
     def load_from_soundcloud_link(self):
         url = self.sc_entry.get().strip()
         if not url or "soundcloud.com" not in url:
@@ -331,17 +318,12 @@ class Spotify2MP3GUI:
         self._set_controls(False)
         self._start_indeterminate("Fetching SoundCloud playlist…")
 
-        cookies_browser = (self.config.get("sc_cookies_from_browser") or "").strip() or None
-        cookies_path = self.config.get("cookies_path")
+        cookies_path = self.config.get("cookies_path")  # optionnel, ex: si l’utilisateur préfère un cookies.txt
 
         def _sc_worker():
             try:
                 sc = SoundCloudClient()
-                rows, name = sc.fetch_playlist(
-                    url,
-                    cookies_path=cookies_path,
-                    cookies_from_browser=cookies_browser
-                )
+                rows, name = sc.fetch_playlist(url, cookies_path=cookies_path)
                 if not rows:
                     self._sc_q.put(('error', 'No tracks found.')); return
                 fd, tmp = tempfile.mkstemp(prefix='soundcloud_playlist_', suffix='.csv'); os.close(fd)
@@ -434,9 +416,18 @@ class Spotify2MP3GUI:
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Error', 'Select a CSV and an output folder.'); return
 
+        # options à persister
         self.config['prefix_numbers'] = bool(self.prefix_numbers_var.get())
-        # Persiste le choix de navigateur si modifié
-        self.config['sc_cookies_from_browser'] = (self.sc_browser_var.get() or "")
+        # NEW: read/bound/persist concurrency
+        try:
+            threads = int(self.concurrency_var.get())
+        except Exception:
+            threads = int(self.config.get("concurrency", 3))
+        threads = max(1, min(8, threads))
+        self.concurrency_var.set(threads)
+        self.config['concurrency'] = threads
+
+        # Sauvegarde config si possible
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
@@ -613,7 +604,7 @@ class Spotify2MP3GUI:
         for w in (self.convert_button, self.clear_button, self.folder_button,
                   self.spotify_load_btn, self.drop_label, self.spotify_entry,
                   self.open_folder_btn, self.sc_load_btn, self.sc_entry,
-                  self.sc_browser_combo):
+                  self.thread_spin):
             try: w.config(state=state)
             except Exception: pass
 
