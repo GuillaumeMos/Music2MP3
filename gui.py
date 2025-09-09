@@ -17,10 +17,10 @@ except Exception:
     CONFIG_FILE = resource_path("config.json")
 
 
-class Spotify2MP3GUI:
+class Music2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title('Spotify2MP3')
+        self.root.title('Music2MP3')
         self.root.geometry('980x880')
         self.root.minsize(880, 740)
 
@@ -151,7 +151,7 @@ class Spotify2MP3GUI:
 
         header = ttk.Frame(self.root)
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
-        ttk.Label(header, text="Spotify2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
+        ttk.Label(header, text="Music2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
         ttk.Label(header, text="Convert playlists to local audio (M4A/MP3)", style='Sub.TLabel').pack(side='left', padx=(12, 0))
 
         cols = ttk.Frame(self.root)
@@ -757,5 +757,5 @@ class Spotify2MP3GUI:
 
 if __name__ == '__main__':
     root = tk.Tk()
-    app = Spotify2MP3GUI(root)
+    app = Music2MP3GUI(root)
     root.mainloop()
