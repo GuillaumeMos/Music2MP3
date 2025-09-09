@@ -7,7 +7,6 @@ from typing import Callable, Optional, Tuple, Set, List
 from mutagen.easyid3 import EasyID3
 from mutagen.mp4 import MP4, MP4Tags
 
-# resource_path compatible PyInstaller
 try:
     from config import resource_path
 except Exception:
@@ -21,7 +20,7 @@ class Converter:
         config: dict,
         status_cb: Optional[Callable[[str], None]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
-        item_cb: Optional[Callable[[str, dict], None]] = None,  # per-track events
+        item_cb: Optional[Callable[[str, dict], None]] = None,
     ):
         self.config = config or {}
         self.status_cb = status_cb or (lambda s: None)
@@ -73,17 +72,10 @@ class Converter:
 
     @staticmethod
     def _strip_numeric_prefix(name_no_ext: str) -> str:
-        """retire 'NNN - ' éventuel au début du nom de fichier (sans extension)"""
         return re.sub(r"^\s*\d{3}\s*-\s*", "", name_no_ext).strip()
 
     # --- keys from CSV row ---
     def _row_keys(self, row: dict) -> List[Tuple]:
-        """
-        Retourne une liste de clés candidates, de la plus forte à la plus faible:
-        1) ("uri", <track_id>)
-        2) ("meta", <titre_norm>, <artiste_norm>)
-        3) ("title", <titre_norm>)
-        """
         keys: List[Tuple] = []
         uri = row.get("Track URI") or row.get("track uri") or row.get("uri")
         if uri:
@@ -91,7 +83,14 @@ class Converter:
             if m:
                 keys.append(("uri", m.group(1)))
             else:
+                # pour SoundCloud on garde l'URL entière
                 keys.append(("uri", uri))
+
+        # (optionnel) si "Source URL" existe, l'utiliser aussi comme clé
+        src = row.get("Source URL") or row.get("source url")
+        if src:
+            keys.append(("uri", src.strip()))
+
         title = self._norm_text(row.get("Track Name") or row.get("Track name") or "")
         artist = self._norm_text(row.get("Artist Name(s)") or row.get("Artist name") or "")
         if title or artist:
@@ -102,10 +101,6 @@ class Converter:
 
     # --- keys from existing file ---
     def _tag_key_from_file(self, path: str) -> List[Tuple]:
-        """
-        Construit des clés à partir des tags du fichier (si possible) + fallback titre seul.
-        Renvoie une liste (potentiellement vide) de tuples de clés.
-        """
         out: List[Tuple] = []
         title_norm = ""
         artist_norm = ""
@@ -128,10 +123,6 @@ class Converter:
         return out
 
     def _file_title_key_from_name(self, path: str) -> Optional[Tuple]:
-        """
-        Fallback si aucun tag: déduit une clé "title" depuis le nom de fichier (sans extension),
-        en ignorant un éventuel préfixe 'NNN - '.
-        """
         base = os.path.splitext(os.path.basename(path))[0]
         core = self._strip_numeric_prefix(base)
         title_only_norm = self._norm_text(core)
@@ -140,11 +131,6 @@ class Converter:
         return None
 
     def _scan_existing_keys(self, out_dir: str) -> Set[Tuple]:
-        """
-        Charge manifest.json si présent, sinon reconstruit:
-        - via tags (meta+title)
-        - à défaut via le nom de fichier (title seul), en ignorant le préfixe numérique.
-        """
         keys: Set[Tuple] = set()
         manifest = os.path.join(out_dir, "manifest.json")
         if os.path.isfile(manifest):
@@ -155,13 +141,10 @@ class Converter:
             except Exception:
                 pass
 
-        # Complète (ou reconstruit si vide) d'après les fichiers présents
         for ext in ("*.mp3", "*.m4a", "*.m4b", "*.mka", "*.opus", "*.webm"):
             for p in glob.glob(os.path.join(out_dir, ext)):
-                # tags -> clés
                 for k in self._tag_key_from_file(p):
                     keys.add(k)
-                # filename -> clé "title" (ignore 'NNN - ')
                 k2 = self._file_title_key_from_name(p)
                 if k2:
                     keys.add(k2)
@@ -176,7 +159,6 @@ class Converter:
             pass
 
     def _max_existing_index(self, out_dir: str) -> int:
-        """Renvoie le plus grand index 'NNN - ' déjà présent, sinon 0."""
         mx = 0
         for p in glob.glob(os.path.join(out_dir, "*.*")):
             base = os.path.basename(p)
@@ -193,49 +175,39 @@ class Converter:
 
     # ---------- main ----------
     def convert_from_csv(self, csv_path: str, output_folder: str, playlist_name_hint: Optional[str] = None) -> str:
-        # Lecture CSV
         with open(csv_path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         total_in_csv = len(rows)
         if total_in_csv == 0:
-            self._status("Aucune ligne dans le CSV.")
+            self._status("No rows in CSV.")
             return output_folder
-
-        # Dossier playlist
 
         playlist_name = (playlist_name_hint or os.path.splitext(os.path.basename(csv_path))[0]).strip()
 
         base_out = os.path.normpath(output_folder)
-        # si le dossier choisi s'appelle déjà comme la playlist → on ne recrée pas un sous-dossier
+        # évite /Playlist/Playlist si le dossier cible porte déjà le bon nom
         if os.path.basename(base_out).lower() == playlist_name.lower():
             out_dir = base_out
         else:
             out_dir = os.path.join(base_out, playlist_name)
-
         os.makedirs(out_dir, exist_ok=True)
 
-        # Binaries
         ffmpeg_exe, ytdlp_exe, creationflags = self._bin_paths()
         if not os.path.isfile(ffmpeg_exe) or not os.path.isfile(ytdlp_exe):
             missing = []
             if not os.path.isfile(ffmpeg_exe): missing.append("ffmpeg")
             if not os.path.isfile(ytdlp_exe): missing.append("yt-dlp")
-            raise RuntimeError(f"Binaires manquants: {', '.join(missing)}")
+            raise RuntimeError(f"Missing binaries: {', '.join(missing)}")
 
-        # Options
         transcode_mp3 = bool(self.config.get("transcode_mp3", False))
         m3u_enabled   = bool(self.config.get("generate_m3u", True))
         exclude_instr = bool(self.config.get("exclude_instrumentals", False))
         cookies_path  = self.config.get("cookies_path") or None
         deep_search   = bool(self.config.get("deep_search", True))
-        max_workers   = int(self.config.get(
-            "concurrency",
-            3 if not transcode_mp3 else max(2, min(4, (os.cpu_count() or 4)//4 or 2))
-        ))
+        max_workers   = int(self.config.get("concurrency", 3))
         incremental   = bool(self.config.get("incremental_update", True))
-        prefix_numbers = bool(self.config.get("prefix_numbers", True))
+        prefix_numbers = bool(self.config.get("prefix_numbers", False))  # défaut = décoché
 
-        # Filtrage incrémental (nouveaux uniquement si dossier existe)
         existing_keys: Set[Tuple] = set()
         to_download: List[Tuple[int, dict, List[Tuple]]] = []
         if incremental and os.path.isdir(out_dir):
@@ -243,36 +215,25 @@ class Converter:
 
         for i, row in enumerate(rows, start=1):
             candidates = self._row_keys(row)
-            # garder si AUCUNE des clés candidates n'est présente
             if not incremental or not any(k in existing_keys for k in candidates):
                 to_download.append((i, row, candidates))
 
         skipped = total_in_csv - len(to_download)
-        self._status(f"Playlist « {playlist_name} » : {total_in_csv} dans le CSV • {skipped} déjà présents • {len(to_download)} nouveaux")
+        self._status(f"Playlist “{playlist_name}”: {total_in_csv} total • {skipped} existing • {len(to_download)} new")
 
-        # Annonce au GUI : nouveaux uniquement
-        self._item('conv_init', {
-            'total': len(to_download),
-            'new':   len(to_download),
-            'playlist': playlist_name
-        })
+        self._item('conv_init', {'total': len(to_download), 'new': len(to_download), 'playlist': playlist_name})
         if len(to_download) == 0:
             if m3u_enabled:
                 self._write_m3u(out_dir, playlist_name)
-            self._status("✅ Rien à télécharger")
+            self._status("✅ Nothing to download")
             return out_dir
 
-        # Numérotation → reprend à la suite si activée
         start_index = self._max_existing_index(out_dir) + 1 if prefix_numbers else 1
 
-        # Locks / shared
         lock = threading.Lock()
-        done_count = 0
         new_keys: Set[Tuple] = set()
-        results: List[Tuple[int, bool, Optional[str], Optional[str]]] = []
 
-        # ---------- worker ----------
-        def process_one(new_idx: int, original_csv_idx: int, row: dict, cand_keys: List[Tuple]) -> Tuple[int, bool, Optional[str], Optional[str], List[Tuple]]:
+        def process_one(new_idx: int, original_csv_idx: int, row: dict, cand_keys: List[Tuple]):
             title = row.get('Track Name') or row.get('Track name') or 'Unknown'
             artist_raw = row.get('Artist Name(s)') or row.get('Artist name') or 'Unknown'
             artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
@@ -283,15 +244,13 @@ class Converter:
             base = self._make_base_name(file_title=file_title, index=new_idx, prefix_numbers=prefix_numbers)
             out_template = os.path.join(out_dir, base + ".%(ext)s")
 
-            # UI init de la piste
+            # UI init
             self._item('init', {'idx': new_idx, 'title': f"{title} — {artist_primary}"})
 
-            # déjà présent sous ce base ? (très rare ici)
-            already = self._find_output_by_base(out_dir, base)
-            if already and os.path.isfile(already):
-                self._item('progress', {'idx': new_idx, 'percent': 100.0, 'speed': None, 'eta': None})
-                return (new_idx, True, already, None, cand_keys)
+            # Détermine si on a une URL directe (SoundCloud) :
+            source_url = (row.get('Source URL') or row.get('source url') or "").strip()
 
+            # Construction de la commande yt-dlp
             def yt_cmd(extra_args: list[str], search_spec: str):
                 cmd = [ytdlp_exe, f"--ffmpeg-location={os.path.dirname(ffmpeg_exe)}", "--no-config", "--newline"]
                 if cookies_path and os.path.isfile(cookies_path):
@@ -299,23 +258,32 @@ class Converter:
                 cmd += extra_args + [search_spec]
                 return cmd
 
-            q = ' '.join([file_title, safe_artist]).strip()
-            download_spec = f"ytsearch2:{q}" if deep_search else f"ytsearch1:{q}"
+            if source_url:
+                # Download direct depuis SoundCloud (ou toute URL supportée)
+                download_spec = source_url
+                fmt_args = ['-f', 'bestaudio']  # on laisse yt-dlp choisir le meilleur flux
+            else:
+                # Fallback: recherche YouTube
+                q = ' '.join([file_title, safe_artist]).strip()
+                download_spec = f"ytsearch2:{q}" if deep_search else f"ytsearch1:{q}"
+                fmt_args = ['-f', 'bestaudio[ext=m4a]/bestaudio']
 
-            args = ['-f', 'bestaudio[ext=m4a]/bestaudio', '--output', out_template, '--no-playlist']
+            args = fmt_args + ['--output', out_template, '--no-playlist']
             if exclude_instr:
                 args += ['--reject-title', 'instrumental']
+
             if transcode_mp3:
-                args += ['--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0']
+                args += ['--extract-audio','--audio-format','mp3','--audio-quality','0']
             else:
-                args += ['--remux-video', 'm4a']
+                # On remux en m4a seulement quand on a fait une recherche YT (souvent m4a dispo).
+                if not source_url:
+                    args += ['--remux-video','m4a']
 
             proc = subprocess.Popen(
                 yt_cmd(args, download_spec),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, universal_newlines=True,
                 encoding='utf-8', errors='replace',
-                creationflags=creationflags
             )
             try:
                 for line in proc.stdout:
@@ -334,19 +302,20 @@ class Converter:
                 proc.wait()
 
             if proc.returncode != 0:
-                err_all = ""
+                err = "yt-dlp error"
                 try:
-                    if proc.stdout:
-                        err_all = proc.stdout.read() or ""
+                    err = proc.stdout.read() or err
                 except Exception:
                     pass
-                return (new_idx, False, None, (err_all or "yt-dlp error")[:700], cand_keys)
+                self._item('error', {'idx': new_idx, 'error': err[:700]})
+                return
 
             outfile = self._find_output_by_base(out_dir, base)
             if not outfile or not os.path.isfile(outfile):
-                return (new_idx, False, None, "Fichier de sortie introuvable après téléchargement.", cand_keys)
+                self._item('error', {'idx': new_idx, 'error': "Output file not found after download."})
+                return
 
-            # tags (best-effort)
+            # tags best-effort (mp3/m4a)
             try:
                 if outfile.lower().endswith(".mp3"):
                     audio = EasyID3()
@@ -354,7 +323,7 @@ class Converter:
                     except: pass
                     audio.update({'artist': artist_primary, 'title': title, 'album': album, 'tracknumber': str(new_idx)})
                     audio.save()
-                else:
+                elif outfile.lower().endswith(".m4a"):
                     mp4 = MP4(outfile)
                     tags = mp4.tags or MP4Tags()
                     tags['\xa9nam']=[title]; tags['\xa9ART']=[artist_primary]; tags['\xa9alb']=[album]
@@ -363,10 +332,13 @@ class Converter:
                 pass
 
             self._item('progress', {'idx': new_idx, 'percent': 100.0, 'speed': None, 'eta': None})
-            return (new_idx, True, outfile, None, cand_keys)
+            self._item('done', {'idx': new_idx})
 
-        # ---------- exécution parallèle ----------
-        self._status(f"Lancement : {len(to_download)} nouveaux • {max_workers} téléchargements en parallèle")
+            with lock:
+                for k in cand_keys:
+                    new_keys.add(k)
+
+        self._status(f"Starting: {len(to_download)} new • {max_workers} parallel")
         self._progress(0, len(to_download))
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -377,46 +349,24 @@ class Converter:
                 futures[fut] = (new_idx, row, cand_keys)
 
             for fut in as_completed(futures):
-                new_idx, row, cand_keys = futures[fut]
-                ok, path, err = False, None, None
                 try:
-                    new_idx2, ok, path, err, returned_keys = fut.result()
+                    fut.result()
                 except Exception as e:
-                    returned_keys = cand_keys
-                    err = str(e)
+                    # remonte une erreur globale par item si besoin
+                    self._item('error', {'idx': futures[fut][0], 'error': str(e)})
 
-                with lock:
-                    self._progress(min(self._progress.__code__.co_argcount, 1) and 0 or 0, 0)  # no-op to satisfy mypy
-                    # On tient quand même un "done_count" pour le statut
-                    # (la barre globale est gérée via la somme des % per-item côté GUI)
-                    # donc ici on se contente d'un compteur textuel:
-                    # (on pourrait conserver done_count si on veut un texte [x/y])
-                    pass
-
-                if ok:
-                    self._item('done', {'idx': new_idx})
-                    self._status(f"OK : {row.get('Track Name') or ''}")
-                    for k in returned_keys:
-                        new_keys.add(k)
-                else:
-                    self._item('error', {'idx': new_idx, 'error': err})
-                    self._status(f"ÉCHEC : {row.get('Track Name') or ''}")
-
-        # ---------- M3U ----------
         if m3u_enabled:
             self._write_m3u(out_dir, playlist_name)
 
-        # ---------- manifest ----------
         try:
             if incremental:
-                existing = self._scan_existing_keys(out_dir)  # relit aussi titres depuis fichiers nouveaux
-                # on fusionne avec les clés "fortes" de la session (uri/meta/title)
+                existing = self._scan_existing_keys(out_dir)
                 existing |= new_keys
                 self._save_manifest(out_dir, existing)
         except Exception:
             pass
 
-        self._status("✅ Terminé")
+        self._status("✅ Done")
         return out_dir
 
     # ---------- write M3U ----------
@@ -437,13 +387,12 @@ class Converter:
                 m3u.write(f'#EXTINF:-1,{os.path.splitext(fn)[0]}\n')
                 m3u.write(f'{fn}\n')
 
-    # ---------- helpers for output detection ----------
     @staticmethod
     def _find_output_by_base(out_dir: str, base: str) -> Optional[str]:
-        matches = glob.glob(os.path.join(out_dir, base + ".*"))
+        import glob as _glob
+        matches = _glob.glob(os.path.join(out_dir, base + ".*"))
         if not matches:
             return None
-        # priorité extensions audio probables
         for pref in (".mp3", ".m4a", ".m4b", ".mka", ".opus", ".webm"):
             for m in matches:
                 if m.lower().endswith(pref):

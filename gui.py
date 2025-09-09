@@ -8,14 +8,15 @@ from utils import Tooltip, DEFAULT_DROP_BG, LOADED_DROP_BG, open_folder
 from converter import Converter
 from spotify_api import SpotifyClient
 from spotify_auth import PKCEAuth
+from soundcloud_api import SoundCloudClient
 
 
 class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('980x780')
-        self.root.minsize(880, 680)
+        self.root.geometry('980x820')
+        self.root.minsize(880, 700)
 
         # state
         self.csv_path = None
@@ -33,17 +34,21 @@ class Spotify2MP3GUI:
         self._sp_q: queue.Queue | None = None
         self._sp_done = False
 
+        self._sc_thread = None
+        self._sc_q: queue.Queue | None = None
+        self._sc_done = False
+
         # per-item UI
-        self._rows = {}         # idx -> {'label':Label, 'bar':Progressbar, 'title':str}
-        self._perc = {}         # idx -> float percent
-        self._total_tracks = 0  # fixé par conv_init (nouveaux uniquement)
+        self._rows = {}
+        self._perc = {}
+        self._total_tracks = 0
 
         # chrono
         self._t0 = None
         self._timer_running = False
 
         # options UI
-        self.prefix_numbers_var = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", True)))
+        self.prefix_numbers_var = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))  # now default unchecked
 
         # default dir
         if platform.system() == "Windows":
@@ -59,7 +64,6 @@ class Spotify2MP3GUI:
     def _init_styles(self):
         self.style = ttk.Style(self.root)
         try:
-            # 'clam' accepte mieux les couleurs custom
             self.style.theme_use('clam')
         except Exception:
             pass
@@ -68,9 +72,9 @@ class Spotify2MP3GUI:
         CARD_BG = '#ffffff'
         TXT = '#111827'
         SUB = '#4b5563'
-        PRIMARY = '#2563eb'  # bleu
-        OK = '#16a34a'       # vert
-        ERR = '#e11d48'      # rose/rouge
+        PRIMARY = '#2563eb'
+        OK = '#16a34a'
+        ERR = '#e11d48'
 
         self.root.configure(bg=BG)
         self.style.configure('.', background=BG, foreground=TXT)
@@ -80,18 +84,15 @@ class Spotify2MP3GUI:
         self.style.configure('Muted.TLabel', foreground='#6b7280')
         self.style.configure('Chip.TLabel', background='#e6f4ea', foreground='#065f46', padding=(8, 2))
 
-        # Boutons
         self.style.configure('TButton', padding=(10, 6))
         self.style.configure('Accent.TButton', padding=(12, 8), foreground='white', background=PRIMARY)
         self.style.map('Accent.TButton',
                        background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')])
 
-        # Cartes (LabelFrame)
         self.style.configure('Card.TLabelframe', background=CARD_BG, borderwidth=1, relief='solid')
         self.style.configure('Card.TLabelframe.Label', background=CARD_BG, foreground=SUB, padding=(6, 0))
         self.style.configure('CardBody.TFrame', background=CARD_BG)
 
-        # Progress bars
         self.style.configure('Active.Horizontal.TProgressbar', thickness=12, background=PRIMARY)
         self.style.configure('Ok.Horizontal.TProgressbar', thickness=12, background=OK)
         self.style.configure('Error.Horizontal.TProgressbar', thickness=12, background=ERR)
@@ -111,46 +112,49 @@ class Spotify2MP3GUI:
 
     # ---------- UI ----------
     def _build_ui(self):
-        # Grid config
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(3, weight=1)  # downloads zone stretch
+        self.root.grid_rowconfigure(3, weight=1)
 
-        # Header
         header = ttk.Frame(self.root)
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
         ttk.Label(header, text="Spotify2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
         ttk.Label(header, text="Convert playlists to local audio (M4A/MP3)", style='Sub.TLabel').pack(side='left', padx=(12, 0))
 
-        # Two-columns: Spotify (left) / CSV (right)
         cols = ttk.Frame(self.root)
         cols.grid(row=1, column=0, sticky='nsew', padx=24)
         cols.grid_columnconfigure(0, weight=1, uniform='cols')
         cols.grid_columnconfigure(1, weight=1, uniform='cols')
 
-        # --- Left: Spotify ---
+        # Left column: Spotify + SoundCloud
         lf_sp = ttk.Labelframe(cols, text="From Spotify link", style='Card.TLabelframe')
         lf_sp.grid(row=0, column=0, sticky='nsew', padx=(0, 12), pady=(6, 6))
-        body_sp = ttk.Frame(lf_sp, style='CardBody.TFrame')
-        body_sp.pack(fill='both', expand=True, padx=12, pady=10)
+        body_sp = ttk.Frame(lf_sp, style='CardBody.TFrame'); body_sp.pack(fill='both', expand=True, padx=12, pady=10)
 
         row = ttk.Frame(body_sp, style='CardBody.TFrame'); row.pack(fill='x')
         ttk.Label(row, text='URL:', style='Sub.TLabel').pack(side='left')
-        self.spotify_entry = ttk.Entry(row)
-        self.spotify_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
+        self.spotify_entry = ttk.Entry(row); self.spotify_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
         self.spotify_load_btn = ttk.Button(row, text='Load from Spotify', command=self.load_from_spotify_link_wrapper)
         self.spotify_load_btn.pack(side='left')
-
         ttk.Label(body_sp, text="Sign-in opens in your browser (OAuth PKCE).", style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
-        # --- Right: CSV ---
+        lf_sc = ttk.Labelframe(cols, text="From SoundCloud playlist", style='Card.TLabelframe')
+        lf_sc.grid(row=1, column=0, sticky='nsew', padx=(0, 12), pady=(6, 6))
+        body_sc = ttk.Frame(lf_sc, style='CardBody.TFrame'); body_sc.pack(fill='both', expand=True, padx=12, pady=10)
+
+        row_sc = ttk.Frame(body_sc, style='CardBody.TFrame'); row_sc.pack(fill='x')
+        ttk.Label(row_sc, text='URL:', style='Sub.TLabel').pack(side='left')
+        self.sc_entry = ttk.Entry(row_sc); self.sc_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
+        self.sc_load_btn = ttk.Button(row_sc, text='Load from SoundCloud', command=self.load_from_soundcloud_link)
+        self.sc_load_btn.pack(side='left')
+        ttk.Label(body_sc, text="Public playlists/sets supported (no login).", style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
+
+        # Right column: CSV
         lf_csv = ttk.Labelframe(cols, text="From CSV file", style='Card.TLabelframe')
-        lf_csv.grid(row=0, column=1, sticky='nsew', padx=(12, 0), pady=(6, 6))
-        body_csv = ttk.Frame(lf_csv, style='CardBody.TFrame')
-        body_csv.pack(fill='both', expand=True, padx=12, pady=10)
+        lf_csv.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(12, 0), pady=(6, 6))
+        body_csv = ttk.Frame(lf_csv, style='CardBody.TFrame'); body_csv.pack(fill='both', expand=True, padx=12, pady=10)
 
         self.drop_frame = tk.Frame(body_csv, bg='#eef2ff', height=70, cursor='hand2', highlightthickness=0)
-        self.drop_frame.pack(fill='x')
-        self.drop_frame.pack_propagate(False)
+        self.drop_frame.pack(fill='x'); self.drop_frame.pack_propagate(False)
         self.drop_label = tk.Label(self.drop_frame, text='Drop a CSV here or click to browse',
                                    bg='#eef2ff', fg='#1f2937', font=("Segoe UI", 11))
         self.drop_label.pack(expand=True, fill='both')
@@ -160,36 +164,33 @@ class Spotify2MP3GUI:
         self.clear_button = ttk.Button(body_csv, text='Clear CSV', command=self.clear_selection, state=tk.DISABLED)
         self.clear_button.pack(pady=(8, 0))
 
-        # --- Output card ---
+        # Output card
         lf_out = ttk.Labelframe(self.root, text="Output", style='Card.TLabelframe')
         lf_out.grid(row=2, column=0, sticky='ew', padx=24, pady=(4, 0))
-        body_out = ttk.Frame(lf_out, style='CardBody.TFrame')
-        body_out.pack(fill='both', expand=True, padx=12, pady=10)
+        body_out = ttk.Frame(lf_out, style='CardBody.TFrame'); body_out.pack(fill='both', expand=True, padx=12, pady=10)
 
-        row = ttk.Frame(body_out, style='CardBody.TFrame'); row.pack(fill='x', pady=(0, 6))
-        ttk.Label(row, text='Folder:', style='Sub.TLabel').pack(side='left')
-        self.out_entry = ttk.Entry(row, state='readonly', width=80)
+        row_out = ttk.Frame(body_out, style='CardBody.TFrame'); row_out.pack(fill='x', pady=(0, 6))
+        ttk.Label(row_out, text='Folder:', style='Sub.TLabel').pack(side='left')
+        self.out_entry = ttk.Entry(row_out, state='readonly', width=80)
         self.out_entry.pack(side='left', fill='x', expand=True, padx=(8, 10))
-        self.folder_button = ttk.Button(row, text='Choose…', command=self.select_output_folder)
+        self.folder_button = ttk.Button(row_out, text='Choose…', command=self.select_output_folder)
         self.folder_button.pack(side='left')
-        self.open_folder_btn = ttk.Button(row, text='Open', command=self.open_output_folder)
+        self.open_folder_btn = ttk.Button(row_out, text='Open', command=self.open_output_folder)
         self.open_folder_btn.pack(side='left', padx=(6, 0))
 
         opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x')
         ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).pack(side='left')
 
-        # Convert button centered
         self.convert_button = ttk.Button(body_out, text='Convert', style='Accent.TButton',
                                          command=self.start_conversion, state=tk.DISABLED)
         self.convert_button.pack(pady=(10, 2))
 
-        # --- Downloads card ---
+        # Downloads card
         lf_dl = ttk.Labelframe(self.root, text="Downloads", style='Card.TLabelframe')
         lf_dl.grid(row=3, column=0, sticky='nsew', padx=24, pady=(10, 16))
         self.root.grid_rowconfigure(3, weight=1)
 
-        body_dl = ttk.Frame(lf_dl, style='CardBody.TFrame')
-        body_dl.pack(fill='both', expand=True, padx=12, pady=10)
+        body_dl = ttk.Frame(lf_dl, style='CardBody.TFrame'); body_dl.pack(fill='both', expand=True, padx=12, pady=10)
         body_dl.grid_columnconfigure(0, weight=1)
 
         self.status_label = ttk.Label(body_dl, text='Status: Waiting…')
@@ -204,7 +205,6 @@ class Spotify2MP3GUI:
         self.time_label = ttk.Label(body_dl, text='', style='Muted.TLabel')
         self.time_label.grid(row=3, column=0, sticky='w', pady=(4, 6))
 
-        # Scrollable list of tracks
         list_wrap = ttk.Frame(body_dl, style='CardBody.TFrame')
         list_wrap.grid(row=4, column=0, sticky='nsew')
         body_dl.grid_rowconfigure(4, weight=1)
@@ -220,7 +220,7 @@ class Spotify2MP3GUI:
         self.canvas.pack(side='left', fill='both', expand=True)
         vscroll.pack(side='right', fill='y')
 
-    # ---------- Spotify loader (PKCE) ----------
+    # ---------- Spotify loader ----------
     def load_from_spotify_link_wrapper(self):
         url = self.spotify_entry.get().strip()
         pid = SpotifyClient.extract_playlist_id(url)
@@ -281,6 +281,59 @@ class Spotify2MP3GUI:
         if self._sp_thread and self._sp_thread.is_alive() and not self._sp_done:
             self.root.after(100, self._poll_spotify_queue)
 
+    # ---------- SoundCloud loader ----------
+    def load_from_soundcloud_link(self):
+        url = self.sc_entry.get().strip()
+        if not url or "soundcloud.com" not in url:
+            messagebox.showerror('Error', 'Please paste a valid SoundCloud playlist/track URL.')
+            return
+
+        self._sc_q = queue.Queue(); self._sc_done = False
+        self._set_controls(False)
+        self._start_indeterminate("Fetching SoundCloud playlist…")
+
+        def _sc_worker():
+            try:
+                sc = SoundCloudClient()
+                rows, name = sc.fetch_playlist(url)
+                if not rows:
+                    self._sc_q.put(('error', 'No tracks found.')); return
+                fd, tmp = tempfile.mkstemp(prefix='soundcloud_playlist_', suffix='.csv'); os.close(fd)
+                with open(tmp, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.DictWriter(f, fieldnames=[
+                        "Track Name","Artist Name(s)","Album Name","Duration (ms)","Source URL","Track URI"
+                    ])
+                    w.writeheader(); w.writerows(rows)
+                self._sc_q.put(('done', (tmp, name, len(rows))))
+            except Exception as e:
+                self._sc_q.put(('error', str(e)))
+
+        self._sc_thread = threading.Thread(target=_sc_worker, daemon=True)
+        self._sc_thread.start()
+        self.root.after(100, self._poll_sc_queue)
+
+    def _poll_sc_queue(self):
+        if not self._sc_q: return
+        try:
+            while True:
+                kind, payload = self._sc_q.get_nowait()
+                if kind == 'done':
+                    tmp, name, n = payload
+                    self.csv_path = tmp
+                    # on réutilise ce hint pour nommer le dossier de sortie côté converter
+                    self._loaded_playlist_name_from_spotify = name or "SoundCloud"
+                    self._style_drop_loaded(os.path.basename(tmp))
+                    self.status_label.config(text=f'Loaded SoundCloud: {self._loaded_playlist_name_from_spotify} ({n} tracks)')
+                    self._stop_indeterminate(); self._set_controls(True)
+                    self.update_convert_button_state(); self._sc_done = True
+                elif kind == 'error':
+                    self._stop_indeterminate(); self._set_controls(True)
+                    messagebox.showerror('SoundCloud Error', payload); self._sc_done = True
+        except queue.Empty:
+            pass
+        if self._sc_thread and self._sc_thread.is_alive() and not self._sc_done:
+            self.root.after(100, self._poll_sc_queue)
+
     # ---------- File handlers ----------
     def _style_drop_loaded(self, name: str):
         self.drop_label.config(text=f'CSV (generated): {name}', bg='#dcfce7', fg='#065f46')
@@ -336,10 +389,8 @@ class Spotify2MP3GUI:
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Error', 'Select a CSV and an output folder.'); return
 
-        # push UI option to config
         self.config['prefix_numbers'] = bool(self.prefix_numbers_var.get())
 
-        # chrono
         self._t0 = time.time()
         self.time_label.config(text='')
         self._start_timer()
@@ -379,7 +430,7 @@ class Spotify2MP3GUI:
                 if kind == 'status':
                     self.status_label.config(text=payload)
                 elif kind == 'progress':
-                    _cur, _maxi = payload  # global bar updated via per-item
+                    _cur, _maxi = payload
                 elif kind == 'item':
                     ev, data = payload
                     self._handle_item_event(ev, data)
@@ -407,11 +458,10 @@ class Spotify2MP3GUI:
     # ---------- per-item UI ----------
     def _handle_item_event(self, ev: str, d: dict):
         if ev == 'conv_init':
-            total = int(d.get('new', d.get('total', 0)))  # new only
+            total = int(d.get('new', d.get('total', 0)))
             self._total_tracks = total
             self._perc.clear()
             self.progress.configure(mode='determinate', maximum=max(1, total * 100), value=0)
-            # chip summary
             if total == 0:
                 self.info_label.config(text="0 new track (already up to date)")
             elif total == 1:
@@ -479,7 +529,7 @@ class Spotify2MP3GUI:
             row['bar'].configure(value=max(0, min(100, p)))
         if self._total_tracks:
             s = sum(self._perc.get(i, 0.0) for i in self._perc)
-            self.progress.configure(value=s)  # maximum = total*100
+            self.progress.configure(value=s)
 
     def _clear_track_list(self):
         for child in self.list_frame.winfo_children():
@@ -509,7 +559,8 @@ class Spotify2MP3GUI:
     def _set_controls(self, enabled: bool):
         state = tk.NORMAL if enabled else tk.DISABLED
         for w in (self.convert_button, self.clear_button, self.folder_button,
-                  self.spotify_load_btn, self.drop_label, self.spotify_entry, self.open_folder_btn):
+                  self.spotify_load_btn, self.drop_label, self.spotify_entry,
+                  self.open_folder_btn, self.sc_load_btn, self.sc_entry):
             try: w.config(state=state)
             except Exception: pass
 
