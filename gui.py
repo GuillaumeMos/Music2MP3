@@ -14,8 +14,8 @@ class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('760x720')
-        self.root.minsize(560, 560)
+        self.root.geometry('780x760')
+        self.root.minsize(580, 600)
 
         # state
         self.csv_path = None
@@ -42,6 +42,9 @@ class Spotify2MP3GUI:
         self._t0 = None
         self._timer_running = False
 
+        # options UI
+        self.prefix_numbers_var = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", True)))
+
         # default dir
         if platform.system() == "Windows":
             self.last_directory = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -66,10 +69,9 @@ class Spotify2MP3GUI:
 
     # ---------- UI ----------
     def _build_ui(self):
-        # Styles ttk (couleurs des barres) — selon le thème, certaines plateformes peuvent ignorer les couleurs.
+        # Styles ttk
         self.style = ttk.Style(self.root)
         try:
-            # styles dédiés
             self.style.configure('Active.Horizontal.TProgressbar', thickness=10, background='#3498db')  # bleu
             self.style.configure('Ok.Horizontal.TProgressbar',      thickness=10, background='#2ecc71')  # vert
             self.style.configure('Error.Horizontal.TProgressbar',   thickness=10, background='#e74c3c')  # rouge
@@ -81,11 +83,11 @@ class Spotify2MP3GUI:
 
         # CSV drop/browse
         tk.Label(self.root, text='CSV de playlist :', anchor='w').pack(fill='x', padx=20)
-        self.drop_frame = tk.Frame(self.root, bg=DEFAULT_DROP_BG, height=64, width=520)
+        self.drop_frame = tk.Frame(self.root, bg=DEFAULT_DROP_BG, height=64, width=540)
         self.drop_frame.pack(pady=6, padx=20)
         self.drop_frame.pack_propagate(False)
         self.drop_label = tk.Label(self.drop_frame, text='CSV file: None', bg=DEFAULT_DROP_BG,
-                                   font=("Arial", 12), wraplength=500, justify='center', cursor='hand2')
+                                   font=("Arial", 12), wraplength=520, justify='center', cursor='hand2')
         self.drop_label.pack(expand=True, fill='both')
         self.drop_label.bind('<Button-1>', self.browse_csv)
         Tooltip(self.drop_label, 'Dépose ton CSV ici ou clique pour parcourir.')
@@ -108,6 +110,12 @@ class Spotify2MP3GUI:
         self.spotify_load_btn = tk.Button(row, text='Charger depuis Spotify', command=self.load_from_spotify_link_wrapper)
         self.spotify_load_btn.pack(side='left')
 
+        # options
+        opt = tk.Frame(self.root); opt.pack(fill='x', padx=20, pady=(10, 0))
+        cb = tk.Checkbutton(opt, text='Numéroter les fichiers (001, 002…)', variable=self.prefix_numbers_var)
+        cb.pack(side='left')
+        Tooltip(cb, "Quand coché, les fichiers seront préfixés par 001 -, 002 -, etc.\nQuand décoché, pas de numérotation dans les noms de fichiers.")
+
         # convert
         self.convert_button = tk.Button(self.root, text='3) Convertir', command=self.start_conversion, state=tk.DISABLED, font=('Arial', 14))
         self.convert_button.pack(pady=10)
@@ -122,7 +130,7 @@ class Spotify2MP3GUI:
         self.info_label.pack(fill='x', padx=20, pady=(2, 2))
 
         self.progress = ttk.Progressbar(
-            self.root, orient='horizontal', length=700, mode='determinate',
+            self.root, orient='horizontal', length=720, mode='determinate',
             style='Active.Horizontal.TProgressbar'
         )
         self.progress.pack(pady=6)
@@ -254,12 +262,14 @@ class Spotify2MP3GUI:
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Erreur', 'Sélectionne un CSV et un dossier de sortie.'); return
 
+        # pousse l’option dans la config passée au converter
+        self.config['prefix_numbers'] = bool(self.prefix_numbers_var.get())
+
         # start chrono
         self._t0 = time.time()
         self.time_label.config(text='')
         self._start_timer()  # chrono live
 
-        # styles en mode actif
         try: self.progress.configure(style='Active.Horizontal.TProgressbar')
         except Exception: pass
 
@@ -295,8 +305,7 @@ class Spotify2MP3GUI:
                 if kind == 'status':
                     self.status_label.config(text=payload)
                 elif kind == 'progress':
-                    # on garde pour compat; la globale est lissée via per-item
-                    _cur, _maxi = payload
+                    _cur, _maxi = payload  # barre globale lissée via per-item
                 elif kind == 'item':
                     ev, data = payload
                     self._handle_item_event(ev, data)
@@ -304,7 +313,6 @@ class Spotify2MP3GUI:
                     self.last_output_dir = payload
                     if self._total_tracks > 0:
                         self.progress.configure(maximum=self._total_tracks * 100, value=self._total_tracks * 100)
-                    # temps total + stop chrono
                     elapsed = 0
                     if self._t0:
                         elapsed = int(time.time() - self._t0)
@@ -331,7 +339,6 @@ class Spotify2MP3GUI:
             self._total_tracks = total
             self._perc.clear()
             self.progress.configure(mode='determinate', maximum=max(1, total * 100), value=0)
-            # message "N nouveaux titres"
             if total == 0:
                 self.info_label.config(text="0 nouveau titre à télécharger (playlist déjà à jour)")
             elif total == 1:
@@ -375,7 +382,7 @@ class Spotify2MP3GUI:
                 row['label'].config(text=f"{idx:03d}. {row['title']}  (Erreur)")
                 try: row['bar'].configure(style='Error.Horizontal.TProgressbar')
                 except Exception: pass
-            self._set_percent(idx, 100.0)  # compte comme terminé pour la globale
+            self._set_percent(idx, 100.0)
             return
 
     def _ensure_row(self, idx: int, title: str):
@@ -386,7 +393,7 @@ class Spotify2MP3GUI:
         lbl = tk.Label(frame, text=f"{idx:03d}. {title}", anchor='w')
         lbl.pack(fill='x')
         bar = ttk.Progressbar(
-            frame, orient='horizontal', length=680, mode='determinate',
+            frame, orient='horizontal', length=720, mode='determinate',
             maximum=100, value=0, style='Active.Horizontal.TProgressbar'
         )
         bar.pack(fill='x', pady=(1, 0))
