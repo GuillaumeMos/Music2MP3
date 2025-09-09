@@ -13,7 +13,7 @@ def _find_ytdlp() -> str:
     """
     Try to use the bundled yt-dlp first, then fallback to PATH.
     """
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    _ = getattr(sys, "_MEIPASS", os.path.abspath("."))
     if platform.system() == "Windows":
         cand = os.path.join(resource_path("yt-dlp"), "yt-dlp.exe")
         return cand if os.path.isfile(cand) else "yt-dlp.exe"
@@ -47,7 +47,6 @@ class SoundCloudClient:
             for e in entries:
                 # Some extractors still return semi-flat entries: enrich if needed.
                 if not self._looks_full(e):
-                    # Try to resolve the track URL and fetch full JSON for that track.
                     track_url = e.get("webpage_url") or e.get("url")
                     if track_url:
                         e = self._dump_sc_json(track_url, cookies_path=cookies_path, flat=False)
@@ -66,7 +65,7 @@ class SoundCloudClient:
 
     def _row_from_info(self, info: Dict, playlist_title: str = "") -> Dict:
         title = (info.get("title")
-                 or info.get("track")            # rare
+                 or info.get("track")
                  or "Unknown")
         artist = (info.get("artist")
                   or info.get("uploader")
@@ -81,7 +80,6 @@ class SoundCloudClient:
             dur_ms = ""
         url = info.get("webpage_url") or info.get("url") or ""
         tid = info.get("id") or ""
-        # SoundCloud usually has no album; use playlist title as a friendly hint if available
         album = info.get("album") or (playlist_title if playlist_title else "")
 
         return {
@@ -97,7 +95,6 @@ class SoundCloudClient:
         """
         Dump JSON from yt-dlp.
         flat=False  -> full metadata (preferred)
-        flat=True   -> faster, but may miss uploader/duration; used only as fallback if ever needed.
         """
         ytdlp = _find_ytdlp()
         cmd = [
@@ -108,7 +105,6 @@ class SoundCloudClient:
             url,
         ]
         if flat:
-            # Only used if we ever decide to speed-up discovery, not needed currently.
             cmd.insert(1, "--flat-playlist")
         if cookies_path:
             cmd += ["--cookies", cookies_path]

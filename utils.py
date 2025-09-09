@@ -2,7 +2,6 @@
 import os
 import platform
 import subprocess
-import webbrowser
 import tkinter as tk
 
 
@@ -43,9 +42,10 @@ def open_folder(path: str | None) -> bool:
     if not path or not os.path.isdir(path):
         return False
     try:
-        if platform.system() == "Windows":
+        system = platform.system()
+        if system == "Windows":
             os.startfile(path)  # noqa: P204
-        elif platform.system() == "Darwin":
+        elif system == "Darwin":
             subprocess.run(["open", path])
         else:
             subprocess.run(["xdg-open", path])

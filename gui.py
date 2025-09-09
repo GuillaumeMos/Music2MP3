@@ -12,6 +12,8 @@ from soundcloud_api import SoundCloudClient
 try:
     from config import CONFIG_FILE
 except Exception:
+    def resource_path(relative_path):
+        return os.path.join(os.path.abspath('.'), relative_path)
     CONFIG_FILE = resource_path("config.json")
 
 
@@ -19,8 +21,8 @@ class Spotify2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Spotify2MP3')
-        self.root.geometry('980x860')
-        self.root.minsize(880, 720)
+        self.root.geometry('980x880')
+        self.root.minsize(880, 740)
 
         # state
         self.csv_path = None
@@ -33,7 +35,7 @@ class Spotify2MP3GUI:
         self._conv_thread = None
         self._conv_q: queue.Queue | None = None
         self._conv_done = False
-        self._conv_obj: Converter | None = None  # keep a ref to converter
+        self._conv_obj: Converter | None = None
         self._cancel_event: threading.Event | None = None
 
         self._sp_thread = None
@@ -44,9 +46,10 @@ class Spotify2MP3GUI:
         self._sc_q: queue.Queue | None = None
         self._sc_done = False
 
-        # per-item UI
+        # per-item UI + errors
         self._rows = {}
         self._perc = {}
+        self._errors = {}
         self._total_tracks = 0
 
         # chrono
@@ -61,8 +64,12 @@ class Spotify2MP3GUI:
         self.m3u_var             = tk.BooleanVar(value=bool(self.config.get("generate_m3u", True)))
         self.exclude_instr_var   = tk.BooleanVar(value=bool(self.config.get("exclude_instrumentals", False)))
         self.incremental_var     = tk.BooleanVar(value=bool(self.config.get("incremental_update", True)))
+        self.remember_default_var= tk.BooleanVar(value=True)
 
-        # default dir
+        # default dir (persisted)
+        self._apply_persisted_default_output()
+
+        # default directory for file dialogs
         if platform.system() == "Windows":
             self.last_directory = os.path.join(os.path.expanduser("~"), "Downloads")
         else:
@@ -71,6 +78,20 @@ class Spotify2MP3GUI:
         self._init_styles()
         self._build_ui()
         self._load_icons()
+        self.update_convert_button_state()
+
+    # ---------- persisted default output ----------
+    def _apply_persisted_default_output(self):
+        default_dir = self.config.get("default_output_dir")
+        if default_dir and os.path.isdir(default_dir):
+            self.output_folder = default_dir
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     # ---------- styles ----------
     def _init_styles(self):
@@ -194,6 +215,11 @@ class Spotify2MP3GUI:
         self.open_folder_btn = ttk.Button(row_out, text='Open', command=self.open_output_folder)
         self.open_folder_btn.pack(side='left', padx=(6, 0))
 
+        # Pre-fill from persisted default (if any)
+        if self.output_folder and os.path.isdir(self.output_folder):
+            self.out_entry.config(state='normal'); self.out_entry.delete(0, 'end')
+            self.out_entry.insert(0, self.output_folder); self.out_entry.config(state='readonly')
+
         # Options group
         opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x', pady=(4, 0))
         ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).grid(row=0, column=0, sticky='w')
@@ -202,6 +228,11 @@ class Spotify2MP3GUI:
         ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=1, column=1, sticky='w', padx=(20,0))
         ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=2, column=1, sticky='w', padx=(20,0))
+
+        # Persist default output
+        row_def = ttk.Frame(body_out, style='CardBody.TFrame'); row_def.pack(fill='x', pady=(8, 0))
+        ttk.Checkbutton(row_def, text='Remember this as default output folder', variable=self.remember_default_var)\
+            .pack(side='left')
 
         # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
@@ -422,6 +453,12 @@ class Spotify2MP3GUI:
             self.out_entry.insert(0, path)
             self.out_entry.config(state='readonly')
             self.status_label.config(text='Output folder selected.')
+
+            # Persist as default if asked
+            if self.remember_default_var.get():
+                self.config['default_output_dir'] = path
+                self._save_config()
+
             self.update_convert_button_state()
 
     def open_output_folder(self):
@@ -446,21 +483,13 @@ class Spotify2MP3GUI:
         self.config['generate_m3u']          = bool(self.m3u_var.get())
         self.config['exclude_instrumentals'] = bool(self.exclude_instr_var.get())
         self.config['incremental_update']    = bool(self.incremental_var.get())
+        self.config['concurrency']           = int(self.concurrency_var.get())
 
-        try:
-            threads = int(self.concurrency_var.get())
-        except Exception:
-            threads = int(self.config.get("concurrency", 3))
-        threads = max(1, min(8, threads))
-        self.concurrency_var.set(threads)
-        self.config['concurrency'] = threads
+        # persist default folder if checkbox checked
+        if self.remember_default_var.get() and self.output_folder:
+            self.config['default_output_dir'] = self.output_folder
 
-        # save config
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        self._save_config()
 
         self._t0 = time.time()
         self.time_label.config(text='')
@@ -469,14 +498,13 @@ class Spotify2MP3GUI:
         try: self.progress.configure(style='Active.Horizontal.TProgressbar')
         except Exception: pass
 
-        # controls
         self._set_controls(False)
-        self.stop_button.config(state=tk.NORMAL)  # keep Stop enabled while running
+        self.stop_button.config(state=tk.NORMAL)
         self.status_label.config(text='Starting conversion…')
         self.progress.configure(value=0, maximum=100, mode='determinate')
         self._clear_track_list()
+        self._errors.clear()
 
-        # Create cancel event
         self._cancel_event = threading.Event()
 
         self._conv_q = queue.Queue(); self._conv_done = False
@@ -503,7 +531,6 @@ class Spotify2MP3GUI:
         self.root.after(80, self._poll_conversion_queue)
 
     def stop_conversion(self):
-        """User pressed Stop: request cancellation."""
         if self._cancel_event and not self._cancel_event.is_set():
             self._cancel_event.set()
             self.stop_button.config(state=tk.DISABLED)
@@ -521,13 +548,11 @@ class Spotify2MP3GUI:
                 elif kind == 'item':
                     ev, data = payload
                     if ev == 'cancel_all':
-                        # Global cancel signal from converter
                         self._stop_timer()
                         try: self.progress.configure(style='Error.Horizontal.TProgressbar')
                         except Exception: pass
                         self.status_label.config(text='⛔ Cancelled')
                         self.stop_button.config(state=tk.DISABLED)
-                        # keep listening for 'done' to re-enable UI
                     else:
                         self._handle_item_event(ev, data)
                 elif kind == 'done':
@@ -545,6 +570,10 @@ class Spotify2MP3GUI:
                         self.status_label.config(text='✅ Conversion complete')
                         try: self.progress.configure(style='Ok.Horizontal.TProgressbar')
                         except Exception: pass
+                        if self._errors:
+                            n = len(self._errors)
+                            messagebox.showwarning("Completed with errors",
+                                f"Finished with {n} failed track(s). Click 'View error' next to the red items for details.")
                     self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
                     self._conv_done = True; self.root.bell()
                     self._cancel_event = None
@@ -605,12 +634,19 @@ class Spotify2MP3GUI:
 
         if ev == 'error':
             idx = int(d['idx'])
+            msg = d.get('message') or 'Unknown error'
+            self._errors[idx] = msg
+
             row = self._rows.get(idx)
             if row:
                 row['bar'].configure(value=100)
                 row['label'].config(text=f"{idx:03d}. {row['title']}  (Error)")
                 try: row['bar'].configure(style='Error.Horizontal.TProgressbar')
                 except Exception: pass
+                # Show "View error" button
+                try: row['btn'].pack(side='right')
+                except Exception: pass
+                Tooltip(row['label'], msg[:3000])
             self._set_percent(idx, 100.0)
             return
 
@@ -619,14 +655,44 @@ class Spotify2MP3GUI:
             return
         frame = ttk.Frame(self.list_frame, style='CardBody.TFrame')
         frame.pack(fill='x', padx=2, pady=4)
-        lbl = ttk.Label(frame, text=f"{idx:03d}. {title}")
-        lbl.pack(fill='x')
+
+        top = ttk.Frame(frame, style='CardBody.TFrame')
+        top.pack(fill='x')
+        lbl = ttk.Label(top, text=f"{idx:03d}. {title}")
+        lbl.pack(side='left', fill='x', expand=True)
+
+        # Hidden until an error happens:
+        btn = ttk.Button(top, text="View error", command=lambda i=idx: self._show_error(i))
+        btn.pack(side='right'); btn.pack_forget()
+
         bar = ttk.Progressbar(
             frame, orient='horizontal', length=820, mode='determinate',
             maximum=100, value=0, style='Active.Horizontal.TProgressbar'
         )
         bar.pack(fill='x', pady=(4, 0))
-        self._rows[idx] = {'label': lbl, 'bar': bar, 'title': title}
+
+        self._rows[idx] = {'frame': frame, 'label': lbl, 'bar': bar, 'btn': btn, 'title': title}
+
+    def _show_error(self, idx: int):
+        msg = self._errors.get(idx, "No details")
+        win = tk.Toplevel(self.root)
+        win.title(f"Error details — Track {idx:03d}")
+        win.geometry("720x420")
+        win.transient(self.root)
+        win.grab_set()
+
+        frm = ttk.Frame(win); frm.pack(fill='both', expand=True, padx=10, pady=10)
+        txt = tk.Text(frm, wrap='word')
+        txt.pack(fill='both', expand=True)
+        txt.insert('1.0', msg)
+        txt.configure(state='disabled')
+
+        btns = ttk.Frame(frm); btns.pack(fill='x', pady=(8,0))
+        def _copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(msg)
+        ttk.Button(btns, text="Copy to clipboard", command=_copy).pack(side='left')
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side='right')
 
     def _set_percent(self, idx: int, p: float):
         self._perc[idx] = p
@@ -642,6 +708,7 @@ class Spotify2MP3GUI:
             child.destroy()
         self._rows.clear()
         self._perc.clear()
+        self._errors.clear()
         self._total_tracks = 0
 
     # ---------- chrono ----------
@@ -671,7 +738,7 @@ class Spotify2MP3GUI:
             try: w.config(state=state)
             except Exception: pass
         if enabled:
-            self.stop_button.config(state=tk.DISABLED)  # Stop only enabled during runs
+            self.stop_button.config(state=tk.DISABLED)
 
     def _start_indeterminate(self, text: str):
         self.status_label.config(text=text)
