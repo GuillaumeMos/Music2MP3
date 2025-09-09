@@ -5,5 +5,8 @@
   "duration_max": 600,
   "transcode_mp3": false,
   "generate_m3u": true,
-  "exclude_instrumentals": false
+  "exclude_instrumentals": false,
+  "concurrency": 3,
+  "deep_search": true,
+  "incremental_update": true
 }
