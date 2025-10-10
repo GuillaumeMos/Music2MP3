@@ -11,7 +11,8 @@ import time
 import logging
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, List
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 
 log = logging.getLogger(__name__)
 
@@ -23,11 +24,6 @@ ItemCB = Callable[[str, dict], None]
 # ========================== BINARIES AUTO-DETECT (PyInstaller friendly) ==========================
 
 def _resource_dir() -> Path:
-    """
-    Retourne le répertoire ressources du bundle (PyInstaller) ou le dossier du script.
-    - Quand packagé : sys._MEIPASS pointe sur un dossier temporaire qui contient les datas (ffmpeg/yt-dlp).
-    - En dev : on retombe sur le dossier du fichier courant.
-    """
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS)  # type: ignore[attr-defined]
     return Path(__file__).resolve().parent
@@ -40,15 +36,6 @@ def _which(names: Sequence[str]) -> str | None:
     return None
 
 def _find_yt_dlp() -> list[str]:
-    """
-    Cherche yt-dlp dans l'ordre :
-      1) _MEIPASS/yt-dlp/yt-dlp(.exe) (comme dans ton .spec)
-      2) _MEIPASS/yt-dlp(.exe)
-      3) dossier source (développement) : ./yt-dlp(.exe)
-      4) PATH
-      5) fallback module: python -m yt_dlp
-    Retourne argv (liste) à exécuter.
-    """
     rd = _resource_dir()
     candidates = [
         rd / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
@@ -63,17 +50,9 @@ def _find_yt_dlp() -> list[str]:
     if found:
         return [found]
 
-    # Dernier recours : module Python
     return [sys.executable, "-m", "yt_dlp"]
 
 def _find_ffmpeg_dir() -> str | None:
-    """
-    Dossier à fournir à --ffmpeg-location si utile.
-      - _MEIPASS/ffmpeg  (Windows: ffmpeg.exe ici)
-      - _MEIPASS/ffmpeg/bin (macOS/Linux)
-      - côté source (dev)
-      - sinon None si ffmpeg dispo via PATH
-    """
     rd = _resource_dir()
     dirs = [
         rd / "ffmpeg",
@@ -116,15 +95,20 @@ class Converter:
         self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
         self.exclude_instr: bool = bool(self.config.get("exclude_instrumentals", False))
         self.incremental: bool = bool(self.config.get("incremental_update", True))
-        self.concurrency: int = int(self.config.get("concurrency", 3))
+        self.concurrency: int = max(1, min(8, int(self.config.get("concurrency", 3))))  # pistes en parallèle
+        self._segments: int = max(1, min(8, self.concurrency))  # parallélisme segments yt-dlp
+
+        # pour la M3U
+        self._made_files_lock = threading.Lock()
+        self._made_files: List[str] = []
 
     # ------------------------------ public API ------------------------------
 
     def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: Optional[str] = None) -> str:
         """
         Lit un CSV (colonnes: Track Name, Artist Name(s), Album Name, Duration (ms), [Source URL], [Track URI])
-        et télécharge les pistes via yt-dlp, avec transcodage optionnel en MP3 VBR0.
-        Retourne le dossier de sortie (souvent output_folder / playlist_hint s'il est fourni).
+        et télécharge les pistes via yt-dlp, en parallèle jusqu’à self.concurrency.
+        Retourne le dossier de sortie.
         """
         out_base = Path(output_folder)
         out_dir = out_base
@@ -137,91 +121,114 @@ class Converter:
         rows = _read_csv(csv_path)
         tracks = self._rows_to_jobs(rows)
 
-        # Option d'exclusion "instrumental"
         if self.exclude_instr:
             tracks = [t for t in tracks if not _looks_instrumental(t["title"])]
 
         total = len(tracks)
         self.item_cb("conv_init", {"new": total})
         self.status_cb(f"Preparing {total} tracks…")
-        log.info("CONV: total tracks to process: %s (out_dir=%s)", total, out_dir)
+        log.info("CONV: total tracks to process: %s (out_dir=%s, workers=%s)", total, out_dir, self.concurrency)
 
-        made_files: list[str] = []
-        for idx, t in enumerate(tracks, start=1):
-            if self.cancel_event.is_set():
-                log.warning("CONV: cancel requested, stopping")
-                self.item_cb("cancel_all", {})
-                break
+        # Lancement parallèle : un worker par piste
+        futures: list[Future] = []
+        with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="dl") as pool:
+            for idx, t in enumerate(tracks, start=1):
+                if self.cancel_event.is_set():
+                    break
+                # calcule le nom final (pour incrémental)
+                pretty_title = self._pretty_title(t)
+                ext = "mp3" if self.transcode_mp3 else "m4a"
+                base_name = _sanitize_filename(pretty_title)
+                if self.prefix_numbers:
+                    base_name = f"{idx:03d} - {base_name}"
+                dest = out_dir / f"{base_name}.{ext}"
 
-            # UI row init
-            pretty_title = self._pretty_title(t)
-            self.item_cb("init", {"idx": idx, "title": pretty_title})
-
-            # Destination filename
-            ext = "mp3" if self.transcode_mp3 else "m4a"
-            base_name = _sanitize_filename(pretty_title)
-            if self.prefix_numbers:
-                base_name = f"{idx:03d} - {base_name}"
-            dest = out_dir / f"{base_name}.{ext}"
-
-            if self.incremental and dest.exists() and dest.stat().st_size > 0:
-                log.info("CONV: skip existing (%s)", dest.name)
-                self.item_cb("done", {"idx": idx})
-                made_files.append(dest.name)
-                continue
-
-            # Construire la commande yt-dlp
-            url = t.get("source_url") or t.get("track_uri")
-            if not url:
-                url = self._build_search_query(t)
-
-            cmd = self._build_ytdlp_cmd(url=url, out_path=str(dest), want_mp3=self.transcode_mp3)
-
-            # Lancer yt-dlp et streamer la progression
-            self.status_cb(f"Downloading {pretty_title}…")
-            code = self._run_ytdlp_stream(
-                cmd,
-                idx=idx,
-                on_progress=self._on_progress_line,
-                cancel_event=self.cancel_event,
-            )
-
-            if self.cancel_event.is_set():
-                log.warning("CONV: cancelled during download (idx=%s)", idx)
-                self.item_cb("cancel_all", {})
-                break
-
-            if code == 127:
-                msg = (
-                    "yt-dlp n'est pas disponible. Installe-le (pip install yt-dlp) "
-                    "ou place 'yt-dlp(.exe)' et 'ffmpeg' avec l'application."
+                futures.append(
+                    pool.submit(self._process_one, idx, t, str(dest))
                 )
-                log.error("CONV: %s", msg)
-                self.item_cb("error", {"idx": idx, "message": msg})
-                continue
 
-            if code != 0:
-                msg = f"yt-dlp failed with code {code} for: {pretty_title}"
-                log.error("CONV: %s", msg)
-                self.item_cb("error", {"idx": idx, "message": msg})
-                continue
-
-            # Done
-            self.item_cb("done", {"idx": idx})
-            made_files.append(dest.name)
+            # on attend la fin (les callbacks UI/progression sont envoyés depuis chaque worker)
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception:
+                    # déjà loggé dans le worker → on continue
+                    pass
 
         # M3U
-        if self.generate_m3u and made_files:
+        if self.generate_m3u and self._made_files:
             m3u = out_dir / "playlist.m3u8"
             try:
+                # garder l'ordre par index (les noms sont déjà préfixés si demandé)
                 with m3u.open("w", encoding="utf-8", newline="\n") as f:
-                    for name in made_files:
+                    for name in self._made_files:
                         f.write(name + "\n")
                 log.info("CONV: M3U generated: %s", m3u)
             except Exception:
                 log.exception("CONV: failed generating M3U")
 
         return str(out_dir)
+
+    # ------------------------------ per-track worker ------------------------------
+
+    def _process_one(self, idx: int, t: dict, dest_path: str):
+        """Télécharge/convertit une piste (thread worker)."""
+        if self.cancel_event.is_set():
+            return
+
+        pretty_title = self._pretty_title(t)
+        dest = Path(dest_path)
+
+        # UI row init
+        self.item_cb("init", {"idx": idx, "title": pretty_title})
+
+        # incrémental
+        if self.incremental and dest.exists() and dest.stat().st_size > 0:
+            log.info("CONV: skip existing (%s)", dest.name)
+            self.item_cb("done", {"idx": idx})
+            with self._made_files_lock:
+                self._made_files.append(dest.name)
+            return
+
+        # Construire l’URL et la commande
+        url = t.get("source_url") or t.get("track_uri")
+        if not url:
+            url = self._build_search_query(t)
+        cmd = self._build_ytdlp_cmd(url=url, out_path=str(dest), want_mp3=self.transcode_mp3)
+
+        # Statut
+        self.status_cb(f"Downloading {pretty_title}…")
+
+        code = self._run_ytdlp_stream(
+            cmd,
+            idx=idx,
+            on_progress=self._on_progress_line,
+            cancel_event=self.cancel_event,
+        )
+
+        if self.cancel_event.is_set():
+            log.warning("CONV: cancelled during download (idx=%s)", idx)
+            self.item_cb("cancel_all", {})
+            return
+
+        if code == 127:
+            msg = (
+                "yt-dlp n'est pas disponible. Installe-le (pip install yt-dlp) "
+                "ou place 'yt-dlp(.exe)' et 'ffmpeg' avec l'application."
+            )
+            log.error("CONV: %s", msg)
+            self.item_cb("error", {"idx": idx, "message": msg})
+            return
+
+        if code != 0:
+            msg = f"yt-dlp failed with code {code} for: {pretty_title}"
+            log.error("CONV: %s", msg)
+            self.item_cb("error", {"idx": idx, "message": msg})
+            return
+
+        self.item_cb("done", {"idx": idx})
+        with self._made_files_lock:
+            self._made_files.append(dest.name)
 
     # ------------------------------ internals ------------------------------
 
@@ -252,7 +259,6 @@ class Converter:
         return nm or a or "Unknown"
 
     def _build_search_query(self, t: dict) -> str:
-        # Favorise audio officiel : ajoute "audio" et enlève des termes bruyants
         artist = (t.get("artists") or "").split(",")[0].strip()
         title = t.get("title") or ""
         query = f"{artist} {title}".strip()
@@ -263,18 +269,16 @@ class Converter:
         return yts
 
     def _build_ytdlp_cmd(self, url: str, out_path: str, want_mp3: bool) -> list[str]:
-        # argv pointant vers le bon binaire/module yt-dlp
         cmd = _find_yt_dlp()
-        # options yt-dlp
         cmd += [
             "--newline",
             "--no-playlist",
             "--ignore-errors",
             "--no-overwrites",
             "-o", out_path,
-            "-N", str(max(1, min(8, self.concurrency))),  # parallélisme de téléchargement
+            "-N", str(self._segments),              # parallélisme segments côté yt-dlp
             "-f", "bestaudio/best",
-            "-x",  # extract audio
+            "-x",
             "--audio-format", "mp3" if want_mp3 else "m4a",
             "--audio-quality", "0" if want_mp3 else "0",
             "--add-metadata",
@@ -283,7 +287,6 @@ class Converter:
         ffdir = _find_ffmpeg_dir()
         if ffdir:
             cmd += ["--ffmpeg-location", ffdir]
-
         cmd.append(url)
         log.debug("CONV: yt-dlp cmd: %s", " ".join(shlex.quote(c) for c in cmd))
         return cmd
@@ -312,10 +315,19 @@ class Converter:
     ) -> int:
         """
         Lance yt-dlp et stream stdout ligne par ligne.
-        - Loggue chaque ligne (INFO)
-        - Parse les lignes de progression pour mettre à jour l'UI
-        - Gère l'annulation via cancel_event
+        - Pas de fenêtre console (Windows)
+        - Log INFO chaque ligne
+        - Parse progression et pousse à l'UI
+        - Arrêt propre si cancel_event
         """
+        # --- empêcher l'ouverture d'une console sur Windows ---
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -324,6 +336,8 @@ class Converter:
                 text=True,
                 universal_newlines=True,
                 bufsize=1,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
             )
         except FileNotFoundError:
             log.error("yt-dlp introuvable (ni binaire embarqué, ni PATH, ni module).")
@@ -369,16 +383,12 @@ def _read_csv(path: str) -> list[dict]:
 
 def _sanitize_filename(name: str, for_dir: bool = False) -> str:
     name = name.strip().replace("\n", " ")
-    # enlever caractères interdits
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
     name = re.sub(r"\s+", " ", name).strip()
-    # tronquer raisonnablement
     if len(name) > 150:
         name = name[:150].rstrip()
-    # éviter noms vides
     if not name:
         name = "untitled"
-    # si c'est un nom de dossier, éviter le point final Windows
     if for_dir:
         name = name.rstrip(". ")
     return name
