@@ -18,12 +18,10 @@ class _TkLogHandler(logging.Handler):
         try:
             self.q.put_nowait(record)
         except Exception:
-            # on ne casse pas l'appli si la queue est pleine/fermée
             pass
 
 class LogWindow(tk.Toplevel):
-    """Fenêtre Toplevel affichant les logs en temps réel avec filtres et autoscroll."""
-    _instance = None  # singleton par root
+    _instance = None  # singleton
 
     @classmethod
     def get_or_create(cls, root, queue: Queue):
@@ -46,19 +44,19 @@ class LogWindow(tk.Toplevel):
         self.level = tk.StringVar(value="INFO")
         self.search_var = tk.StringVar(value="")
 
-        # UI
+        # UI top-bar
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=6)
         ttk.Label(top, text="Niveau").pack(side="left")
         ttk.OptionMenu(top, self.level, self.level.get(), *_LEVELS).pack(side="left", padx=(6, 12))
         ttk.Checkbutton(top, text="Pause", variable=self.paused).pack(side="left")
         ttk.Checkbutton(top, text="Autoscroll", variable=self.autoscroll).pack(side="left", padx=(12, 0))
         ttk.Button(top, text="Effacer", command=self._clear).pack(side="left", padx=(12, 0))
-
         ttk.Label(top, text="Rechercher").pack(side="left", padx=(16, 4))
         search_entry = ttk.Entry(top, textvariable=self.search_var, width=28)
         search_entry.pack(side="left")
         ttk.Button(top, text="Suivant", command=self._find_next).pack(side="left", padx=(6, 0))
 
+        # Text zone
         body = ttk.Frame(self); body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.text = tk.Text(body, wrap="none", state="disabled", undo=False)
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
@@ -70,20 +68,15 @@ class LogWindow(tk.Toplevel):
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
 
-        # tags couleurs par niveau (restent sobres)
-        self.text.tag_config("DEBUG", foreground="#6b7280")     # gris
-        self.text.tag_config("INFO", foreground="#111827")      # noir
-        self.text.tag_config("WARNING", foreground="#b45309")   # orange
-        self.text.tag_config("ERROR", foreground="#b91c1c")     # rouge
+        # color tags
+        self.text.tag_config("DEBUG", foreground="#6b7280")
+        self.text.tag_config("INFO", foreground="#111827")
+        self.text.tag_config("WARNING", foreground="#b45309")
+        self.text.tag_config("ERROR", foreground="#b91c1c")
         self.text.tag_config("CRITICAL", foreground="#7f1d1d", underline=1)
 
-        # fermeture → juste masquer
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # polling queue
         self._poll()
-
-        # Bind Ctrl+F pour focus recherche
         self.bind("<Control-f>", lambda e: (search_entry.focus_set(), "break"))
 
     def _on_close(self):
@@ -100,7 +93,6 @@ class LogWindow(tk.Toplevel):
         self.text.config(state="disabled")
 
     def _format_record(self, r: logging.LogRecord) -> str:
-        # 2025-10-10 12:34:56 INFO module: message
         ts = datetime.fromtimestamp(r.created).strftime("%Y-%m-%d %H:%M:%S")
         msg = r.getMessage()
         return f"{ts} {r.levelname} {r.name}: {msg}"
@@ -115,6 +107,7 @@ class LogWindow(tk.Toplevel):
     def _poll(self):
         if not self.paused.get():
             try:
+                from queue import Empty
                 while True:
                     r = self.queue.get_nowait()
                     if self._passes_filter(r):
@@ -122,7 +115,7 @@ class LogWindow(tk.Toplevel):
                         self._append_line(line, r.levelname)
             except Empty:
                 pass
-        self.after(100, self._poll)  # 10 Hz
+        self.after(100, self._poll)
 
     def _find_next(self):
         q = self.search_var.get()
@@ -130,7 +123,6 @@ class LogWindow(tk.Toplevel):
             return
         idx = self.text.search(q, self.text.index("insert +1c"), nocase=True, stopindex="end")
         if not idx:
-            # wrap to start
             idx = self.text.search(q, "1.0", nocase=True, stopindex="end")
             if not idx:
                 return
@@ -140,16 +132,16 @@ class LogWindow(tk.Toplevel):
         self.text.mark_set("insert", end)
         self.text.see(idx)
 
-def attach_live_log_handler(root) -> tuple[_TkLogHandler, Queue, LogWindow]:
+def attach_live_log_handler(root):
     """
     Crée la Queue, un handler logging thread-safe, et la fenêtre (cachée par défaut).
     Retourne (handler, queue, window).
     """
+    from queue import Queue
     q = Queue(maxsize=1000)
     handler = _TkLogHandler(q)
-    # on laisse la mise en forme à la fenêtre (pas de Formatter ici)
-    handler.setLevel(logging.DEBUG)  # on envoie tout, filtrage côté fenêtre
+    handler.setLevel(logging.DEBUG)  # on envoie tout; filtrage dans la fenêtre
     logging.getLogger().addHandler(handler)
     win = LogWindow.get_or_create(root, q)
-    win.withdraw()  # démarre caché; on l’affiche à la demande
+    win.withdraw()
     return handler, q, win

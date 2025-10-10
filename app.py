@@ -1,8 +1,7 @@
-# entrypoint.py
+# app.py (entrypoint)
 import os, sys, logging
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox as mb
 
 try:
     from tkinterdnd2 import TkinterDnD
@@ -12,7 +11,7 @@ except Exception:
 
 from logging_setup import setup_logging
 from gui import Music2MP3GUI
-from log_viewer import attach_live_log_handler  
+from log_viewer import attach_live_log_handler
 
 def main():
     # --- logging early ---
@@ -23,35 +22,26 @@ def main():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
+    log = logging.getLogger(__name__)
+    log.info("App starting… DND_AVAILABLE=%s", DND_AVAILABLE)
+    log.info("Log file -> %s", log_path)
+
     # --- root ---
     if DND_AVAILABLE:
         try:
             root = TkinterDnD.Tk()
         except Exception:
+            log.warning("TkinterDnD init failed, fallback Tk()", exc_info=True)
             root = tk.Tk()
     else:
         root = tk.Tk()
 
-    # --- log window: rien dans gui.py ---
+    # --- live log window (F12) ---
     handler, q, log_win = attach_live_log_handler(root)
-
-    # Raccourci clavier (n'interfère pas avec gui.py)
     root.bind("<F12>", lambda e: (log_win.deiconify(), log_win.lift(), "break"))
 
-    # (Optionnel) n’ajoute un menu que s’il n’y en a pas déjà un
-    try:
-        current_menu = root.nametowidget(root["menu"]) if root["menu"] else None
-    except Exception:
-        current_menu = None
-    if current_menu is None:
-        from tkinter import Menu
-        menubar = Menu(root)
-        view_menu = Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Console des logs (F12)", command=lambda: (log_win.deiconify(), log_win.lift()))
-        menubar.add_cascade(label="Affichage", menu=view_menu)
-        root.config(menu=menubar)
-
     app = Music2MP3GUI(root)
+    logging.getLogger(__name__).info("App UI ready")
     root.mainloop()
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ def _retrying_session(
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.mount("http://", HTTPAdapter(max_retries=r))
 
-    # inject default timeout for all requests
+    # default timeout for all requests
     orig_request = s.request
     def _with_timeout(method, url, **kw):
         kw.setdefault("timeout", 20)
@@ -46,7 +46,6 @@ class SpotifyClient:
     """
     token_supplier: callable -> str (access_token)
     """
-    # --------- helpers de parsing (compat avec gui.py) ---------
     _RGX = re.compile(
         r"spotify:(?P<kind>track|album|artist|playlist):(?P<id>[A-Za-z0-9]+)|"
         r"open\.spotify\.com/(?P<kind2>track|album|artist|playlist)/(?P<id2>[A-Za-z0-9]+)"
@@ -54,14 +53,12 @@ class SpotifyClient:
 
     @staticmethod
     def extract_playlist_id(s: str | None) -> str | None:
-        """Retourne l'ID playlist depuis une URL/URI Spotify, sinon None."""
         if not s:
             return None
         m = re.search(r"(?:spotify:playlist:|open\.spotify\.com/playlist/)([A-Za-z0-9]+)", s)
         return m.group(1) if m else None
 
     def _parse_spotify_id(self, s):
-        """Retourne (kind, id) ou (None, None)"""
         m = self._RGX.search(s or "")
         if not m:
             return (None, None)
@@ -74,9 +71,7 @@ class SpotifyClient:
             raise ValueError("token_supplier must be callable")
         self._token_supplier = token_supplier
 
-    # -----------------------
-    # HTTP helpers
-    # -----------------------
+    # ---------------- HTTP ----------------
     def _headers(self):
         return {"Authorization": f"Bearer {self._token_supplier()}"}
 
@@ -104,9 +99,7 @@ class SpotifyClient:
         r.raise_for_status()
         return r.json()
 
-    # -----------------------
-    # Resolvers
-    # -----------------------
+    # ------------- Resolvers --------------
     def resolve(self, url_or_uri):
         kind, ident = self._parse_spotify_id(url_or_uri)
         if kind == "track":
@@ -121,9 +114,7 @@ class SpotifyClient:
         else:
             return []
 
-    # -----------------------
-    # Entities
-    # -----------------------
+    # -------------- Entities --------------
     def track(self, track_id):
         return self._get(f"{API}/tracks/{track_id}")
 
@@ -198,9 +189,7 @@ class SpotifyClient:
             })
         return out
 
-    # -----------------------
-    # Batch lookups
-    # -----------------------
+    # ------------- Batch lookups ----------
     def tracks(self, track_ids):
         out = []
         ids = list(track_ids or [])
@@ -209,9 +198,7 @@ class SpotifyClient:
             out.extend(data.get("tracks") or [])
         return out
 
-    # -----------------------
-    # Playlists utilitaires (compat gui.py)
-    # -----------------------
+    # --------- Playlists utils (+GUI) ----
     def current_user_id(self):
         me = self._get(f"{API}/me")
         return me.get("id")
@@ -233,23 +220,13 @@ class SpotifyClient:
         return self._post(f"{API}/playlists/{playlist_id}/tracks", json_body=body)
 
     def fetch_playlist(self, playlist_id: str):
-        """
-        Utilisé par gui.py :
-          rows, name = fetch_playlist(playlist_id)
-        rows -> liste de dicts CSV ("Track Name", "Artist Name(s)", "Album Name", "Duration (ms)")
-        name -> nom de la playlist
-        """
-        # nom de la playlist
         meta = self._get(f"{API}/playlists/{playlist_id}", params={"fields": "name"})
         name = meta.get("name")
-        # tracks
         tracks = self.playlist_tracks(playlist_id)
         rows, _ = self.to_csv_rows(tracks, playlist_name=name)
         return rows, name
 
-    # -----------------------
-    # Helpers CSV
-    # -----------------------
+    # -------------- CSV helper -----------
     def to_csv_rows(self, track_dicts, playlist_name=None):
         rows = []
         for tr in track_dicts or []:
