@@ -12,7 +12,7 @@ except Exception:
 
 from logging_setup import setup_logging
 from gui import Music2MP3GUI
-from log_viewer import attach_live_log_handler  # ← notre viewer
+from log_viewer import attach_live_log_handler  
 
 def main():
     # --- logging early ---
