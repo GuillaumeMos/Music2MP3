@@ -46,6 +46,29 @@ class SpotifyClient:
     """
     token_supplier: callable -> str (access_token)
     """
+    # --------- helpers de parsing (compat avec gui.py) ---------
+    _RGX = re.compile(
+        r"spotify:(?P<kind>track|album|artist|playlist):(?P<id>[A-Za-z0-9]+)|"
+        r"open\.spotify\.com/(?P<kind2>track|album|artist|playlist)/(?P<id2>[A-Za-z0-9]+)"
+    )
+
+    @staticmethod
+    def extract_playlist_id(s: str | None) -> str | None:
+        """Retourne l'ID playlist depuis une URL/URI Spotify, sinon None."""
+        if not s:
+            return None
+        m = re.search(r"(?:spotify:playlist:|open\.spotify\.com/playlist/)([A-Za-z0-9]+)", s)
+        return m.group(1) if m else None
+
+    def _parse_spotify_id(self, s):
+        """Retourne (kind, id) ou (None, None)"""
+        m = self._RGX.search(s or "")
+        if not m:
+            return (None, None)
+        kind = m.group("kind") or m.group("kind2")
+        ident = m.group("id") or m.group("id2")
+        return (kind, ident)
+
     def __init__(self, token_supplier):
         if not callable(token_supplier):
             raise ValueError("token_supplier must be callable")
@@ -97,22 +120,6 @@ class SpotifyClient:
             return self.artist_top_tracks(ident)
         else:
             return []
-
-    # -----------------------
-    # Parsers
-    # -----------------------
-    _RGX = re.compile(
-        r"spotify:(?P<kind>track|album|artist|playlist):(?P<id>[A-Za-z0-9]+)|"
-        r"open\.spotify\.com/(?P<kind2>track|album|artist|playlist)/(?P<id2>[A-Za-z0-9]+)"
-    )
-
-    def _parse_spotify_id(self, s):
-        m = self._RGX.search(s or "")
-        if not m:
-            return (None, None)
-        kind = m.group("kind") or m.group("kind2")
-        ident = m.group("id") or m.group("id2")
-        return (kind, ident)
 
     # -----------------------
     # Entities
@@ -203,7 +210,7 @@ class SpotifyClient:
         return out
 
     # -----------------------
-    # Playlists utilitaires
+    # Playlists utilitaires (compat gui.py)
     # -----------------------
     def current_user_id(self):
         me = self._get(f"{API}/me")
@@ -225,12 +232,26 @@ class SpotifyClient:
         body = {"uris": uris}
         return self._post(f"{API}/playlists/{playlist_id}/tracks", json_body=body)
 
+    def fetch_playlist(self, playlist_id: str):
+        """
+        Utilisé par gui.py :
+          rows, name = fetch_playlist(playlist_id)
+        rows -> liste de dicts CSV ("Track Name", "Artist Name(s)", "Album Name", "Duration (ms)")
+        name -> nom de la playlist
+        """
+        # nom de la playlist
+        meta = self._get(f"{API}/playlists/{playlist_id}", params={"fields": "name"})
+        name = meta.get("name")
+        # tracks
+        tracks = self.playlist_tracks(playlist_id)
+        rows, _ = self.to_csv_rows(tracks, playlist_name=name)
+        return rows, name
+
     # -----------------------
-    # Helpers CSV (pour export simple)
+    # Helpers CSV
     # -----------------------
     def to_csv_rows(self, track_dicts, playlist_name=None):
         rows = []
-        name = playlist_name or ""
         for tr in track_dicts or []:
             if not tr:
                 continue
@@ -244,4 +265,4 @@ class SpotifyClient:
                 "Album Name": album,
                 "Duration (ms)": dur
             })
-        return rows, name
+        return rows, (playlist_name or "")
