@@ -4,12 +4,14 @@ import csv
 import os
 import re
 import shlex
+import sys
+import shutil
 import threading
 import time
 import logging
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +19,80 @@ StatusCB = Callable[[str], None]
 ProgressCB = Callable[[int, int], None]
 ItemCB = Callable[[str, dict], None]
 
+
+# ========================== BINARIES AUTO-DETECT (PyInstaller friendly) ==========================
+
+def _resource_dir() -> Path:
+    """
+    Retourne le répertoire ressources du bundle (PyInstaller) ou le dossier du script.
+    - Quand packagé : sys._MEIPASS pointe sur un dossier temporaire qui contient les datas (ffmpeg/yt-dlp).
+    - En dev : on retombe sur le dossier du fichier courant.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+def _which(names: Sequence[str]) -> str | None:
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+def _find_yt_dlp() -> list[str]:
+    """
+    Cherche yt-dlp dans l'ordre :
+      1) _MEIPASS/yt-dlp/yt-dlp(.exe) (comme dans ton .spec)
+      2) _MEIPASS/yt-dlp(.exe)
+      3) dossier source (développement) : ./yt-dlp(.exe)
+      4) PATH
+      5) fallback module: python -m yt_dlp
+    Retourne argv (liste) à exécuter.
+    """
+    rd = _resource_dir()
+    candidates = [
+        rd / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+        rd / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+        Path(__file__).resolve().parent / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return [str(c)]
+
+    found = _which(["yt-dlp", "yt-dlp.exe"])
+    if found:
+        return [found]
+
+    # Dernier recours : module Python
+    return [sys.executable, "-m", "yt_dlp"]
+
+def _find_ffmpeg_dir() -> str | None:
+    """
+    Dossier à fournir à --ffmpeg-location si utile.
+      - _MEIPASS/ffmpeg  (Windows: ffmpeg.exe ici)
+      - _MEIPASS/ffmpeg/bin (macOS/Linux)
+      - côté source (dev)
+      - sinon None si ffmpeg dispo via PATH
+    """
+    rd = _resource_dir()
+    dirs = [
+        rd / "ffmpeg",
+        rd / "ffmpeg" / "bin",
+        Path(__file__).resolve().parent / "ffmpeg",
+        Path(__file__).resolve().parent / "ffmpeg" / "bin",
+    ]
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for d in dirs:
+        exe = d / exe_name
+        if exe.exists():
+            return str(d)
+
+    if shutil.which(exe_name):
+        return None
+    return None
+
+
+# ========================================= CONVERTER ============================================
 
 class Converter:
     def __init__(
@@ -97,7 +173,6 @@ class Converter:
             # Construire la commande yt-dlp
             url = t.get("source_url") or t.get("track_uri")
             if not url:
-                # ytsearch query
                 url = self._build_search_query(t)
 
             cmd = self._build_ytdlp_cmd(url=url, out_path=str(dest), want_mp3=self.transcode_mp3)
@@ -115,6 +190,15 @@ class Converter:
                 log.warning("CONV: cancelled during download (idx=%s)", idx)
                 self.item_cb("cancel_all", {})
                 break
+
+            if code == 127:
+                msg = (
+                    "yt-dlp n'est pas disponible. Installe-le (pip install yt-dlp) "
+                    "ou place 'yt-dlp(.exe)' et 'ffmpeg' avec l'application."
+                )
+                log.error("CONV: %s", msg)
+                self.item_cb("error", {"idx": idx, "message": msg})
+                continue
 
             if code != 0:
                 msg = f"yt-dlp failed with code {code} for: {pretty_title}"
@@ -172,39 +256,35 @@ class Converter:
         artist = (t.get("artists") or "").split(",")[0].strip()
         title = t.get("title") or ""
         query = f"{artist} {title}".strip()
-        # deep_search -> plus de mots-clés pour précision
         if self.deep_search:
             query += " audio"
-        # yt-dlp format: ytsearch1:<query>
         yts = f"ytsearch1:{query}"
         log.debug("CONV: search query -> %s", yts)
         return yts
 
     def _build_ytdlp_cmd(self, url: str, out_path: str, want_mp3: bool) -> list[str]:
-        # --newline pour une progression ligne à ligne
-        # --no-playlist pour éviter de dérouler des playlists entières
-        # Extraction audio + transcodage avec ffmpeg
-        cmd = [
-            "yt-dlp",
+        # argv pointant vers le bon binaire/module yt-dlp
+        cmd = _find_yt_dlp()
+        # options yt-dlp
+        cmd += [
             "--newline",
             "--no-playlist",
             "--ignore-errors",
             "--no-overwrites",
             "-o", out_path,
-            "-N", str(max(1, min(8, self.concurrency))),  # parallélisme segments
+            "-N", str(max(1, min(8, self.concurrency))),  # parallélisme de téléchargement
             "-f", "bestaudio/best",
             "-x",  # extract audio
             "--audio-format", "mp3" if want_mp3 else "m4a",
             "--audio-quality", "0" if want_mp3 else "0",
+            "--add-metadata",
+            "--embed-thumbnail",
         ]
+        ffdir = _find_ffmpeg_dir()
+        if ffdir:
+            cmd += ["--ffmpeg-location", ffdir]
 
-        # Ajoute quelques post-proc utiles
-        # (si ffmpeg est dispo, yt-dlp prendra en charge la conversion)
-        cmd += ["--add-metadata", "--embed-thumbnail"]
-
-        # Enfin l'URL / recherche
         cmd.append(url)
-
         log.debug("CONV: yt-dlp cmd: %s", " ".join(shlex.quote(c) for c in cmd))
         return cmd
 
@@ -232,7 +312,7 @@ class Converter:
     ) -> int:
         """
         Lance yt-dlp et stream stdout ligne par ligne.
-        - Loggue chaque ligne
+        - Loggue chaque ligne (INFO)
         - Parse les lignes de progression pour mettre à jour l'UI
         - Gère l'annulation via cancel_event
         """
@@ -246,7 +326,7 @@ class Converter:
                 bufsize=1,
             )
         except FileNotFoundError:
-            log.exception("yt-dlp introuvable dans le PATH")
+            log.error("yt-dlp introuvable (ni binaire embarqué, ni PATH, ni module).")
             return 127
 
         assert proc.stdout is not None
@@ -270,12 +350,12 @@ class Converter:
                 pass
 
         try:
-            return proc.wait(timeout=10)
+            return proc.wait(timeout=20)
         except Exception:
             return 1
 
 
-# ------------------------------ helpers ------------------------------
+# ========================================= HELPERS ==============================================
 
 def _read_csv(path: str) -> list[dict]:
     rows: list[dict] = []
