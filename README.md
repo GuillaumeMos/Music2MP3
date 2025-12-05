@@ -1,12 +1,12 @@
 # Music2MP3
 
 **Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
-You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others) **or paste a Spotify playlist link** and sign in (PKCE, **no client secret**).
+You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**).
 
 The app downloads each track via **yt-dlp** as:
 
 - **M4A** (remux; keeps source AAC when available), or
-- **MP3 VBR0** (high quality re-encode via FFmpeg).
+- **MP3 VBR0** (high-quality re-encode via FFmpeg).
 
 Everything is bundled—no Python or external installs required.
 
@@ -14,21 +14,28 @@ Everything is bundled—no Python or external installs required.
 
 ## ✨ Highlights
 
-- **Load directly from a Spotify playlist URL**  
-  Uses **OAuth PKCE** in your browser (scopes: `playlist-read-private`, `playlist-read-collaborative`). Works for **public, private, and collaborative** playlists. No client secret stored.
+- **Load from Spotify URL (public/private/collab)**  
+  Uses **OAuth PKCE** in your browser (scopes: `playlist-read-private`, `playlist-read-collaborative`). No client secret stored.
+- **Load from SoundCloud URL (no auth)**  
+  Paste any **public playlist** or **private “secret link”** URL and it just works. No account login, no credentials.
 - **CSV still supported**  
   Any CSV with the usual headers (`Track Name`, `Artist Name(s)`, `Album Name`, `Duration (ms)`…) works (Exportify, TuneMyMusic…).
 - **Incremental updates**  
   If the target playlist folder already exists, the app **adds only new tracks** (no duplicates).  
-  Dedup uses (in order): **Track URI**, then **title+artist tags**, then **filename (title) ignoring any `001 -` prefix**. A small `manifest.json` helps future runs.
-- **Parallel downloads (2–4 workers)**  
-  Faster end-to-end with a safe concurrency level.
+  Dedup uses (in order):
+  - **Track URI** (when present),
+  - **title + primary artist**,
+  - then **filename** (ignoring any numeric prefix like `001 -`).  
+    A small `manifest.json` helps future runs.
+- **Parallel downloads (2–8 workers)**  
+  Configurable **Threads** selector; 2–4 is a safe sweet spot.
 - **Great live UI**
   - Global progress bar + **per-track progress bars**
   - **Speed & ETA** per track when available
-  - **Live elapsed time** and **total time** at the end
+  - **Elapsed time** while running and **total time** at the end
+  - **Stop** button to cancel gracefully
 - **Optional file numbering**  
-  Toggle **“Number files (001, 002…)”** if you want a fixed order in filenames.  
+  Toggle **“Number files (001, 002…)”** if you want filenames to reflect order.  
   (M3U is generated and sorted by number when present, otherwise by time.)
 - **Extras**
   - Generate **.m3u** playlist
@@ -43,8 +50,8 @@ Everything is bundled—no Python or external installs required.
 Grab the latest build from the **Releases** page:
 
 - **Windows**: download the ZIP, extract, run `Music2MP3.exe`
-- **macOS**: download the ZIP, unzip, open `Music2MP3.app` - stanbdy
-- **Linux**: download `Music2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run - stanbdy
+- **macOS**: download the ZIP, unzip, open `Music2MP3.app`
+- **Linux**: download `Music2MP3_Linux_x86-64.AppImage`, `chmod +x`, then run
 
 ---
 
@@ -56,20 +63,30 @@ Grab the latest build from the **Releases** page:
    - Spotify → [Exportify](https://exportify.net)
    - Apple/YouTube/others → [TuneMyMusic](https://tunemymusic.com)
 2. Launch the app.
-3. **Drag & drop** the CSV (or click to browse).
+3. **Drag & drop** the CSV (or click to browse).  
+   _(Tip: after loading, click the CSV label to open the file.)_
 4. Choose an **output folder**.
 5. (Optional) Toggle settings (see below).
 6. Click **Convert**.
 
 ### Option B — From a Spotify playlist URL
 
-1. Copy a playlist link from Spotify (e.g., `https://open.spotify.com/playlist/...`).
+1. Copy a playlist link from Spotify (e.g. `https://open.spotify.com/playlist/...`).
 2. Paste it in the app and click **Load from Spotify**.
 3. Your browser opens for **OAuth PKCE** sign-in (no secret; local redirect to `http://127.0.0.1:8765/callback`).
 4. The app builds a temp CSV internally and shows the track count.
 5. Choose an **output folder**, then click **Convert**.
 
-> Tip: Public **and** private/collaborative playlists are supported after sign-in.
+> Supports **public**, **private**, and **collaborative** playlists after sign-in.
+
+### Option C — From a SoundCloud playlist URL (no auth)
+
+1. Copy a SoundCloud **public playlist** URL **or** a **private “secret link”** URL (it contains a token).
+2. Paste it and click **Load from SoundCloud**.
+3. The app parses the playlist and builds a temp CSV (with `Source URL` for each track).
+4. Choose an **output folder**, then click **Convert**.
+
+> Note: If some tracks are region-locked or not streamable, yt-dlp may fail those entries. You can optionally provide a cookies file in `config.json` to improve access when needed.
 
 ---
 
@@ -78,6 +95,8 @@ Grab the latest build from the **Releases** page:
 - **Number files (001, 002…)**  
   Adds a numeric prefix to filenames. Useful to enforce order.  
   If unchecked, files are named without the prefix.
+- **Threads**  
+  Number of parallel downloads (1–8). **2–4** recommended.
 - **Transcode to MP3 (VBR 0)**  
   Re-encode for maximum compatibility. Otherwise M4A remux keeps the source AAC (commonly ~128 kbps).
 - **Generate M3U playlist**  
@@ -86,8 +105,8 @@ Grab the latest build from the **Releases** page:
   Rejects videos with “instrumental” in title.
 - **Deep search**  
   Slower but more accurate search (tries multiple candidates).
-- **Incremental update** _(enabled internally)_  
-  Skips tracks that already exist in the playlist folder using URI/tags/filename matching. Maintains a `manifest.json`.
+- **Incremental update**  
+  Skips tracks that already exist using URI/tags/normalized filename matching. Maintains a `manifest.json`.
 
 ---
 
@@ -96,31 +115,38 @@ Grab the latest build from the **Releases** page:
 - Files are saved under:  
   `/<YourOutputFolder>/<PlaylistName>/`
 - Filenames follow either:
-  - `001 - Track Name.m4a` (if numbering is enabled), or
-  - `Track Name.m4a` (if disabled).
+  - `001 - Track Name - Artist.m4a` (if numbering is enabled), or
+  - `Track Name - Artist.m4a` (if disabled).
 - Basic tags are written (Title, Artist, Album, Track # when numbered).
 - A `.m3u` playlist is generated if enabled.
 
 ---
 
-## 💡 Notes
-
-- This tool **does not rip Spotify audio**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded.
-- **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
-- If a track fails, try toggling **Deep search** or adjusting query variants.
-
----
-
 ## 🔐 Privacy & Auth
 
-- Spotify sign-in uses **OAuth PKCE**: no client secret, no data sent to any server we control.
-- The local redirect runs on `http://127.0.0.1:8765/callback` just for the auth code exchange.
-- Tokens are kept in memory for the current session.
-- When loading from a playlist URL, the generated CSV is **temporary** (used internally by the converter).
+- **Spotify** sign-in uses **OAuth PKCE**: no client secret, no data sent to any server we control.
+  - Local redirect: `http://127.0.0.1:8765/callback`
+  - Tokens are kept in memory for the current session.
+- **SoundCloud** usage requires **no authentication**:
+  - Public playlists work out of the box.
+  - Private playlists shared via **secret links** also work (the token is in the URL).
+- When loading from URLs, the generated CSV is **temporary**, used internally by the converter.
 
 ---
 
-## 🛠️ Build from Source (optional)
+## 💡 Notes
+
+- This tool **does not rip Spotify or SoundCloud directly**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded.
+- **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
+- UI work is done in background threads; the app stays responsive and shows live progress.
+- If a track fails, try:
+  - **Deep search** (more candidates),
+  - checking the URL availability,
+  - or providing a **cookies** file in `config.json` (helps with region locks, age restrictions, etc.).
+
+---
+
+## 🧰 Build from Source (optional)
 
 > You don’t need this to use the app—releases are prebuilt.  
 > For contributors:
@@ -134,22 +160,25 @@ Grab the latest build from the **Releases** page:
 4. Run the platform spec, e.g.:
    - Windows: `pyinstaller Music2MP3-Windows.spec`
    - macOS: `pyinstaller Music2MP3-macOS.spec`
-   - Linux: `pyinstaller Music2MP3-Linux.spec` (AppImage packaging script included in CI)
+   - Linux: `pyinstaller Music2MP3-Linux.spec` (AppImage packaging in CI)
 
-The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the single-folder app in `dist/`.
+The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the app in `dist/`.
 
 ---
 
-## 🧰 Troubleshooting
+## 🧩 Troubleshooting
 
 - **“(Not Responding)” on Windows while downloading**  
-  The UI now runs long tasks in worker threads; per-track progress bars keep updating. If you still see UI freezes, ensure GPU overlays/AV scanners aren’t throttling file writes.
-- **Age-restricted videos on YouTube**  
-  yt-dlp might refuse them without cookies. Add a cookies file to `config.json` if needed.
-- **Too many duplicates**  
-  Make sure you’re running the latest version. The app compares by URI → tags → filename (without numeric prefix) and keeps a `manifest.json`.
-- **ffmpeg/yt-dlp missing (source builds)**  
-  Confirm the platform-specific binaries are in `ffmpeg/` and `yt-dlp/` next to the executable/spec.
+  Long tasks run in worker threads; per-track progress should update. If you still see freezes, check GPU overlays/AV scanners.
+- **Age-restricted / region-locked videos**  
+  yt-dlp may refuse them without cookies. Add a cookies file to `config.json`.
+- **Duplicates still appear**  
+  We compare by URI → tags → normalized filename (ignores leading numbers and normalizes punctuation).  
+  Delete `manifest.json` if you suspect it’s stale and retry.
+- **SoundCloud shows “Unknown – Unknown”**  
+  Usually caused by missing page metadata or blocked access. Ensure the playlist/secret link is valid and reachable in your region; cookies can help.
+- **No console popups**  
+  All subprocesses are spawned hidden on Windows; progress is parsed and shown in the UI.
 
 ---
 

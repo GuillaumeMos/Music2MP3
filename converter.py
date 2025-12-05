@@ -1,362 +1,399 @@
 # converter.py
+from __future__ import annotations
+import csv
 import os
 import re
-import csv
+import shlex
 import sys
-import time
-import json
-import queue
-import platform
+import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import logging
+import subprocess
+from pathlib import Path
+from typing import Callable, Optional, Sequence, List
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 
-from utils import run_quiet, popen_quiet
-from config import resource_path
+log = logging.getLogger(__name__)
 
-
-def _find_binaries():
-    _ = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    if platform.system() == "Windows":
-        ff = os.path.join(resource_path("ffmpeg"), "ffmpeg.exe")
-        yd = os.path.join(resource_path("yt-dlp"), "yt-dlp.exe")
-        ffmpeg_exe = ff if os.path.isfile(ff) else "ffmpeg.exe"
-        ytdlp_exe = yd if os.path.isfile(yd) else "yt-dlp.exe"
-    else:
-        ff = os.path.join(resource_path("ffmpeg"), "ffmpeg")
-        yd = os.path.join(resource_path("yt-dlp"), "yt-dlp")
-        ffmpeg_exe = ff if os.path.isfile(ff) else "ffmpeg"
-        ytdlp_exe = yd if os.path.isfile(yd) else "yt-dlp"
-    return ffmpeg_exe, ytdlp_exe
+StatusCB = Callable[[str], None]
+ProgressCB = Callable[[int, int], None]
+ItemCB = Callable[[str, dict], None]
 
 
-def _norm(s: str) -> str:
-    """
-    Robust normalization so keys match filenames even with punctuation/dashes.
-    - Lowercase, unify en/em dashes to '-'
-    - Remove most punctuation except hyphen (we standardize ' - ' delimiter)
-    - Collapse spaces, normalize ' - ' spacing
-    """
-    s = (s or "").lower()
-    s = s.replace("–", "-").replace("—", "-")  # en/em dash -> hyphen
-    # keep word chars, spaces, and hyphen
-    s = re.sub(r"[^\w\s\-]", "", s, flags=re.U)
-    # normalize hyphen spacing
-    s = re.sub(r"\s*-\s*", " - ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ========================== BINARIES AUTO-DETECT (PyInstaller friendly) ==========================
+
+def _resource_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+def _which(names: Sequence[str]) -> str | None:
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+def _find_yt_dlp() -> list[str]:
+    rd = _resource_dir()
+    candidates = [
+        rd / "yt-dlp" / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+        rd / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+        Path(__file__).resolve().parent / ("yt-dlp.exe" if os.name == "nt" else "yt-dlp"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return [str(c)]
+
+    found = _which(["yt-dlp", "yt-dlp.exe"])
+    if found:
+        return [found]
+
+    return [sys.executable, "-m", "yt_dlp"]
+
+def _find_ffmpeg_dir() -> str | None:
+    rd = _resource_dir()
+    dirs = [
+        rd / "ffmpeg",
+        rd / "ffmpeg" / "bin",
+        Path(__file__).resolve().parent / "ffmpeg",
+        Path(__file__).resolve().parent / "ffmpeg" / "bin",
+    ]
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for d in dirs:
+        exe = d / exe_name
+        if exe.exists():
+            return str(d)
+
+    if shutil.which(exe_name):
+        return None
+    return None
 
 
-def _strip_leading_index(name: str) -> str:
-    base = os.path.splitext(name)[0]
-    # strip leading "001 - ", "01.", "12_ ", etc.
-    base = re.sub(r"^\s*\d+\s*[-_\.]\s*", "", base)
-    return base
-
-
-def _track_key(title: str, artist: str) -> str:
-    a0 = re.split(r'[,/&]| feat\.| ft\.', artist, flags=re.I)[0].strip()
-    return _norm(f"{title}::{a0}")
-
-
-def _existing_keys_in_folder(folder: str) -> set[str]:
-    keys = set()
-    for fn in os.listdir(folder):
-        if not fn.lower().endswith((".mp3", ".m4a")):
-            continue
-        base = _strip_leading_index(fn)
-        # expect "<title> - <artist>"
-        if " - " in base:
-            t, a = base.rsplit(" - ", 1)
-        else:
-            t, a = base, ""
-        keys.add(_track_key(t, a))
-    return keys
-
-
-def _safe_filename(s: str) -> str:
-    s = re.sub(r"[^\w\s\-\.\(\)\[\]&']", "", s, flags=re.U)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _choose_best_youtube(ytdlp_exe: str, query: str, duration_ms: int | None, artist_primary: str | None, cookies_path: str | None):
-    cmd = [ytdlp_exe, "--flat-playlist", "--dump-single-json", "--no-warnings", "-q", f"ytsearch3:{query}"]
-    if cookies_path:
-        cmd += ["--cookies", cookies_path]
-    proc = run_quiet(cmd, text=True, capture_output=True)
-    try:
-        data = json.loads(proc.stdout or "{}")
-    except Exception:
-        data = {}
-    entries = data.get("entries") or []
-    if not entries:
-        return f"ytsearch1:{query}"
-
-    def score(entry: dict) -> float:
-        dur = entry.get("duration") or 0
-        s = 0.0
-        if duration_ms:
-            s -= abs(dur - int(duration_ms / 1000))
-        title = (entry.get("title") or "").lower()
-        if artist_primary and artist_primary.lower() in title:
-            s += 10
-        return s
-
-    best = max(entries, key=score)
-    return best.get("url") or f"ytsearch1:{query}"
-
+# ========================================= CONVERTER ============================================
 
 class Converter:
-    """
-    Heavy worker with cooperative cancel support.
-
-    Callbacks:
-      - status_cb(str)
-      - progress_cb(cur, max)
-      - item_cb(event, data)
-        * 'conv_init' {'total': N, 'new': M, 'existing': N-M}
-        * 'init' {'idx': i, 'title': '…'}
-        * 'progress' {'idx': i, 'percent': 0..100, 'speed': '…', 'eta': '…'}
-        * 'done' {'idx': i}
-        * 'error' {'idx': i, 'message': '…'}
-        * 'cancel_all' {}
-    """
-
-    def __init__(self, config: dict, status_cb=None, progress_cb=None, item_cb=None, cancel_event: threading.Event | None = None):
-        self.cfg = config or {}
+    def __init__(
+        self,
+        config: dict,
+        status_cb: Optional[StatusCB] = None,
+        progress_cb: Optional[ProgressCB] = None,
+        item_cb: Optional[ItemCB] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ):
+        self.config = config or {}
         self.status_cb = status_cb or (lambda s: None)
-        self.progress_cb = progress_cb or (lambda a, b: None)
+        self.progress_cb = progress_cb or (lambda c, m: None)
         self.item_cb = item_cb or (lambda k, d: None)
-        self.cancel = cancel_event or threading.Event()
-        self.ffmpeg_exe, self.ytdlp_exe = _find_binaries()
+        self.cancel_event = cancel_event or threading.Event()
 
-    # --------------------------- Public API ---------------------------
+        # options
+        self.prefix_numbers: bool = bool(self.config.get("prefix_numbers", False))
+        self.deep_search: bool = bool(self.config.get("deep_search", True))
+        self.transcode_mp3: bool = bool(self.config.get("transcode_mp3", False))
+        self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
+        self.exclude_instr: bool = bool(self.config.get("exclude_instrumentals", False))
+        self.incremental: bool = bool(self.config.get("incremental_update", True))
+        self.concurrency: int = max(1, min(8, int(self.config.get("concurrency", 3))))  # pistes en parallèle
+        self._segments: int = max(1, min(8, self.concurrency))  # parallélisme segments yt-dlp
 
-    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: str | None = None) -> str:
-        rows = list(self._read_csv(csv_path))
-        if not rows:
-            raise RuntimeError("CSV is empty or malformed.")
+        # pour la M3U
+        self._made_files_lock = threading.Lock()
+        self._made_files: List[str] = []
 
-        # Playlist name / output path (avoid double-nesting)
-        playlist_name = playlist_hint or os.path.splitext(os.path.basename(csv_path))[0]
-        out_dir = output_folder
-        if os.path.basename(os.path.normpath(output_folder)).lower() != playlist_name.lower():
-            out_dir = os.path.join(output_folder, playlist_name)
-        os.makedirs(out_dir, exist_ok=True)
+    # ------------------------------ public API ------------------------------
 
-        # incremental snapshot
-        existing_keys = _existing_keys_in_folder(out_dir) if self.cfg.get("incremental_update", True) else set()
+    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: Optional[str] = None) -> str:
+        """
+        Lit un CSV (colonnes: Track Name, Artist Name(s), Album Name, Duration (ms), [Source URL], [Track URI])
+        et télécharge les pistes via yt-dlp, en parallèle jusqu’à self.concurrency.
+        Retourne le dossier de sortie.
+        """
+        out_base = Path(output_folder)
+        out_dir = out_base
+        if playlist_hint:
+            safe = _sanitize_filename(playlist_hint, for_dir=True)
+            if safe:
+                out_dir = out_base / safe
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        todo = []
-        for idx, r in enumerate(rows, start=1):
-            title = r.get("Track Name") or r.get("Track name") or "Unknown"
-            artist = r.get("Artist Name(s)") or r.get("Artist name") or ""
-            k = _track_key(title, artist)
-            if k in existing_keys:
-                continue
-            todo.append((idx, r))
+        rows = _read_csv(csv_path)
+        tracks = self._rows_to_jobs(rows)
 
-        self.item_cb('conv_init', {
-            'total': len(rows),
-            'new': len(todo),
-            'existing': len(rows) - len(todo),
-        })
+        if self.exclude_instr:
+            tracks = [t for t in tracks if not _looks_instrumental(t["title"])]
 
-        if self.cancel.is_set():
-            self.status_cb("Cancelled.")
-            self.item_cb('cancel_all', {})
-            return out_dir
+        total = len(tracks)
+        self.item_cb("conv_init", {"new": total})
+        self.status_cb(f"Preparing {total} tracks…")
+        log.info("CONV: total tracks to process: %s (out_dir=%s, workers=%s)", total, out_dir, self.concurrency)
 
-        if not todo:
-            self.status_cb("Everything already up to date.")
-            if self.cfg.get("generate_m3u", True):
-                self._write_m3u(out_dir, playlist_name)
-            return out_dir
-
-        self.status_cb(f"Starting downloads: {len(todo)} tracks…")
-
-        workers = max(1, min(8, int(self.cfg.get("concurrency", 3))))
-        cookies_path = self.cfg.get("cookies_path")
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = []
-            for idx, row in todo:
-                if self.cancel.is_set():
+        # Lancement parallèle : un worker par piste
+        futures: list[Future] = []
+        with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="dl") as pool:
+            for idx, t in enumerate(tracks, start=1):
+                if self.cancel_event.is_set():
                     break
-                futures.append(ex.submit(self._download_one, idx, row, out_dir, playlist_name, cookies_path, len(rows)))
-            for f in as_completed(futures):
-                _ = f.exception()
-                if self.cancel.is_set():
-                    break
+                # calcule le nom final (pour incrémental)
+                pretty_title = self._pretty_title(t)
+                ext = "mp3" if self.transcode_mp3 else "m4a"
+                base_name = _sanitize_filename(pretty_title)
+                if self.prefix_numbers:
+                    base_name = f"{idx:03d} - {base_name}"
+                dest = out_dir / f"{base_name}.{ext}"
 
-        if self.cancel.is_set():
-            self.status_cb("Cancelled.")
-            self.item_cb('cancel_all', {})
-            return out_dir
+                futures.append(
+                    pool.submit(self._process_one, idx, t, str(dest))
+                )
 
-        if self.cfg.get("generate_m3u", True):
-            self._write_m3u(out_dir, playlist_name)
+            # on attend la fin (les callbacks UI/progression sont envoyés depuis chaque worker)
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception:
+                    # déjà loggé dans le worker → on continue
+                    pass
 
-        self.status_cb("All done.")
-        return out_dir
+        # M3U
+        if self.generate_m3u and self._made_files:
+            m3u = out_dir / "playlist.m3u8"
+            try:
+                # garder l'ordre par index (les noms sont déjà préfixés si demandé)
+                with m3u.open("w", encoding="utf-8", newline="\n") as f:
+                    for name in self._made_files:
+                        f.write(name + "\n")
+                log.info("CONV: M3U generated: %s", m3u)
+            except Exception:
+                log.exception("CONV: failed generating M3U")
 
-    # --------------------------- Internals ---------------------------
+        return str(out_dir)
 
-    def _read_csv(self, path: str):
-        with open(path, newline='', encoding='utf-8') as f:
-            rdr = csv.DictReader(f)
-            for row in rdr:
-                yield row
+    # ------------------------------ per-track worker ------------------------------
 
-    def _make_base_name(self, seq_index: int, total_tracks: int, row: dict) -> str:
-        title = row.get("Track Name") or row.get("Track name") or "Unknown"
-        artist_raw = row.get("Artist Name(s)") or row.get("Artist name") or ""
-        artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
-        base_title = _safe_filename(title)
-        base_artist = _safe_filename(artist_primary)
-        name = f"{base_title} - {base_artist}"
-        if self.cfg.get("prefix_numbers", False):
-            width = len(str(max(1, total_tracks)))
-            name = f"{seq_index:0{width}d} - {name}"
-        return name
-
-    def _download_one(self, idx: int, row: dict, out_dir: str, playlist_name: str, cookies_path: str | None, total_tracks: int):
-        if self.cancel.is_set():
-            self.item_cb('error', {'idx': idx, 'message': 'Cancelled'})
+    def _process_one(self, idx: int, t: dict, dest_path: str):
+        """Télécharge/convertit une piste (thread worker)."""
+        if self.cancel_event.is_set():
             return
 
-        title = row.get("Track Name") or "Track"
-        artist = row.get("Artist Name(s)") or ""
-        nice_title = f"{title} - {artist}" if artist else title
-        self.item_cb('init', {'idx': idx, 'title': nice_title})
+        pretty_title = self._pretty_title(t)
+        dest = Path(dest_path)
 
-        src_url = (row.get("Source URL") or "").strip()
-        dur_ms = None
-        try:
-            d = row.get("Duration (ms)")
-            if d:
-                dur_ms = int(float(d))
-        except Exception:
-            dur_ms = None
+        # UI row init
+        self.item_cb("init", {"idx": idx, "title": pretty_title})
 
-        base = self._make_base_name(seq_index=idx, total_tracks=total_tracks, row=row)
-        out_tmpl = os.path.join(out_dir, base + ".%(ext)s")
+        # incrémental
+        if self.incremental and dest.exists() and dest.stat().st_size > 0:
+            log.info("CONV: skip existing (%s)", dest.name)
+            self.item_cb("done", {"idx": idx})
+            with self._made_files_lock:
+                self._made_files.append(dest.name)
+            return
 
-        ffmpeg_exe, ytdlp_exe = self.ffmpeg_exe, self.ytdlp_exe
-        cmd = [
-            ytdlp_exe,
-            f"--ffmpeg-location={os.path.dirname(ffmpeg_exe)}",
-            "--no-config",
+        # Construire l’URL et la commande
+        url = t.get("source_url") or t.get("track_uri")
+        if not url:
+            url = self._build_search_query(t)
+        cmd = self._build_ytdlp_cmd(url=url, out_path=str(dest), want_mp3=self.transcode_mp3)
+
+        # Statut
+        self.status_cb(f"Downloading {pretty_title}…")
+
+        code = self._run_ytdlp_stream(
+            cmd,
+            idx=idx,
+            on_progress=self._on_progress_line,
+            cancel_event=self.cancel_event,
+        )
+
+        if self.cancel_event.is_set():
+            log.warning("CONV: cancelled during download (idx=%s)", idx)
+            self.item_cb("cancel_all", {})
+            return
+
+        if code == 127:
+            msg = (
+                "yt-dlp n'est pas disponible. Installe-le (pip install yt-dlp) "
+                "ou place 'yt-dlp(.exe)' et 'ffmpeg' avec l'application."
+            )
+            log.error("CONV: %s", msg)
+            self.item_cb("error", {"idx": idx, "message": msg})
+            return
+
+        if code != 0:
+            msg = f"yt-dlp failed with code {code} for: {pretty_title}"
+            log.error("CONV: %s", msg)
+            self.item_cb("error", {"idx": idx, "message": msg})
+            return
+
+        self.item_cb("done", {"idx": idx})
+        with self._made_files_lock:
+            self._made_files.append(dest.name)
+
+    # ------------------------------ internals ------------------------------
+
+    def _rows_to_jobs(self, rows: list[dict]) -> list[dict]:
+        jobs = []
+        for r in rows:
+            title = (r.get("Track Name") or "").strip()
+            artists = (r.get("Artist Name(s)") or "").strip()
+            album = (r.get("Album Name") or "").strip()
+            url = (r.get("Source URL") or "").strip()
+            uri = (r.get("Track URI") or "").strip()
+            if not title and not artists and not url and not uri:
+                continue
+            jobs.append({
+                "title": title,
+                "artists": artists,
+                "album": album,
+                "source_url": url if url else None,
+                "track_uri": uri if uri else None,
+            })
+        return jobs
+
+    def _pretty_title(self, t: dict) -> str:
+        a = t.get("artists") or ""
+        nm = t.get("title") or ""
+        if a and nm:
+            return f"{a} - {nm}"
+        return nm or a or "Unknown"
+
+    def _build_search_query(self, t: dict) -> str:
+        artist = (t.get("artists") or "").split(",")[0].strip()
+        title = t.get("title") or ""
+        query = f"{artist} {title}".strip()
+        if self.deep_search:
+            query += " audio"
+        yts = f"ytsearch1:{query}"
+        log.debug("CONV: search query -> %s", yts)
+        return yts
+
+    def _build_ytdlp_cmd(self, url: str, out_path: str, want_mp3: bool) -> list[str]:
+        cmd = _find_yt_dlp()
+        cmd += [
             "--newline",
+            "--no-playlist",
+            "--ignore-errors",
+            "--no-overwrites",
+            "-o", out_path,
+            "-N", str(self._segments),              # parallélisme segments côté yt-dlp
+            "-f", "bestaudio/best",
+            "-x",
+            "--audio-format", "mp3" if want_mp3 else "m4a",
+            "--audio-quality", "0" if want_mp3 else "0",
+            "--add-metadata",
+            "--embed-thumbnail",
         ]
-        if cookies_path:
-            cmd += ["--cookies", cookies_path]
+        ffdir = _find_ffmpeg_dir()
+        if ffdir:
+            cmd += ["--ffmpeg-location", ffdir]
+        cmd.append(url)
+        log.debug("CONV: yt-dlp cmd: %s", " ".join(shlex.quote(c) for c in cmd))
+        return cmd
 
-        if self.cfg.get("transcode_mp3", False):
-            cmd += ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
-        else:
-            cmd += ["-f", "bestaudio[ext=m4a]/bestaudio", "--remux-video", "m4a"]
+    # ---- streaming / parsing de la progression yt-dlp ----
 
-        if self.cfg.get("exclude_instrumentals", False):
-            cmd += ["--reject-title", "instrumental"]
+    _RGX_PROGRESS = re.compile(
+        r"^\[download\]\s+(?P<pct>\d{1,3}(?:\.\d)?)%\s+of.*?(?:at\s+(?P<speed>[0-9\.]+[KMG]?i?B/s))?(?:\s+ETA\s+(?P<eta>\d{2}:\d{2}))?",
+        re.IGNORECASE
+    )
 
-        cmd += ["-o", out_tmpl, "--no-playlist"]
+    def _on_progress_line(self, idx: int, line: str):
+        m = self._RGX_PROGRESS.search(line)
+        if m:
+            pct = float(m.group("pct"))
+            speed = m.group("speed")
+            eta = m.group("eta")
+            self.item_cb("progress", {"idx": idx, "percent": pct, "speed": speed, "eta": eta})
 
-        if src_url:
-            spec = src_url
-        else:
-            title = row.get("Track Name") or row.get("Track name") or ""
-            artist_raw = row.get("Artist Name(s)") or row.get("Artist name") or ""
-            artist_primary = re.split(r'[,/&]| feat\.| ft\.', artist_raw, flags=re.I)[0].strip()
-            q = " ".join([title, artist_primary]).strip() or title or artist_primary
-            if self.cfg.get("deep_search", True):
-                spec = _choose_best_youtube(self.ytdlp_exe, q, dur_ms, artist_primary, cookies_path)
-            else:
-                spec = f"ytsearch1:{q}"
-        cmd += [spec]
+    def _run_ytdlp_stream(
+        self,
+        cmd: list[str],
+        idx: int,
+        on_progress: Callable[[int, str], None],
+        cancel_event: threading.Event,
+    ) -> int:
+        """
+        Lance yt-dlp et stream stdout ligne par ligne.
+        - Pas de fenêtre console (Windows)
+        - Log INFO chaque ligne
+        - Parse progression et pousse à l'UI
+        - Arrêt propre si cancel_event
+        """
+        # --- empêcher l'ouverture d'une console sur Windows ---
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-        p = popen_quiet(cmd, text=True)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                universal_newlines=True,
+                bufsize=1,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        except FileNotFoundError:
+            log.error("yt-dlp introuvable (ni binaire embarqué, ni PATH, ni module).")
+            return 127
 
-        stderr_q = queue.Queue()
-        stdout_q = queue.Queue()
-
-        def _pump(stream, qout):
-            for line in iter(stream.readline, ""):
-                qout.put(line)
-            stream.close()
-
-        t1 = threading.Thread(target=_pump, args=(p.stderr, stderr_q), daemon=True)
-        t2 = threading.Thread(target=_pump, args=(p.stdout, stdout_q), daemon=True)
-        t1.start(); t2.start()
-
-        prog_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:at\s+([^\s]+/s))?.*?(?:ETA\s+([\d:\.]+))?", re.I)
-
-        while True:
-            if self.cancel.is_set():
-                try: p.terminate()
-                except Exception: pass
-                try:
-                    for _ in range(20):
-                        if p.poll() is not None: break
-                        time.sleep(0.05)
-                    if p.poll() is None:
-                        p.kill()
-                except Exception:
-                    pass
-                self.item_cb('error', {'idx': idx, 'message': 'Cancelled'})
-                return
-
+        assert proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                log.info("yt-dlp[%03d]: %s", idx, line)
+                on_progress(idx, line)
+                if cancel_event.is_set():
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+        finally:
             try:
-                while True:
-                    line = stderr_q.get_nowait()
-                    m = prog_re.search(line)
-                    if m:
-                        pct = float(m.group(1))
-                        spd = m.group(2) or None
-                        eta = m.group(3) or None
-                        self.item_cb('progress', {'idx': idx, 'percent': pct, 'speed': spd, 'eta': eta})
-            except queue.Empty:
+                proc.stdout.close()
+            except Exception:
                 pass
 
-            try:
-                while True:
-                    _ = stdout_q.get_nowait()
-            except queue.Empty:
-                pass
+        try:
+            return proc.wait(timeout=20)
+        except Exception:
+            return 1
 
-            if p.poll() is not None:
-                break
-            time.sleep(0.05)
 
-        rc = p.returncode
-        if rc == 0:
-            self.item_cb('done', {'idx': idx})
-        else:
-            # Collect last stderr lines for a meaningful error
-            err_lines = []
-            try:
-                while True:
-                    err_lines.append(stderr_q.get_nowait().strip())
-            except queue.Empty:
-                pass
-            tail = [ln for ln in err_lines[-20:] if ln]
-            concise = next((ln for ln in reversed(tail)
-                            if "ERROR" in ln or "HTTP" in ln or "403" in ln or "404" in ln or "SSL" in ln), None)
-            msg = concise or ("\n".join(tail) if tail else "Unknown download error")
-            self.item_cb('error', {'idx': idx, 'message': msg})
+# ========================================= HELPERS ==============================================
 
-    def _write_m3u(self, out_dir: str, playlist_name: str):
-        files = [f for f in os.listdir(out_dir) if f.lower().endswith((".mp3", ".m4a"))]
-        def sort_key(fn):
-            m = re.match(r"^\s*(\d+)\s*[-_\.]\s*", fn)
-            if m:
-                return (0, int(m.group(1)))
-            return (1, os.path.getctime(os.path.join(out_dir, fn)))
-        files.sort(key=sort_key)
+def _read_csv(path: str) -> list[dict]:
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            rows.append(r)
+    log.info("CONV: CSV loaded (%s rows) from %s", len(rows), path)
+    return rows
 
-        m3u_path = os.path.join(out_dir, f"{playlist_name}.m3u")
-        with open(m3u_path, "w", encoding="utf-8") as m3u:
-            m3u.write("#EXTM3U\n")
-            for fn in files:
-                title = os.path.splitext(fn)[0]
-                m3u.write(f"#EXTINF:-1,{title}\n")
-                m3u.write(f"{fn}\n")
+
+def _sanitize_filename(name: str, for_dir: bool = False) -> str:
+    name = name.strip().replace("\n", " ")
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > 150:
+        name = name[:150].rstrip()
+    if not name:
+        name = "untitled"
+    if for_dir:
+        name = name.rstrip(". ")
+    return name
+
+
+def _looks_instrumental(title: str) -> bool:
+    t = (title or "").lower()
+    return "instrumental" in t or "karaoke" in t or "8d audio" in t

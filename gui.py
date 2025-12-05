@@ -3,6 +3,9 @@ import os, csv, platform, tempfile, threading, queue, time, tkinter as tk, json
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
+import logging
+log = logging.getLogger(__name__)
+
 from config import load_config, resource_path
 from utils import Tooltip, open_folder, open_path
 from converter import Converter
@@ -23,6 +26,7 @@ class Music2MP3GUI:
         self.root.title('Music2MP3')
         self.root.geometry('980x880')
         self.root.minsize(880, 740)
+        log.info("GUI: Music2MP3 window created")
 
         # state
         self.csv_path = None
@@ -30,6 +34,7 @@ class Music2MP3GUI:
         self.last_output_dir = None
         self._loaded_playlist_name_from_spotify = None
         self.config = load_config()
+        log.debug("GUI: Config loaded: %s", self.config)
 
         # background threads/queues
         self._conv_thread = None
@@ -84,13 +89,15 @@ class Music2MP3GUI:
         default_dir = self.config.get("default_output_dir")
         if default_dir and os.path.isdir(default_dir):
             self.output_folder = default_dir
+            log.info("GUI: default output dir restored: %s", self.output_folder)
 
     def _save_config(self):
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
+            log.debug("GUI: config saved -> %s", CONFIG_FILE)
         except Exception:
-            pass
+            log.exception("GUI: failed to save config")
 
     # ---------- styles ----------
     def _init_styles(self):
@@ -298,20 +305,26 @@ class Music2MP3GUI:
 
     # ---------- Spotify loader ----------
     def load_from_spotify_link_wrapper(self):
+        log.info("UI: Spotify load button clicked")
         try:
             from spotify_auth import PKCEAuth
         except Exception as e:
+            log.exception("UI: PKCEAuth import failed")
             messagebox.showerror('Missing dependency', f'spotify_auth.PKCEAuth not available:\n{e}')
             return
 
         url = self.spotify_entry.get().strip()
+        log.debug("UI: Spotify URL entered = %s", url)
         pid = SpotifyClient.extract_playlist_id(url)
         if not pid:
+            log.warning("UI: Invalid Spotify playlist link")
             messagebox.showerror('Error', 'Invalid Spotify playlist link.')
             return
+        log.info("UI: Detected Spotify playlist id=%s", pid)
 
         client_id = self.config.get('spotify_client_id')
         if not client_id:
+            log.warning('UI: Missing spotify_client_id in config.json')
             messagebox.showerror('Missing Client ID', 'Add "spotify_client_id" in config.json (PKCE).')
             return
 
@@ -320,20 +333,21 @@ class Music2MP3GUI:
         self._start_indeterminate("Opening browser for Spotify authorization…")
 
         def _spotify_worker():
+            log.info("BG: Spotify worker started for playlist %s", pid)
             try:
                 auth = PKCEAuth(client_id=client_id, redirect_uri="http://127.0.0.1:8765/callback",
                                 scopes=["playlist-read-private", "playlist-read-collaborative"])
                 sp = SpotifyClient(token_supplier=auth.get_token)
                 self._sp_q.put(('status', 'Fetching playlist from Spotify…'))
                 rows, name = sp.fetch_playlist(pid)
-                if not rows:
-                    self._sp_q.put(('error', 'No tracks found.')); return
+                log.info("BG: Spotify fetched %s items for '%s'", len(rows), name)
                 fd, tmp = tempfile.mkstemp(prefix='spotify_playlist_', suffix='.csv'); os.close(fd)
                 with open(tmp, 'w', newline='', encoding='utf-8') as f:
                     w = csv.DictWriter(f, fieldnames=["Track Name","Artist Name(s)","Album Name","Duration (ms)"])
                     w.writeheader(); w.writerows(rows)
                 self._sp_q.put(('done', (tmp, name, len(rows))))
             except Exception as e:
+                log.exception("BG: Spotify worker failed")
                 self._sp_q.put(('error', str(e)))
 
         self._sp_thread = threading.Thread(target=_spotify_worker, daemon=True)
@@ -345,6 +359,7 @@ class Music2MP3GUI:
         try:
             while True:
                 kind, payload = self._sp_q.get_nowait()
+                log.debug("UI: _poll_spotify_queue got %s", kind)
                 if kind == 'status':
                     self.status_label.config(text=payload)
                 elif kind == 'done':
@@ -366,6 +381,7 @@ class Music2MP3GUI:
     # ---------- SoundCloud loader (NO auth) ----------
     def load_from_soundcloud_link(self):
         url = self.sc_entry.get().strip()
+        log.info("UI: SoundCloud load button clicked (url=%s)", url)
         if not url or "soundcloud.com" not in url:
             messagebox.showerror('Error', 'Please paste a valid SoundCloud playlist/track URL.')
             return
@@ -377,11 +393,11 @@ class Music2MP3GUI:
         cookies_path = self.config.get("cookies_path")  # optional
 
         def _sc_worker():
+            log.info("BG: SoundCloud worker started")
             try:
                 sc = SoundCloudClient()
                 rows, name = sc.fetch_playlist(url, cookies_path=cookies_path)
-                if not rows:
-                    self._sc_q.put(('error', 'No tracks found.')); return
+                log.info("BG: SoundCloud fetched %s items for '%s'", len(rows), name)
                 fd, tmp = tempfile.mkstemp(prefix='soundcloud_playlist_', suffix='.csv'); os.close(fd)
                 with open(tmp, 'w', newline='', encoding='utf-8') as f:
                     w = csv.DictWriter(f, fieldnames=[
@@ -390,6 +406,7 @@ class Music2MP3GUI:
                     w.writeheader(); w.writerows(rows)
                 self._sc_q.put(('done', (tmp, name, len(rows))))
             except Exception as e:
+                log.exception("BG: SoundCloud worker failed")
                 self._sc_q.put(('error', str(e)))
 
         self._sc_thread = threading.Thread(target=_sc_worker, daemon=True)
@@ -401,6 +418,7 @@ class Music2MP3GUI:
         try:
             while True:
                 kind, payload = self._sc_q.get_nowait()
+                log.debug("UI: _poll_sc_queue got %s", kind)
                 if kind == 'done':
                     tmp, name, n = payload
                     self.csv_path = tmp
@@ -469,6 +487,7 @@ class Music2MP3GUI:
 
     # ---------- Conversion ----------
     def start_conversion(self):
+        log.info("UI: Start conversion (csv=%s, out=%s)", self.csv_path, self.output_folder)
         if not (self.csv_path and self.output_folder):
             messagebox.showerror('Error', 'Select a CSV and an output folder.'); return
 
@@ -504,6 +523,7 @@ class Music2MP3GUI:
 
         self._conv_q = queue.Queue(); self._conv_done = False
         def _worker():
+            log.info("BG: Converter worker started")
             try:
                 conv = Converter(
                     config=self.config,
@@ -515,8 +535,10 @@ class Music2MP3GUI:
                 self._conv_obj = conv
                 playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
                 out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
+                log.info("BG: Converter finished -> out_dir=%s", out_dir)
                 self._conv_q.put(('done', out_dir))
             except Exception as e:
+                log.exception("BG: Converter crashed")
                 self._conv_q.put(('error', str(e)))
             finally:
                 self._conv_obj = None
@@ -587,6 +609,7 @@ class Music2MP3GUI:
 
     # ---------- per-item UI ----------
     def _handle_item_event(self, ev: str, d: dict):
+        log.debug("UI: item_event %s %s", ev, {k: d.get(k) for k in ("idx","percent","message","title") if k in d})
         if ev == 'conv_init':
             total = int(d.get('new', d.get('total', 0)))
             self._total_tracks = total
