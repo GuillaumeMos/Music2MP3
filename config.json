@@ -6,7 +6,7 @@
   "transcode_mp3": false,
   "generate_m3u": true,
   "exclude_instrumentals": false,
-  "concurrency": 3,
+  "concurrency": 6,
   "deep_search": true,
   "incremental_update": true,
   "prefix_numbers": false

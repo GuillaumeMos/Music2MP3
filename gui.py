@@ -160,6 +160,7 @@ class Music2MP3GUI:
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
         ttk.Label(header, text="Music2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
         ttk.Label(header, text="Convert playlists to local audio (M4A/MP3)", style='Sub.TLabel').pack(side='left', padx=(12, 0))
+        ttk.Button(header, text="Logs (F12)", command=self.show_logs).pack(side='right')
 
         cols = ttk.Frame(self.root)
         cols.grid(row=1, column=0, sticky='nsew', padx=24)
@@ -191,9 +192,29 @@ class Music2MP3GUI:
         ttk.Label(body_sc, text="Works with public playlists or private links (secret token). No login required.",
                   style='Muted.TLabel').pack(anchor='w', pady=(6, 0))
 
+        # Left column: Manual text list
+        lf_txt = ttk.Labelframe(cols, text="From text list", style='Card.TLabelframe')
+        lf_txt.grid(row=2, column=0, sticky='nsew', padx=(0, 12), pady=(6, 6))
+        body_txt = ttk.Frame(lf_txt, style='CardBody.TFrame'); body_txt.pack(fill='both', expand=True, padx=12, pady=10)
+        ttk.Label(body_txt, text="One track per line. Format: Artist - Title or just Title.", style='Muted.TLabel').pack(anchor='w')
+
+        txt_wrap = ttk.Frame(body_txt, style='CardBody.TFrame')
+        txt_wrap.pack(fill='both', expand=True, pady=(6, 6))
+        txt_wrap.grid_columnconfigure(0, weight=1)
+        self.manual_text = tk.Text(txt_wrap, height=5, wrap='word', bg='#f9fafb', relief='flat',
+                                   highlightthickness=1, highlightbackground='#e5e7eb')
+        self.manual_text.grid(row=0, column=0, sticky='nsew')
+        txt_scroll = ttk.Scrollbar(txt_wrap, orient='vertical', command=self.manual_text.yview)
+        txt_scroll.grid(row=0, column=1, sticky='ns')
+        self.manual_text.configure(yscrollcommand=txt_scroll.set)
+
+        btn_txt = ttk.Frame(body_txt, style='CardBody.TFrame'); btn_txt.pack(fill='x')
+        self.manual_load_btn = ttk.Button(btn_txt, text='Load from text', command=self.load_from_manual_list)
+        self.manual_load_btn.pack(side='right')
+
         # Right column: CSV
         lf_csv = ttk.Labelframe(cols, text="From CSV file", style='Card.TLabelframe')
-        lf_csv.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(12, 0), pady=(6, 6))
+        lf_csv.grid(row=0, column=1, rowspan=3, sticky='nsew', padx=(12, 0), pady=(6, 6))
         body_csv = ttk.Frame(lf_csv, style='CardBody.TFrame'); body_csv.pack(fill='both', expand=True, padx=12, pady=10)
 
         self.drop_frame = tk.Frame(body_csv, bg='#eef2ff', height=70, cursor='hand2', highlightthickness=0)
@@ -435,6 +456,44 @@ class Music2MP3GUI:
         if self._sc_thread and self._sc_thread.is_alive() and not self._sc_done:
             self.root.after(100, self._poll_sc_queue)
 
+    # ---------- Manual text list ----------
+    def load_from_manual_list(self):
+        raw = self.manual_text.get("1.0", "end")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            messagebox.showerror('Error', 'Paste at least one line (Artist - Title or Title).')
+            return
+
+        rows = []
+        for ln in lines:
+            if " - " in ln:
+                artist, title = ln.split(" - ", 1)
+                artist = artist.strip()
+                title = title.strip()
+            else:
+                artist, title = "", ln
+            rows.append({
+                "Track Name": title or "Unknown",
+                "Artist Name(s)": artist,
+                "Album Name": "",
+                "Duration (ms)": "",
+                "Source URL": "",
+                "Track URI": "",
+            })
+
+        fd, tmp = tempfile.mkstemp(prefix='manual_tracks_', suffix='.csv'); os.close(fd)
+        with open(tmp, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "Track Name","Artist Name(s)","Album Name","Duration (ms)","Source URL","Track URI"
+            ])
+            w.writeheader(); w.writerows(rows)
+
+        self.csv_path = tmp
+        self._loaded_playlist_name_from_spotify = "ManualList"
+        self._style_drop_loaded(os.path.basename(tmp))
+        self.status_label.config(text=f'Loaded text list ({len(rows)} tracks)')
+        self.update_convert_button_state()
+
     # ---------- File handlers ----------
     def _style_drop_loaded(self, name: str):
         self.drop_label.config(text=f'CSV: {name}  (click to open)', bg='#dcfce7', fg='#065f46')
@@ -589,8 +648,9 @@ class Music2MP3GUI:
                         except Exception: pass
                         if self._errors:
                             n = len(self._errors)
+                            self._write_error_report(payload)
                             messagebox.showwarning("Completed with errors",
-                                f"Finished with {n} failed track(s). Click 'View error' next to the red items for details.")
+                                f"Finished with {n} failed track(s). See errors.txt in the output folder or click 'View error' next to the red items.")
                     self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
                     self._conv_done = True; self.root.bell()
                     self._cancel_event = None
@@ -653,7 +713,8 @@ class Music2MP3GUI:
         if ev == 'error':
             idx = int(d['idx'])
             msg = d.get('message') or 'Unknown error'
-            self._errors[idx] = msg
+            title = self._rows.get(idx, {}).get('title', f"Track {idx}")
+            self._errors[idx] = (title, msg)
 
             row = self._rows.get(idx)
             if row:
@@ -692,9 +753,13 @@ class Music2MP3GUI:
         self._rows[idx] = {'frame': frame, 'label': lbl, 'bar': bar, 'btn': btn, 'title': title}
 
     def _show_error(self, idx: int):
-        msg = self._errors.get(idx, "No details")
+        err = self._errors.get(idx, ("Track", "No details"))
+        if isinstance(err, tuple):
+            title, msg = err
+        else:
+            title, msg = f"Track {idx}", str(err)
         win = tk.Toplevel(self.root)
-        win.title(f"Error details — Track {idx:03d}")
+        win.title(f"Error details - Track {idx:03d}")
         win.geometry("720x420")
         win.transient(self.root)
         win.grab_set()
@@ -702,13 +767,13 @@ class Music2MP3GUI:
         frm = ttk.Frame(win); frm.pack(fill='both', expand=True, padx=10, pady=10)
         txt = tk.Text(frm, wrap='word')
         txt.pack(fill='both', expand=True)
-        txt.insert('1.0', msg)
+        txt.insert('1.0', f"{title}\n\n{msg}")
         txt.configure(state='disabled')
 
         btns = ttk.Frame(frm); btns.pack(fill='x', pady=(8,0))
         def _copy():
             self.root.clipboard_clear()
-            self.root.clipboard_append(msg)
+            self.root.clipboard_append(f"{title}\n{msg}")
         ttk.Button(btns, text="Copy to clipboard", command=_copy).pack(side='left')
         ttk.Button(btns, text="Close", command=win.destroy).pack(side='right')
 
@@ -728,6 +793,24 @@ class Music2MP3GUI:
         self._perc.clear()
         self._errors.clear()
         self._total_tracks = 0
+
+    def _write_error_report(self, out_dir: str):
+        if not (out_dir and os.path.isdir(out_dir) and self._errors):
+            return
+        path = os.path.join(out_dir, "errors.txt")
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Failed tracks\n")
+                for idx in sorted(self._errors):
+                    err = self._errors[idx]
+                    if isinstance(err, tuple):
+                        title, msg = err
+                    else:
+                        title, msg = f"Track {idx}", str(err)
+                    f.write(f"{idx:03d} | {title} | {msg}\n")
+            log.info("GUI: error report written -> %s", path)
+        except Exception:
+            log.exception("GUI: failed to write errors.txt")
 
     # ---------- chrono ----------
     def _start_timer(self):
@@ -752,7 +835,8 @@ class Music2MP3GUI:
         for w in (self.convert_button, self.clear_button, self.folder_button,
                   self.spotify_load_btn, self.drop_label, self.spotify_entry,
                   self.open_folder_btn, self.sc_load_btn, self.sc_entry,
-                  self.thread_spin):
+                  self.thread_spin, getattr(self, "manual_load_btn", None),
+                  getattr(self, "manual_text", None)):
             try: w.config(state=state)
             except Exception: pass
         if enabled:
@@ -776,6 +860,15 @@ class Music2MP3GUI:
         h, rem = divmod(int(sec), 3600)
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def show_logs(self, event=None):
+        try:
+            lw = getattr(self.root, "_log_window", None)
+            if lw:
+                lw.deiconify(); lw.lift()
+        except Exception:
+            pass
+        return "break"
 
 
 if __name__ == '__main__':
