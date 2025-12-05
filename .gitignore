@@ -6,3 +6,6 @@ yt-dlp.exe
 yt-dlp/yt-dlp
 ffmpeg/ffmpeg
 icon/Music2MP3-icon.ai
+
+__pycache__/
+__Pycache__/
