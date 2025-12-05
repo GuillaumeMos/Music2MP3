@@ -516,6 +516,8 @@ class Music2MP3GUI:
                 playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
                 out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
                 self._conv_q.put(('done', out_dir))
+            except ValueError as e:
+                self._conv_q.put(('csv_error', str(e)))
             except Exception as e:
                 self._conv_q.put(('error', str(e)))
             finally:
@@ -571,6 +573,14 @@ class Music2MP3GUI:
                                 f"Finished with {n} failed track(s). Click 'View error' next to the red items for details.")
                     self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
                     self._conv_done = True; self.root.bell()
+                    self._cancel_event = None
+                elif kind == 'csv_error':
+                    self._stop_timer()
+                    try: self.progress.configure(style='Error.Horizontal.TProgressbar')
+                    except Exception: pass
+                    messagebox.showerror('Invalid CSV', payload)
+                    self._set_controls(True); self.stop_button.config(state=tk.DISABLED)
+                    self._conv_done = True
                     self._cancel_event = None
                 elif kind == 'error':
                     self._stop_timer()

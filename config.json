@@ -1,13 +1,15 @@
 {
-  "spotify_client_id": "a95304cfabe043f49ab04668b635d01d",
   "variants": [],
   "duration_min": 30,
   "duration_max": 600,
   "transcode_mp3": false,
   "generate_m3u": true,
   "exclude_instrumentals": false,
-  "concurrency": 3,
+  "spotify_client_id": "a95304cfabe043f49ab04668b635d01d",
+  "spotify_client_secret": "",
+  "concurrency": 6,
   "deep_search": true,
   "incremental_update": true,
-  "prefix_numbers": false
+  "prefix_numbers": false,
+  "default_output_dir": "/mnt/d/Musique"
 }

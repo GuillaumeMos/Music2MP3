@@ -8,11 +8,13 @@ import json
 import queue
 import platform
 import threading
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import run_quiet, popen_quiet
 from config import resource_path
 
+log = logging.getLogger(__name__)
 
 def _find_binaries():
     _ = getattr(sys, "_MEIPASS", os.path.abspath("."))
@@ -132,9 +134,7 @@ class Converter:
     # --------------------------- Public API ---------------------------
 
     def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: str | None = None) -> str:
-        rows = list(self._read_csv(csv_path))
-        if not rows:
-            raise RuntimeError("CSV is empty or malformed.")
+        rows = self._read_csv(csv_path)
 
         # Playlist name / output path (avoid double-nesting)
         playlist_name = playlist_hint or os.path.splitext(os.path.basename(csv_path))[0]
@@ -201,11 +201,36 @@ class Converter:
 
     # --------------------------- Internals ---------------------------
 
-    def _read_csv(self, path: str):
-        with open(path, newline='', encoding='utf-8') as f:
+    def _read_csv(self, path: str) -> list[dict]:
+        required = ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"]
+        rows: list[dict] = []
+        with open(path, newline='', encoding='utf-8-sig') as f:
             rdr = csv.DictReader(f)
+            headers = [h.strip() for h in (rdr.fieldnames or []) if h is not None]
+            if not headers:
+                raise ValueError("CSV missing header row.")
+
+            headers_lower = {h.lower(): h for h in headers}
+            missing = [h for h in required if h.lower() not in headers_lower]
+            if missing:
+                raise ValueError(f"CSV missing required column(s): {', '.join(missing)}")
+
+            skipped_empty = 0
             for row in rdr:
-                yield row
+                # Skip rows that are entirely empty (common with trailing newlines)
+                if not any((row.get(h) or "").strip() for h in headers):
+                    skipped_empty += 1
+                    continue
+                rows.append(row)
+
+        if skipped_empty:
+            log.info("CSV skipped %s empty row(s)", skipped_empty)
+
+        if not rows:
+            raise ValueError("CSV has no valid rows to process.")
+
+        log.info("CSV loaded (%s rows) from %s", len(rows), path)
+        return rows
 
     def _make_base_name(self, seq_index: int, total_tracks: int, row: dict) -> str:
         title = row.get("Track Name") or row.get("Track name") or "Unknown"

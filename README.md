@@ -140,6 +140,15 @@ The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the sin
 
 ---
 
+
+
+###build 
+
+
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\build_exe.ps1
+
 ## 🧰 Troubleshooting
 
 - **“(Not Responding)” on Windows while downloading**  
@@ -152,6 +161,8 @@ The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the sin
   Confirm the platform-specific binaries are in `ffmpeg/` and `yt-dlp/` next to the executable/spec.
 
 ---
+
+
 
 ## 📜 License
 
