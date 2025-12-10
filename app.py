@@ -38,7 +38,13 @@ def main():
 
     # --- live log window (F12) ---
     handler, q, log_win = attach_live_log_handler(root)
-    root.bind("<F12>", lambda e: (log_win.deiconify(), log_win.lift(), "break"))
+    def _show_logs(_=None):
+        log_win.deiconify()
+        log_win.lift()
+        return "break"
+    root.bind_all("<F12>", _show_logs)
+    # expose to GUI for a "Logs" button
+    root._log_window = log_win  # type: ignore[attr-defined]
 
     app = Music2MP3GUI(root)
     logging.getLogger(__name__).info("App UI ready")
