@@ -3,6 +3,7 @@
   "variants": [],
   "duration_min": 30,
   "duration_max": 600,
+  "output_format": "mp3",
   "transcode_mp3": false,
   "generate_m3u": true,
   "exclude_instrumentals": false,

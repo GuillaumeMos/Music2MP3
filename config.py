@@ -11,7 +11,10 @@ _DEFAULT = {
     "variants": [],
     "duration_min": 30,
     "duration_max": 600,
+    # Deprecated toggle; kept for backward compat
     "transcode_mp3": False,
+    # New unified output format (mp3, m4a, aac, wav, flac, aiff)
+    "output_format": "mp3",
     "generate_m3u": True,
     "exclude_instrumentals": False,
     "spotify_client_id": "",

@@ -21,6 +21,17 @@ ProgressCB = Callable[[int, int], None]
 ItemCB = Callable[[str, dict], None]
 
 
+_FORMAT_MAP = {
+    "mp3":  {"yt_fmt": "mp3",  "ext": "mp3",  "quality": "0"},
+    "m4a":  {"yt_fmt": "m4a",  "ext": "m4a",  "quality": "0"},
+    "aac":  {"yt_fmt": "aac",  "ext": "aac",  "quality": "0"},
+    "wav":  {"yt_fmt": "wav",  "ext": "wav"},
+    "flac": {"yt_fmt": "flac", "ext": "flac"},
+    # yt-dlp cannot output AIFF directly; we download WAV then convert to AIFF.
+    "aiff": {"yt_fmt": "wav", "ext": "aiff", "needs_aiff": True},
+}
+
+
 # ========================== BINARIES AUTO-DETECT (PyInstaller friendly) ==========================
 
 def _resource_dir() -> Path:
@@ -71,6 +82,12 @@ def _find_ffmpeg_dir() -> str | None:
     return None
 
 
+def _ffmpeg_exe() -> str:
+    ffdir = _find_ffmpeg_dir()
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    return str(Path(ffdir) / exe) if ffdir else exe
+
+
 # ========================================= CONVERTER ============================================
 
 class Converter:
@@ -91,7 +108,8 @@ class Converter:
         # options
         self.prefix_numbers: bool = bool(self.config.get("prefix_numbers", False))
         self.deep_search: bool = bool(self.config.get("deep_search", True))
-        self.transcode_mp3: bool = bool(self.config.get("transcode_mp3", False))
+        self.transcode_mp3: bool = bool(self.config.get("transcode_mp3", False))  # legacy toggle
+        self.output_format: str = self._resolve_output_format(self.config)
         self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
         self.exclude_instr: bool = bool(self.config.get("exclude_instrumentals", False))
         self.incremental: bool = bool(self.config.get("incremental_update", True))
@@ -101,6 +119,7 @@ class Converter:
         # pour la M3U
         self._made_files_lock = threading.Lock()
         self._made_files: List[str] = []
+        self._fmt_entry = _FORMAT_MAP[self.output_format]
 
     # ------------------------------ public API ------------------------------
 
@@ -130,6 +149,7 @@ class Converter:
         log.info("CONV: total tracks to process: %s (out_dir=%s, workers=%s)", total, out_dir, self.concurrency)
 
         # Lancement parallèle : un worker par piste
+        ext_final = self._fmt_entry.get("ext", "mp3")
         futures: list[Future] = []
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="dl") as pool:
             for idx, t in enumerate(tracks, start=1):
@@ -137,11 +157,10 @@ class Converter:
                     break
                 # calcule le nom final (pour incrémental)
                 pretty_title = self._pretty_title(t)
-                ext = "mp3" if self.transcode_mp3 else "m4a"
                 base_name = _sanitize_filename(pretty_title)
                 if self.prefix_numbers:
                     base_name = f"{idx:03d} - {base_name}"
-                dest = out_dir / f"{base_name}.{ext}"
+                dest = out_dir / f"{base_name}.{ext_final}"
 
                 futures.append(
                     pool.submit(self._process_one, idx, t, str(dest))
@@ -177,27 +196,30 @@ class Converter:
             return
 
         pretty_title = self._pretty_title(t)
-        dest = Path(dest_path)
+        dest_final = Path(dest_path)
+        fmt_entry = self._fmt_entry
+        needs_aiff = bool(fmt_entry.get("needs_aiff"))
+        dl_target = dest_final if not needs_aiff else dest_final.with_suffix(".tmp.wav")
 
         # UI row init
         self.item_cb("init", {"idx": idx, "title": pretty_title})
 
         # incrémental
-        if self.incremental and dest.exists() and dest.stat().st_size > 0:
-            log.info("CONV: skip existing (%s)", dest.name)
+        if self.incremental and dest_final.exists() and dest_final.stat().st_size > 0:
+            log.info("CONV: skip existing (%s)", dest_final.name)
             self.item_cb("done", {"idx": idx})
             with self._made_files_lock:
-                self._made_files.append(dest.name)
+                self._made_files.append(dest_final.name)
             return
 
         # Construire l’URL et la commande
         url = t.get("source_url") or t.get("track_uri")
         if not url:
             url = self._build_search_query(t)
-        cmd = self._build_ytdlp_cmd(url=url, out_path=str(dest), want_mp3=self.transcode_mp3)
+        cmd = self._build_ytdlp_cmd(url=url, out_path=str(dl_target), fmt_entry=fmt_entry)
 
         # Statut
-        self.status_cb(f"Downloading {pretty_title}…")
+        self.status_cb(f"Downloading {pretty_title}… ({self.output_format.upper()}, 44.1 kHz)")
 
         code = self._run_ytdlp_stream(
             cmd,
@@ -226,11 +248,34 @@ class Converter:
             self.item_cb("error", {"idx": idx, "message": msg})
             return
 
+        if needs_aiff:
+            try:
+                self._convert_wav_to_aiff(temp_path=str(dl_target), final_path=str(dest_final))
+            except Exception as e:
+                log.exception("CONV: failed to convert WAV to AIFF")
+                self.item_cb("error", {"idx": idx, "message": f"AIFF conversion failed: {e}"})
+                return
+            try:
+                if Path(dl_target).exists():
+                    Path(dl_target).unlink()
+            except Exception:
+                pass
+
         self.item_cb("done", {"idx": idx})
         with self._made_files_lock:
-            self._made_files.append(dest.name)
+            self._made_files.append(dest_final.name)
 
     # ------------------------------ internals ------------------------------
+
+    def _resolve_output_format(self, cfg: dict) -> str:
+        fmt = (cfg.get("output_format") or "").strip().lower()
+        if fmt == "aif":
+            fmt = "aiff"
+        if fmt and fmt in _FORMAT_MAP:
+            return fmt
+        if cfg.get("transcode_mp3"):
+            return "mp3"
+        return "mp3"
 
     def _rows_to_jobs(self, rows: list[dict]) -> list[dict]:
         jobs = []
@@ -268,8 +313,10 @@ class Converter:
         log.debug("CONV: search query -> %s", yts)
         return yts
 
-    def _build_ytdlp_cmd(self, url: str, out_path: str, want_mp3: bool) -> list[str]:
+    def _build_ytdlp_cmd(self, url: str, out_path: str, fmt_entry: dict) -> list[str]:
         cmd = _find_yt_dlp()
+        audio_fmt = fmt_entry.get("yt_fmt", "mp3")
+        audio_quality = fmt_entry.get("quality", "0")
         cmd += [
             "--newline",
             "--no-playlist",
@@ -279,10 +326,11 @@ class Converter:
             "-N", str(self._segments),              # parallélisme segments côté yt-dlp
             "-f", "bestaudio/best",
             "-x",
-            "--audio-format", "mp3" if want_mp3 else "m4a",
-            "--audio-quality", "0" if want_mp3 else "0",
+            "--audio-format", audio_fmt,
+            "--audio-quality", audio_quality,
             "--add-metadata",
             "--embed-thumbnail",
+            "--postprocessor-args", "FFmpegExtractAudio:-ar 44100",
         ]
         ffdir = _find_ffmpeg_dir()
         if ffdir:
@@ -290,6 +338,30 @@ class Converter:
         cmd.append(url)
         log.debug("CONV: yt-dlp cmd: %s", " ".join(shlex.quote(c) for c in cmd))
         return cmd
+
+    def _convert_wav_to_aiff(self, temp_path: str, final_path: str):
+        exe = _ffmpeg_exe()
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        cmd = [
+            exe,
+            "-y",
+            "-i", temp_path,
+            "-ar", "44100",
+            "-acodec", "pcm_s16be",
+            "-f", "aiff",
+            final_path,
+        ]
+        log.debug("CONV: ffmpeg AIFF cmd: %s", " ".join(shlex.quote(c) for c in cmd))
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              startupinfo=startupinfo, creationflags=creationflags)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or "ffmpeg failed")
 
     # ---- streaming / parsing de la progression yt-dlp ----
 

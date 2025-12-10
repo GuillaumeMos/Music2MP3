@@ -65,7 +65,7 @@ class Music2MP3GUI:
         self.prefix_numbers_var  = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
         self.concurrency_var     = tk.IntVar(value=int(self.config.get("concurrency", 3)))
         self.deep_search_var     = tk.BooleanVar(value=bool(self.config.get("deep_search", True)))
-        self.transcode_mp3_var   = tk.BooleanVar(value=bool(self.config.get("transcode_mp3", False)))
+        self.output_format_var   = tk.StringVar(value=str(self.config.get("output_format", "mp3")).lower())
         self.m3u_var             = tk.BooleanVar(value=bool(self.config.get("generate_m3u", True)))
         self.exclude_instr_var   = tk.BooleanVar(value=bool(self.config.get("exclude_instrumentals", False)))
         self.incremental_var     = tk.BooleanVar(value=bool(self.config.get("incremental_update", True)))
@@ -251,10 +251,14 @@ class Music2MP3GUI:
         opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x', pady=(4, 0))
         ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).grid(row=0, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Deep search (more accurate, slower)', variable=self.deep_search_var).grid(row=0, column=1, sticky='w', padx=(20,0))
-        ttk.Checkbutton(opt, text='Transcode to MP3 (VBR 0)', variable=self.transcode_mp3_var).grid(row=1, column=0, sticky='w')
-        ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=1, column=1, sticky='w', padx=(20,0))
-        ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=0, sticky='w')
-        ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=2, column=1, sticky='w', padx=(20,0))
+        ttk.Label(opt, text='Output format (44.1 kHz)').grid(row=1, column=0, sticky='w', pady=(4,0))
+        self.format_combo = ttk.Combobox(opt, textvariable=self.output_format_var,
+                                         values=['mp3','m4a','aac','wav','flac','aiff'],
+                                         state='readonly', width=10)
+        self.format_combo.grid(row=1, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=2, column=0, sticky='w')
+        ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=3, column=0, sticky='w')
 
         # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
@@ -553,7 +557,7 @@ class Music2MP3GUI:
         # persist options from UI
         self.config['prefix_numbers']        = bool(self.prefix_numbers_var.get())
         self.config['deep_search']           = bool(self.deep_search_var.get())
-        self.config['transcode_mp3']         = bool(self.transcode_mp3_var.get())
+        self.config['output_format']         = str(self.output_format_var.get()).lower() or "mp3"
         self.config['generate_m3u']          = bool(self.m3u_var.get())
         self.config['exclude_instrumentals'] = bool(self.exclude_instr_var.get())
         self.config['incremental_update']    = bool(self.incremental_var.get())
