@@ -3,10 +3,7 @@
 **Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
 You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**).
 
-The app downloads each track via **yt-dlp** as:
-
-- **M4A** (remux; keeps source AAC when available), or
-- **MP3 VBR0** (high-quality re-encode via FFmpeg).
+The app downloads each track via **yt-dlp**, resamples to **44.1 kHz**, and saves to your chosen format (MP3, WAV, FLAC, AIFF, AAC, M4A – default MP3).
 
 Everything is bundled—no Python or external installs required.
 
@@ -39,7 +36,7 @@ Everything is bundled—no Python or external installs required.
   (M3U is generated and sorted by number when present, otherwise by time.)
 - **Extras**
   - Generate **.m3u** playlist
-  - **MP3 VBR0** re-encode toggle
+  - Output format picker (MP3 / WAV / FLAC / AIFF / AAC / M4A, resampled 44.1 kHz)
   - **Exclude instrumental** versions
   - “Deep search” mode for more accurate matches
 
@@ -97,8 +94,8 @@ Grab the latest build from the **Releases** page:
   If unchecked, files are named without the prefix.
 - **Threads**  
   Number of parallel downloads (1–8). **2–4** recommended.
-- **Transcode to MP3 (VBR 0)**  
-  Re-encode for maximum compatibility. Otherwise M4A remux keeps the source AAC (commonly ~128 kbps).
+- **Output format (44.1 kHz resample)**  
+  Choose MP3, WAV, FLAC, AIFF, AAC or M4A. Default is **MP3**; AIFF is produced by converting a WAV.
 - **Generate M3U playlist**  
   Creates a `.m3u` in the playlist folder (sorted by number if present, else by time).
 - **Exclude instrumental versions**  
@@ -115,8 +112,10 @@ Grab the latest build from the **Releases** page:
 - Files are saved under:  
   `/<YourOutputFolder>/<PlaylistName>/`
 - Filenames follow either:
-  - `001 - Track Name - Artist.m4a` (if numbering is enabled), or
-  - `Track Name - Artist.m4a` (if disabled).
+  - `001 - Track Name - Artist.<ext>` (if numbering is enabled), or
+  - `Track Name - Artist.<ext>` (if disabled).  
+    `<ext>` is the chosen format: mp3 / wav / flac / aiff / aac / m4a (default mp3).
+- Audio is resampled to **44.1 kHz**; AIFF is produced from a WAV download when selected.
 - Basic tags are written (Title, Artist, Album, Track # when numbered).
 - A `.m3u` playlist is generated if enabled.
 
