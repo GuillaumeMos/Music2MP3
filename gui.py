@@ -11,6 +11,7 @@ from utils import Tooltip, open_folder, open_path
 from converter import Converter
 from spotify_api import SpotifyClient
 from soundcloud_api import SoundCloudClient
+from token_store import RefreshTokenStore
 
 try:
     from config import CONFIG_FILE
@@ -24,8 +25,8 @@ class Music2MP3GUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title('Music2MP3')
-        self.root.geometry('980x880')
-        self.root.minsize(880, 740)
+        self.root.geometry('980x760')
+        self.root.minsize(820, 560)
         log.info("GUI: Music2MP3 window created")
 
         # state
@@ -65,7 +66,16 @@ class Music2MP3GUI:
         self.prefix_numbers_var  = tk.BooleanVar(value=bool(self.config.get("prefix_numbers", False)))
         self.concurrency_var     = tk.IntVar(value=int(self.config.get("concurrency", 3)))
         self.deep_search_var     = tk.BooleanVar(value=bool(self.config.get("deep_search", True)))
-        self.output_format_var   = tk.StringVar(value=str(self.config.get("output_format", "mp3")).lower())
+        self.strict_match_var    = tk.BooleanVar(value=bool(self.config.get("strict_match", False)))
+        mode_raw = str(self.config.get("output_mode", "")).strip().lower()
+        fmt_raw = str(self.config.get("output_format", "mp3")).strip().lower()
+        if mode_raw not in {"auto", "manual"}:
+            mode_raw = "auto" if fmt_raw == "auto" else "manual"
+        fmt_manual = str(self.config.get("output_format_manual", fmt_raw)).strip().lower()
+        if fmt_manual not in {"mp3", "m4a", "aac", "wav", "flac", "aiff"}:
+            fmt_manual = "mp3"
+        self.output_mode_var     = tk.StringVar(value="Auto (best available)" if mode_raw == "auto" else "Manual")
+        self.output_format_var   = tk.StringVar(value=fmt_manual)
         self.m3u_var             = tk.BooleanVar(value=bool(self.config.get("generate_m3u", True)))
         self.exclude_instr_var   = tk.BooleanVar(value=bool(self.config.get("exclude_instrumentals", False)))
         self.incremental_var     = tk.BooleanVar(value=bool(self.config.get("incremental_update", True)))
@@ -93,6 +103,9 @@ class Music2MP3GUI:
 
     def _save_config(self):
         try:
+            cfg_dir = os.path.dirname(CONFIG_FILE)
+            if cfg_dir:
+                os.makedirs(cfg_dir, exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
             log.debug("GUI: config saved -> %s", CONFIG_FILE)
@@ -109,6 +122,7 @@ class Music2MP3GUI:
 
         BG = '#f7f8fb'
         CARD_BG = '#ffffff'
+        DL_BG = '#f8fafc'
         TXT = '#111827'
         SUB = '#4b5563'
         PRIMARY = '#2563eb'
@@ -121,7 +135,7 @@ class Music2MP3GUI:
         self.style.configure('TLabel', background=BG, foreground=TXT)
         self.style.configure('Sub.TLabel', foreground=SUB)
         self.style.configure('Muted.TLabel', foreground='#6b7280')
-        self.style.configure('Chip.TLabel', background='#e6f4ea', foreground='#065f46', padding=(8, 2))
+        self.style.configure('Chip.TLabel', background='#e5edff', foreground='#1e3a8a', padding=(8, 2))
 
         self.style.configure('TButton', padding=(10, 6))
         self.style.configure('Accent.TButton', padding=(12, 8), foreground='white', background=PRIMARY)
@@ -133,10 +147,13 @@ class Music2MP3GUI:
         self.style.configure('Card.TLabelframe', background=CARD_BG, borderwidth=1, relief='solid')
         self.style.configure('Card.TLabelframe.Label', background=CARD_BG, foreground=SUB, padding=(6, 0))
         self.style.configure('CardBody.TFrame', background=CARD_BG)
+        self.style.configure('Downloads.TFrame', background=DL_BG)
+        self.style.configure('TrackRow.TFrame', background=DL_BG)
+        self.style.configure('TrackRow.TLabel', background=DL_BG, foreground=TXT)
 
-        self.style.configure('Active.Horizontal.TProgressbar', thickness=12, background=PRIMARY)
-        self.style.configure('Ok.Horizontal.TProgressbar', thickness=12, background=OK)
-        self.style.configure('Error.Horizontal.TProgressbar', thickness=12, background=ERR)
+        self.style.configure('Active.Horizontal.TProgressbar', thickness=12, background=PRIMARY, troughcolor='#e5e7eb')
+        self.style.configure('Ok.Horizontal.TProgressbar', thickness=12, background=OK, troughcolor='#e5e7eb')
+        self.style.configure('Error.Horizontal.TProgressbar', thickness=12, background=ERR, troughcolor='#e5e7eb')
 
     # ---------- icons ----------
     def _load_icons(self):
@@ -154,16 +171,51 @@ class Music2MP3GUI:
     # ---------- UI ----------
     def _build_ui(self):
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(4, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        header = ttk.Frame(self.root)
-        header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 10))
+        shell = ttk.Frame(self.root, style='CardBody.TFrame')
+        shell.grid(row=0, column=0, sticky='nsew', padx=16, pady=12)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        # Vertical split: top controls + bottom downloads (resizable).
+        self.main_pane = ttk.Panedwindow(shell, orient='vertical')
+        self.main_pane.grid(row=0, column=0, sticky='nsew')
+
+        top_host = ttk.Frame(self.main_pane, style='CardBody.TFrame')
+        dl_host = ttk.Frame(self.main_pane, style='CardBody.TFrame')
+        self.main_pane.add(top_host, weight=3)
+        self.main_pane.add(dl_host, weight=2)
+        self.root.after(120, self._set_initial_sash)
+
+        # Scrollable top area for small windows.
+        top_host.grid_columnconfigure(0, weight=1)
+        top_host.grid_rowconfigure(0, weight=1)
+        self.top_canvas = tk.Canvas(top_host, highlightthickness=0, bg='#f7f8fb', bd=0)
+        top_scroll = ttk.Scrollbar(top_host, orient='vertical', command=self.top_canvas.yview)
+        self.top_canvas.configure(yscrollcommand=top_scroll.set)
+        self.top_canvas.grid(row=0, column=0, sticky='nsew')
+        top_scroll.grid(row=0, column=1, sticky='ns')
+
+        self.top_content = ttk.Frame(self.top_canvas, style='CardBody.TFrame')
+        self._top_window = self.top_canvas.create_window((0, 0), window=self.top_content, anchor='nw')
+        self.top_content.bind('<Configure>', self._on_top_content_configure)
+        self.top_canvas.bind('<Configure>', self._on_top_canvas_configure)
+        self.top_canvas.bind('<MouseWheel>', self._on_top_mousewheel)
+        self.top_canvas.bind('<Button-4>', lambda _e: self.top_canvas.yview_scroll(-1, 'units'))
+        self.top_canvas.bind('<Button-5>', lambda _e: self.top_canvas.yview_scroll(1, 'units'))
+
+        top = self.top_content
+        top.grid_columnconfigure(0, weight=1)
+
+        header = ttk.Frame(top)
+        header.grid(row=0, column=0, sticky='ew', padx=8, pady=(6, 10))
         ttk.Label(header, text="Music2MP3", font=("Segoe UI", 20, "bold")).pack(side='left')
         ttk.Label(header, text="Convert playlists to local audio (M4A/MP3)", style='Sub.TLabel').pack(side='left', padx=(12, 0))
         ttk.Button(header, text="Logs (F12)", command=self.show_logs).pack(side='right')
 
-        cols = ttk.Frame(self.root)
-        cols.grid(row=1, column=0, sticky='nsew', padx=24)
+        cols = ttk.Frame(top)
+        cols.grid(row=1, column=0, sticky='nsew', padx=8)
         cols.grid_columnconfigure(0, weight=1, uniform='cols')
         cols.grid_columnconfigure(1, weight=1, uniform='cols')
 
@@ -201,7 +253,7 @@ class Music2MP3GUI:
         txt_wrap = ttk.Frame(body_txt, style='CardBody.TFrame')
         txt_wrap.pack(fill='both', expand=True, pady=(6, 6))
         txt_wrap.grid_columnconfigure(0, weight=1)
-        self.manual_text = tk.Text(txt_wrap, height=5, wrap='word', bg='#f9fafb', relief='flat',
+        self.manual_text = tk.Text(txt_wrap, height=4, wrap='word', bg='#f9fafb', relief='flat',
                                    highlightthickness=1, highlightbackground='#e5e7eb')
         self.manual_text.grid(row=0, column=0, sticky='nsew')
         txt_scroll = ttk.Scrollbar(txt_wrap, orient='vertical', command=self.manual_text.yview)
@@ -217,7 +269,7 @@ class Music2MP3GUI:
         lf_csv.grid(row=0, column=1, rowspan=3, sticky='nsew', padx=(12, 0), pady=(6, 6))
         body_csv = ttk.Frame(lf_csv, style='CardBody.TFrame'); body_csv.pack(fill='both', expand=True, padx=12, pady=10)
 
-        self.drop_frame = tk.Frame(body_csv, bg='#eef2ff', height=70, cursor='hand2', highlightthickness=0)
+        self.drop_frame = tk.Frame(body_csv, bg='#eef2ff', height=58, cursor='hand2', highlightthickness=0)
         self.drop_frame.pack(fill='x'); self.drop_frame.pack_propagate(False)
         self.drop_label = tk.Label(self.drop_frame, text='Drop a CSV here or click to browse',
                                    bg='#eef2ff', fg='#1f2937', font=("Segoe UI", 11))
@@ -229,8 +281,8 @@ class Music2MP3GUI:
         self.clear_button.pack(pady=(8, 0))
 
         # Output card
-        lf_out = ttk.Labelframe(self.root, text="Output", style='Card.TLabelframe')
-        lf_out.grid(row=2, column=0, sticky='ew', padx=24, pady=(4, 0))
+        lf_out = ttk.Labelframe(top, text="Output", style='Card.TLabelframe')
+        lf_out.grid(row=2, column=0, sticky='ew', padx=8, pady=(4, 8))
         body_out = ttk.Frame(lf_out, style='CardBody.TFrame'); body_out.pack(fill='both', expand=True, padx=12, pady=10)
 
         row_out = ttk.Frame(body_out, style='CardBody.TFrame'); row_out.pack(fill='x', pady=(0, 6))
@@ -251,14 +303,28 @@ class Music2MP3GUI:
         opt = ttk.Frame(body_out, style='CardBody.TFrame'); opt.pack(fill='x', pady=(4, 0))
         ttk.Checkbutton(opt, text='Number files (001, 002…)', variable=self.prefix_numbers_var).grid(row=0, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Deep search (more accurate, slower)', variable=self.deep_search_var).grid(row=0, column=1, sticky='w', padx=(20,0))
-        ttk.Label(opt, text='Output format (44.1 kHz)').grid(row=1, column=0, sticky='w', pady=(4,0))
+        self.strict_match_chk = ttk.Checkbutton(opt, text='Strict matching (safer, slower)', variable=self.strict_match_var)
+        self.strict_match_chk.grid(row=0, column=2, sticky='w', padx=(20,0))
+        ttk.Label(opt, text='Format mode').grid(row=1, column=0, sticky='w', pady=(4,0))
+        self.output_mode_combo = ttk.Combobox(
+            opt,
+            textvariable=self.output_mode_var,
+            values=['Auto (best available)', 'Manual'],
+            state='readonly',
+            width=22,
+        )
+        self.output_mode_combo.grid(row=1, column=1, sticky='w', padx=(20,0))
+        self.output_mode_combo.bind('<<ComboboxSelected>>', self._on_output_mode_changed)
+
+        self.format_label = ttk.Label(opt, text='Output format (manual, 44.1 kHz)')
+        self.format_label.grid(row=2, column=0, sticky='w', pady=(4,0))
         self.format_combo = ttk.Combobox(opt, textvariable=self.output_format_var,
                                          values=['mp3','m4a','aac','wav','flac','aiff'],
                                          state='readonly', width=10)
-        self.format_combo.grid(row=1, column=1, sticky='w', padx=(20,0))
-        ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=2, column=0, sticky='w')
-        ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=2, column=1, sticky='w', padx=(20,0))
-        ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=3, column=0, sticky='w')
+        self.format_combo.grid(row=2, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=3, column=0, sticky='w')
+        ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=3, column=1, sticky='w', padx=(20,0))
+        ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=4, column=0, sticky='w')
 
         # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
@@ -285,10 +351,11 @@ class Music2MP3GUI:
                                       command=self.stop_conversion, state=tk.DISABLED)
         self.stop_button.pack(side='left')
 
-        # Downloads card
-        lf_dl = ttk.Labelframe(self.root, text="Downloads", style='Card.TLabelframe')
-        lf_dl.grid(row=4, column=0, sticky='nsew', padx=24, pady=(10, 16))
-        self.root.grid_rowconfigure(4, weight=1)
+        # Downloads card (always visible in bottom pane)
+        dl_host.grid_columnconfigure(0, weight=1)
+        dl_host.grid_rowconfigure(0, weight=1)
+        lf_dl = ttk.Labelframe(dl_host, text="Downloads", style='Card.TLabelframe')
+        lf_dl.grid(row=0, column=0, sticky='nsew', padx=8, pady=(8, 0))
 
         body_dl = ttk.Frame(lf_dl, style='CardBody.TFrame'); body_dl.pack(fill='both', expand=True, padx=12, pady=10)
         body_dl.grid_columnconfigure(0, weight=1)
@@ -305,20 +372,25 @@ class Music2MP3GUI:
         self.time_label = ttk.Label(body_dl, text='', style='Muted.TLabel')
         self.time_label.grid(row=3, column=0, sticky='w', pady=(4, 6))
 
-        list_wrap = ttk.Frame(body_dl, style='CardBody.TFrame')
+        list_wrap = ttk.Frame(body_dl, style='Downloads.TFrame')
         list_wrap.grid(row=4, column=0, sticky='nsew')
         body_dl.grid_rowconfigure(4, weight=1)
 
-        self.canvas = tk.Canvas(list_wrap, highlightthickness=0, bg='#ffffff')
+        self.canvas = tk.Canvas(list_wrap, highlightthickness=0, bg='#f8fafc', bd=0)
         vscroll = ttk.Scrollbar(list_wrap, orient='vertical', command=self.canvas.yview)
-        self.list_frame = ttk.Frame(self.canvas, style='CardBody.TFrame')
+        self.list_frame = ttk.Frame(self.canvas, style='Downloads.TFrame')
 
-        self.list_frame.bind('<Configure>', lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.create_window((0, 0), window=self.list_frame, anchor='nw')
+        self.list_frame.bind('<Configure>', self._on_list_frame_configure)
+        self._list_window = self.canvas.create_window((0, 0), window=self.list_frame, anchor='nw')
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+        self.canvas.bind('<MouseWheel>', self._on_download_mousewheel)
+        self.canvas.bind('<Button-4>', lambda _e: self.canvas.yview_scroll(-1, 'units'))
+        self.canvas.bind('<Button-5>', lambda _e: self.canvas.yview_scroll(1, 'units'))
         self.canvas.configure(yscrollcommand=vscroll.set)
 
         self.canvas.pack(side='left', fill='both', expand=True)
         vscroll.pack(side='right', fill='y')
+        self._sync_output_mode_ui()
 
     # ---------- click CSV label ----------
     def _click_csv_label(self, _=None):
@@ -360,8 +432,10 @@ class Music2MP3GUI:
         def _spotify_worker():
             log.info("BG: Spotify worker started for playlist %s", pid)
             try:
+                token_store = RefreshTokenStore(service="Music2MP3", user="spotify_pkce")
                 auth = PKCEAuth(client_id=client_id, redirect_uri="http://127.0.0.1:8765/callback",
-                                scopes=["playlist-read-private", "playlist-read-collaborative"])
+                                scopes=["playlist-read-private", "playlist-read-collaborative"],
+                                refresh_token_store=token_store)
                 sp = SpotifyClient(token_supplier=auth.get_token)
                 self._sp_q.put(('status', 'Fetching playlist from Spotify…'))
                 rows, name = sp.fetch_playlist(pid)
@@ -557,7 +631,12 @@ class Music2MP3GUI:
         # persist options from UI
         self.config['prefix_numbers']        = bool(self.prefix_numbers_var.get())
         self.config['deep_search']           = bool(self.deep_search_var.get())
-        self.config['output_format']         = str(self.output_format_var.get()).lower() or "mp3"
+        self.config['strict_match']          = bool(self.strict_match_var.get())
+        mode = self._current_output_mode()
+        fmt = str(self.output_format_var.get()).lower() or "mp3"
+        self.config['output_mode']           = mode
+        self.config['output_format_manual']  = fmt
+        self.config['output_format']         = fmt if mode == "manual" else "auto"
         self.config['generate_m3u']          = bool(self.m3u_var.get())
         self.config['exclude_instrumentals'] = bool(self.exclude_instr_var.get())
         self.config['incremental_update']    = bool(self.incremental_var.get())
@@ -736,12 +815,12 @@ class Music2MP3GUI:
     def _ensure_row(self, idx: int, title: str):
         if idx in self._rows:
             return
-        frame = ttk.Frame(self.list_frame, style='CardBody.TFrame')
-        frame.pack(fill='x', padx=2, pady=4)
+        frame = ttk.Frame(self.list_frame, style='TrackRow.TFrame', padding=(8, 6))
+        frame.pack(fill='x', padx=2, pady=3)
 
-        top = ttk.Frame(frame, style='CardBody.TFrame')
+        top = ttk.Frame(frame, style='TrackRow.TFrame')
         top.pack(fill='x')
-        lbl = ttk.Label(top, text=f"{idx:03d}. {title}")
+        lbl = ttk.Label(top, text=f"{idx:03d}. {title}", style='TrackRow.TLabel')
         lbl.pack(side='left', fill='x', expand=True)
 
         # Hidden until an error happens:
@@ -749,7 +828,7 @@ class Music2MP3GUI:
         btn.pack(side='right'); btn.pack_forget()
 
         bar = ttk.Progressbar(
-            frame, orient='horizontal', length=820, mode='determinate',
+            frame, orient='horizontal', mode='determinate',
             maximum=100, value=0, style='Active.Horizontal.TProgressbar'
         )
         bar.pack(fill='x', pady=(4, 0))
@@ -834,17 +913,100 @@ class Music2MP3GUI:
         self.root.after(1000, self._tick_timer)
 
     # ---------- misc ----------
+    def _current_output_mode(self) -> str:
+        val = str(self.output_mode_var.get()).strip().lower()
+        return "auto" if val.startswith("auto") else "manual"
+
+    def _sync_output_mode_ui(self):
+        manual = self._current_output_mode() == "manual"
+        if manual:
+            self.format_label.grid()
+            self.format_combo.grid()
+            try:
+                if str(self.format_combo.cget("state")) != str(tk.DISABLED):
+                    self.format_combo.config(state='readonly')
+            except Exception:
+                pass
+        else:
+            self.format_label.grid_remove()
+            self.format_combo.grid_remove()
+
+    def _on_output_mode_changed(self, _event=None):
+        self._sync_output_mode_ui()
+
     def _set_controls(self, enabled: bool):
         state = tk.NORMAL if enabled else tk.DISABLED
         for w in (self.convert_button, self.clear_button, self.folder_button,
                   self.spotify_load_btn, self.drop_label, self.spotify_entry,
                   self.open_folder_btn, self.sc_load_btn, self.sc_entry,
                   self.thread_spin, getattr(self, "manual_load_btn", None),
-                  getattr(self, "manual_text", None)):
+                  getattr(self, "manual_text", None), getattr(self, "output_mode_combo", None),
+                  getattr(self, "strict_match_chk", None)):
             try: w.config(state=state)
             except Exception: pass
+        try:
+            if enabled and self._current_output_mode() == "manual":
+                self.format_combo.config(state='readonly')
+            else:
+                self.format_combo.config(state=state)
+        except Exception:
+            pass
+        self._sync_output_mode_ui()
         if enabled:
             self.stop_button.config(state=tk.DISABLED)
+
+    def _set_initial_sash(self):
+        try:
+            total = self.main_pane.winfo_height()
+            if total > 0:
+                # Keep downloads visible by default; user can drag handle.
+                self.main_pane.sashpos(0, int(total * 0.58))
+        except Exception:
+            pass
+
+    def _on_top_content_configure(self, _event=None):
+        try:
+            self.top_canvas.configure(scrollregion=self.top_canvas.bbox('all'))
+        except Exception:
+            pass
+
+    def _on_top_canvas_configure(self, event):
+        try:
+            self.top_canvas.itemconfigure(self._top_window, width=event.width)
+        except Exception:
+            pass
+
+    def _on_top_mousewheel(self, event):
+        try:
+            if event.delta > 0:
+                self.top_canvas.yview_scroll(-1, 'units')
+            elif event.delta < 0:
+                self.top_canvas.yview_scroll(1, 'units')
+        except Exception:
+            pass
+        return "break"
+
+    def _on_list_frame_configure(self, _event=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, event):
+        try:
+            self.canvas.itemconfigure(self._list_window, width=event.width)
+        except Exception:
+            pass
+
+    def _on_download_mousewheel(self, event):
+        try:
+            if event.delta > 0:
+                self.canvas.yview_scroll(-1, 'units')
+            elif event.delta < 0:
+                self.canvas.yview_scroll(1, 'units')
+        except Exception:
+            pass
+        return "break"
 
     def _start_indeterminate(self, text: str):
         self.status_label.config(text=text)

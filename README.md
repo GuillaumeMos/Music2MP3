@@ -1,7 +1,7 @@
 # Music2MP3
 
 **Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
-You can either **drag & drop a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**).
+You can either **load a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**).
 
 The app downloads each track via **yt-dlp**, resamples to **44.1 kHz**, and saves to your chosen format (MP3, WAV, FLAC, AIFF, AAC, M4A – default MP3).
 
@@ -18,22 +18,18 @@ Everything is bundled—no Python or external installs required.
 - **CSV still supported**  
   Any CSV with the usual headers (`Track Name`, `Artist Name(s)`, `Album Name`, `Duration (ms)`…) works (Exportify, TuneMyMusic…).
 - **Incremental updates**  
-  If the target playlist folder already exists, the app **adds only new tracks** (no duplicates).  
-  Dedup uses (in order):
-  - **Track URI** (when present),
-  - **title + primary artist**,
-  - then **filename** (ignoring any numeric prefix like `001 -`).  
-    A small `manifest.json` helps future runs.
+  If the target playlist folder already exists, the app skips tracks whose final output file already exists and is non-empty.
 - **Parallel downloads (2–8 workers)**  
   Configurable **Threads** selector; 2–4 is a safe sweet spot.
 - **Great live UI**
   - Global progress bar + **per-track progress bars**
+  - Per-track **state column** (`Queued`, `Downloading`, `Converting`, `Done`, `Failed`)
   - **Speed & ETA** per track when available
   - **Elapsed time** while running and **total time** at the end
   - **Stop** button to cancel gracefully
 - **Optional file numbering**  
   Toggle **“Number files (001, 002…)”** if you want filenames to reflect order.  
-  (M3U is generated and sorted by number when present, otherwise by time.)
+  (`playlist.m3u8` is generated in playlist order.)
 - **Extras**
   - Generate **.m3u** playlist
   - Output format picker (MP3 / WAV / FLAC / AIFF / AAC / M4A, resampled 44.1 kHz)
@@ -54,13 +50,21 @@ Grab the latest build from the **Releases** page:
 
 ## 🚀 How to Use
 
+### Optional: Experimental Qt UI
+
+An experimental **PySide6 / Qt** frontend is available as a progressive migration path.
+
+- Run: `task run:qt`
+- Current scope: Spotify/SoundCloud/CSV loading + output options + live downloads panel
+- Tk frontend is still available: `task run:tk`
+
 ### Option A — From a CSV
 
 1. Export your playlist:
    - Spotify → [Exportify](https://exportify.net)
    - Apple/YouTube/others → [TuneMyMusic](https://tunemymusic.com)
 2. Launch the app.
-3. **Drag & drop** the CSV (or click to browse).  
+3. Click the CSV area to browse and select a file.  
    _(Tip: after loading, click the CSV label to open the file.)_
 4. Choose an **output folder**.
 5. (Optional) Toggle settings (see below).
@@ -96,14 +100,19 @@ Grab the latest build from the **Releases** page:
   Number of parallel downloads (1–8). **2–4** recommended.
 - **Output format (44.1 kHz resample)**  
   Choose MP3, WAV, FLAC, AIFF, AAC or M4A. Default is **MP3**; AIFF is produced by converting a WAV.
+- **Format mode: Auto / Manual**  
+  - **Auto (best available)**: keeps the best available audio format/quality from source (extension may vary).  
+  - **Manual**: forces the selected output format and uses 44.1 kHz resample.
 - **Generate M3U playlist**  
-  Creates a `.m3u` in the playlist folder (sorted by number if present, else by time).
+  Creates `playlist.m3u8` in the playlist folder, in playlist order.
 - **Exclude instrumental versions**  
   Rejects videos with “instrumental” in title.
 - **Deep search**  
   Slower but more accurate search (tries multiple candidates).
+- **Strict matching (safer, slower)**  
+  Tries multiple YouTube candidates and keeps only confident matches using title/artist/duration scoring.
 - **Incremental update**  
-  Skips tracks that already exist using URI/tags/normalized filename matching. Maintains a `manifest.json`.
+  Skips tracks whose final output file already exists and is non-empty.
 
 ---
 
@@ -125,7 +134,8 @@ Grab the latest build from the **Releases** page:
 
 - **Spotify** sign-in uses **OAuth PKCE**: no client secret, no data sent to any server we control.
   - Local redirect: `http://127.0.0.1:8765/callback`
-  - Tokens are kept in memory for the current session.
+  - Access token is kept in memory for the current session.
+  - Refresh token is stored in your OS keychain when available (via `keyring`).
 - **SoundCloud** usage requires **no authentication**:
   - Public playlists work out of the box.
   - Private playlists shared via **secret links** also work (the token is in the URL).
@@ -137,6 +147,10 @@ Grab the latest build from the **Releases** page:
 
 - This tool **does not rip Spotify or SoundCloud directly**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded.
 - **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
+- Runtime settings are persisted per user:
+  - Windows: `%APPDATA%\\Music2MP3\\config.json`
+  - macOS: `~/Library/Application Support/Music2MP3/config.json`
+  - Linux: `~/.music2mp3/config.json`
 - UI work is done in background threads; the app stays responsive and shows live progress.
 - If a track fails, try:
   - **Deep search** (more candidates),
@@ -157,9 +171,23 @@ Grab the latest build from the **Releases** page:
    - macOS: `ffmpeg/ffmpeg`, `yt-dlp/yt-dlp`
    - Linux: same as macOS (or use the AppImage workflow)
 4. Run the platform spec, e.g.:
-   - Windows: `pyinstaller Music2MP3-Windows.spec`
-   - macOS: `pyinstaller Music2MP3-macOS.spec`
-   - Linux: `pyinstaller Music2MP3-Linux.spec` (AppImage packaging in CI)
+   - Windows (Qt default): `pyinstaller Music2MP3-Qt-Windows.spec`
+   - Windows (Tk legacy): `pyinstaller Music2MP3-Windows.spec`
+   - macOS (Qt default): `pyinstaller Music2MP3-Qt-macOS.spec`
+   - macOS (Tk legacy): `pyinstaller Music2MP3-macOS.spec`
+   - Linux (Qt default): `pyinstaller Music2MP3-Qt-Linux.spec`
+   - Linux (Tk legacy): `pyinstaller Music2MP3-Linux.spec` (AppImage packaging in CI)
+
+Or with Taskfile:
+- `task build:current` (build for your current OS, Qt default)
+- `task build:windows` / `task build:windows:tk`
+- `task build:macos` (Qt default)
+- `task build:macos:tk` (Tk legacy)
+- `task build:linux` / `task build:linux:tk`
+
+macOS signing/notarization (optional):
+- `task sign:macos` with `MACOS_SIGN_IDENTITY="Developer ID Application: ..."`
+- `task notarize:macos` with `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`
 
 The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the app in `dist/`.
 
@@ -172,8 +200,8 @@ The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the app
 - **Age-restricted / region-locked videos**  
   yt-dlp may refuse them without cookies. Add a cookies file to `config.json`.
 - **Duplicates still appear**  
-  We compare by URI → tags → normalized filename (ignores leading numbers and normalizes punctuation).  
-  Delete `manifest.json` if you suspect it’s stale and retry.
+  The incremental mode only skips files that already exist with the exact expected final filename.  
+  If naming options changed (format, numbering, artist/title text), new files may be created.
 - **SoundCloud shows “Unknown – Unknown”**  
   Usually caused by missing page metadata or blocked access. Ensure the playlist/secret link is valid and reachable in your region; cookies can help.
 - **No console popups**  

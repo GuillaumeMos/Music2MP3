@@ -1,11 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import shutil
 
+
+def _pick_binary(local_path: str, fallback_name: str) -> tuple[str, str]:
+    """
+    Return (source_path, dest_dir_name) for bundled binaries.
+    Priority: local repo path, then PATH lookup.
+    """
+    if os.path.isfile(local_path):
+        return (local_path, os.path.dirname(local_path))
+    found = shutil.which(fallback_name)
+    if found:
+        return (found, os.path.dirname(local_path))
+    raise SystemExit(
+        f"Missing required binary: {fallback_name}. "
+        f"Provide {local_path} or install `{fallback_name}` in PATH."
+    )
+
+
+datas = [
+    _pick_binary("ffmpeg/ffmpeg.exe", "ffmpeg.exe"),
+    _pick_binary("yt-dlp/yt-dlp.exe", "yt-dlp.exe"),
+    ("config.json", "."),
+    ("icon.ico", "."),
+]
 
 a = Analysis(
      ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('ffmpeg/ffmpeg.exe', 'ffmpeg'), ('yt-dlp/yt-dlp.exe', 'yt-dlp'), ('config.json', '.'), ('icon.ico', '.')],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -28,7 +28,18 @@ class Tooltip:
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f'+{x}+{y}')
-        lbl = tk.Label(self.tip, text=self.text, bg='#FFF9C4', relief='solid', bd=1)
+        lbl = tk.Label(
+            self.tip,
+            text=self.text,
+            bg='#fff8dc',
+            fg='#111827',
+            relief='solid',
+            bd=1,
+            padx=8,
+            pady=4,
+            justify='left',
+            wraplength=360,
+        )
         lbl.pack()
 
     def _hide(self, _):
