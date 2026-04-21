@@ -1,11 +1,32 @@
+# Binaries & external tools
+ffmpeg/ffmpeg
 ffmpeg/ffmpeg.exe
 ffmpeg/ffplay.exe
 ffmpeg/ffprobe.exe
-yt-dlp.exe
-.DS_Store
 yt-dlp/yt-dlp
-ffmpeg/ffmpeg
-icon/Music2MP3-icon.ai
+yt-dlp.exe
+
+# Build artifacts
 /dist
+/build
+
+# Python
 __pycache__/
 __Pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Assets
+icon/Music2MP3-icon.ai
