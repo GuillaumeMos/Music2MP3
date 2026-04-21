@@ -27,7 +27,7 @@ datas = [
 ]
 
 a = Analysis(
-     ['app.py'],
+     ['qt_app.py'],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -55,8 +55,8 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    codesign_identity=os.getenv("PYI_CODESIGN_IDENTITY") or None,
+    entitlements_file=os.getenv("PYI_ENTITLEMENTS_FILE") or None,
     icon=['icon.icns'],
 )
 coll = COLLECT(
@@ -72,5 +72,5 @@ app = BUNDLE(
     coll,
     name='Music2MP3.app',
     icon='icon.icns',
-    bundle_identifier=None,
+    bundle_identifier=os.getenv("MUSIC2MP3_BUNDLE_ID") or None,
 )

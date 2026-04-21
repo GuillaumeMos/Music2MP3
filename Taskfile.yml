@@ -1,0 +1,201 @@
+version: '3'
+
+vars:
+  BOOTSTRAP_PYTHON: '{{if eq OS "windows"}}py -3{{else}}python3{{end}}'
+  PYTHON: '{{if eq OS "windows"}}.venv/Scripts/python.exe{{else}}.venv/bin/python{{end}}'
+  PIP: '{{.PYTHON}} -m pip'
+
+tasks:
+  default:
+    desc: Aide rapide
+    cmds:
+      - echo "Use 'task --list' (or 'go-task --list') to see available tasks."
+
+  venv:
+    desc: Crée l'environnement virtuel .venv
+    status:
+      - '{{.PYTHON}} --version'
+    cmds:
+      - '{{.BOOTSTRAP_PYTHON}} -m venv .venv'
+
+  install:
+    desc: Installe les dépendances Python dans .venv
+    deps: [venv]
+    cmds:
+      - '{{.PIP}} install --upgrade pip'
+      - '{{.PIP}} install -r requirements.txt'
+
+  run:
+    desc: Lance l'application
+    deps: [install]
+    cmds:
+      - '{{.PYTHON}} app.py'
+
+  run:tk:
+    desc: Lance l'UI Tk (legacy)
+    deps: [install]
+    cmds:
+      - '{{.PYTHON}} app.py'
+
+  qt:install:
+    desc: Installe PySide6 pour l'UI Qt expérimentale
+    deps: [venv]
+    cmds:
+      - '{{.PIP}} install PySide6'
+
+  run:qt:
+    desc: Lance l'UI Qt expérimentale
+    deps: [install, qt:install]
+    cmds:
+      - '{{.PYTHON}} qt_app.py'
+
+  test:
+    desc: Lance les tests unitaires
+    deps: [install]
+    cmds:
+      - '{{.PYTHON}} -m unittest discover -s tests -v'
+
+  compile:
+    desc: Vérifie la syntaxe Python (compileall)
+    deps: [venv]
+    cmds:
+      - '{{.PYTHON}} -m compileall app.py qt_app.py gui.py converter.py spotify_auth.py token_store.py tests'
+
+  check:
+    desc: Exécute les vérifications de base (compile + tests)
+    deps: [compile, test]
+
+  build:deps:
+    desc: Installe les dépendances de build (PyInstaller)
+    deps: [install]
+    cmds:
+      - '{{.PIP}} install pyinstaller'
+
+  build:current:
+    desc: Build pour l'OS courant (Qt par défaut)
+    cmds:
+      - |
+        {{if eq OS "darwin"}}
+        task build:macos
+        {{else if eq OS "windows"}}
+        task build:windows
+        {{else if eq OS "linux"}}
+        task build:linux
+        {{else}}
+        echo "Unsupported OS: {{OS}}" && exit 1
+        {{end}}
+
+  build:windows:
+    desc: Build Windows Qt app (default)
+    deps: [build:deps, qt:install]
+    platforms: [windows]
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Windows.spec'
+
+  build:windows:qt:
+    desc: Build Windows Qt app
+    deps: [build:windows]
+
+  build:windows:tk:
+    desc: Build Windows Tk app (legacy)
+    deps: [build:deps]
+    platforms: [windows]
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Windows.spec'
+
+  build:macos:
+    desc: Build macOS Qt app (default)
+    deps: [build:deps, qt:install]
+    platforms: [darwin]
+    preconditions:
+      - sh: test -f ffmpeg/ffmpeg || command -v ffmpeg >/dev/null 2>&1
+        msg: "Missing ffmpeg. Run 'task tools:install:macos' or add ffmpeg/ffmpeg"
+      - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
+        msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-macOS.spec'
+
+  build:macos:qt:
+    desc: Build macOS Qt app
+    deps: [build:macos]
+
+  build:macos:tk:
+    desc: Build macOS Tk app (legacy)
+    deps: [build:deps]
+    platforms: [darwin]
+    preconditions:
+      - sh: '{{.PYTHON}} -c "import tkinter"'
+        msg: "Missing tkinter support. Run 'brew install python-tk@3.14'"
+      - sh: test -f ffmpeg/ffmpeg || command -v ffmpeg >/dev/null 2>&1
+        msg: "Missing ffmpeg. Run 'task tools:install:macos' or add ffmpeg/ffmpeg"
+      - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
+        msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-macOS.spec'
+
+  sign:macos:
+    desc: Signe l'app macOS (Developer ID)
+    deps: [build:macos]
+    platforms: [darwin]
+    preconditions:
+      - sh: test -n "${MACOS_SIGN_IDENTITY:-}"
+        msg: "Set MACOS_SIGN_IDENTITY='Developer ID Application: ...'"
+    cmds:
+      - codesign --force --deep --options runtime --sign "$MACOS_SIGN_IDENTITY" dist/Music2MP3.app
+      - codesign --verify --deep --strict --verbose=2 dist/Music2MP3.app
+
+  notarize:macos:
+    desc: Notarize + staple l'app macOS
+    deps: [sign:macos]
+    platforms: [darwin]
+    preconditions:
+      - sh: command -v xcrun >/dev/null 2>&1
+        msg: "xcrun is required (Xcode command line tools)."
+      - sh: test -n "${APPLE_ID:-}" && test -n "${APPLE_TEAM_ID:-}" && test -n "${APPLE_APP_PASSWORD:-}"
+        msg: "Set APPLE_ID, APPLE_TEAM_ID and APPLE_APP_PASSWORD."
+    cmds:
+      - rm -f dist/Music2MP3-macOS.zip
+      - ditto -c -k --keepParent dist/Music2MP3.app dist/Music2MP3-macOS.zip
+      - xcrun notarytool submit dist/Music2MP3-macOS.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+      - xcrun stapler staple dist/Music2MP3.app
+      - spctl --assess --type execute --verbose=4 dist/Music2MP3.app
+
+  build:linux:
+    desc: Build Linux Qt app (default)
+    deps: [build:deps, qt:install]
+    platforms: [linux]
+    preconditions:
+      - sh: test -f ffmpeg/ffmpeg || command -v ffmpeg >/dev/null 2>&1
+        msg: "Missing ffmpeg. Add ffmpeg/ffmpeg or install ffmpeg in PATH."
+      - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
+        msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Linux.spec'
+
+  build:linux:qt:
+    desc: Build Linux Qt app
+    deps: [build:linux]
+
+  build:linux:tk:
+    desc: Build Linux Tk app (legacy)
+    deps: [build:deps]
+    platforms: [linux]
+    preconditions:
+      - sh: test -f ffmpeg/ffmpeg || command -v ffmpeg >/dev/null 2>&1
+        msg: "Missing ffmpeg. Add ffmpeg/ffmpeg or install ffmpeg in PATH."
+      - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
+        msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
+    cmds:
+      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Linux.spec'
+
+  clean:
+    desc: Nettoie les artefacts Python et build
+    cmds:
+      - find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+      - rm -rf .pytest_cache build dist
+
+  tools:install:macos:
+    desc: Installe les outils de build macOS (ffmpeg, yt-dlp, tkinter)
+    platforms: [darwin]
+    cmds:
+      - brew install ffmpeg yt-dlp python-tk@3.14

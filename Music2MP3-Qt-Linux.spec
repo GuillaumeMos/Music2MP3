@@ -23,11 +23,11 @@ datas = [
     _pick_binary("ffmpeg/ffmpeg", "ffmpeg"),
     _pick_binary("yt-dlp/yt-dlp", "yt-dlp"),
     ("config.json", "."),
-    ("icon.icns", "."),
+    ("icon.png", "."),
 ]
 
 a = Analysis(
-     ['app.py'],
+    ["qt_app.py"],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -46,18 +46,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Music2MP3',
+    name="Music2MP3",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=['icon.icns'],
+    icon="icon.png",
 )
 coll = COLLECT(
     exe,
@@ -66,11 +61,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Music2MP3',
-)
-app = BUNDLE(
-    coll,
-    name='Music2MP3.app',
-    icon='icon.icns',
-    bundle_identifier=None,
+    name="Music2MP3",
 )
