@@ -38,13 +38,13 @@ tasks:
       - '{{.PYTHON}} app.py'
 
   qt:install:
-    desc: Installe PySide6 pour l'UI Qt expérimentale
+    desc: Installe PySide6 pour l'UI Qt
     deps: [venv]
     cmds:
       - '{{.PIP}} install PySide6'
 
   run:qt:
-    desc: Lance l'UI Qt expérimentale
+    desc: Lance l'UI Qt
     deps: [install, qt:install]
     cmds:
       - '{{.PYTHON}} qt_app.py'
@@ -59,7 +59,7 @@ tasks:
     desc: Vérifie la syntaxe Python (compileall)
     deps: [venv]
     cmds:
-      - '{{.PYTHON}} -m compileall app.py qt_app.py gui.py converter.py spotify_auth.py token_store.py tests'
+      - '{{.PYTHON}} -m compileall app.py qt_app.py gui.py converter.py library_manifest.py spotify_auth.py token_store.py tests'
 
   check:
     desc: Exécute les vérifications de base (compile + tests)
@@ -90,7 +90,7 @@ tasks:
     deps: [build:deps, qt:install]
     platforms: [windows]
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Windows.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-Windows.spec'
 
   build:windows:qt:
     desc: Build Windows Qt app
@@ -101,7 +101,7 @@ tasks:
     deps: [build:deps]
     platforms: [windows]
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Windows.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Windows.spec'
 
   build:macos:
     desc: Build macOS Qt app (default)
@@ -113,7 +113,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-macOS.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-macOS.spec'
 
   build:macos:qt:
     desc: Build macOS Qt app
@@ -131,7 +131,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-macOS.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-macOS.spec'
 
   sign:macos:
     desc: Signe l'app macOS (Developer ID)
@@ -170,7 +170,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Linux.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-Linux.spec'
 
   build:linux:qt:
     desc: Build Linux Qt app
@@ -186,7 +186,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Linux.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Linux.spec'
 
   clean:
     desc: Nettoie les artefacts Python et build

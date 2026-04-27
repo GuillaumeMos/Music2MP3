@@ -14,6 +14,11 @@ from soundcloud_api import SoundCloudClient
 from token_store import RefreshTokenStore
 
 try:
+    from tkinterdnd2 import DND_FILES
+except Exception:
+    DND_FILES = None
+
+try:
     from config import CONFIG_FILE
 except Exception:
     def resource_path(relative_path):
@@ -34,6 +39,7 @@ class Music2MP3GUI:
         self.output_folder = None
         self.last_output_dir = None
         self._loaded_playlist_name_from_spotify = None
+        self._loaded_source_info = None
         self.config = load_config()
         log.debug("GUI: Config loaded: %s", self.config)
 
@@ -67,6 +73,7 @@ class Music2MP3GUI:
         self.concurrency_var     = tk.IntVar(value=int(self.config.get("concurrency", 3)))
         self.deep_search_var     = tk.BooleanVar(value=bool(self.config.get("deep_search", True)))
         self.strict_match_var    = tk.BooleanVar(value=bool(self.config.get("strict_match", False)))
+        self.safe_search_var     = tk.BooleanVar(value=bool(self.config.get("safe_search", True)))
         mode_raw = str(self.config.get("output_mode", "")).strip().lower()
         fmt_raw = str(self.config.get("output_format", "mp3")).strip().lower()
         if mode_raw not in {"auto", "manual"}:
@@ -276,6 +283,7 @@ class Music2MP3GUI:
         self.drop_label.pack(expand=True, fill='both')
         self.drop_label.bind('<Button-1>', self._click_csv_label)
         Tooltip(self.drop_label, 'Click to select a CSV. Once loaded, click again to open it.')
+        self._setup_csv_drop_target()
 
         self.clear_button = ttk.Button(body_csv, text='Clear CSV', command=self.clear_selection, state=tk.DISABLED)
         self.clear_button.pack(pady=(8, 0))
@@ -325,6 +333,8 @@ class Music2MP3GUI:
         ttk.Checkbutton(opt, text='Generate M3U', variable=self.m3u_var).grid(row=3, column=0, sticky='w')
         ttk.Checkbutton(opt, text='Exclude "instrumental" matches', variable=self.exclude_instr_var).grid(row=3, column=1, sticky='w', padx=(20,0))
         ttk.Checkbutton(opt, text='Only add new tracks (incremental)', variable=self.incremental_var).grid(row=4, column=0, sticky='w')
+        self.safe_search_chk = ttk.Checkbutton(opt, text='Safe search (avoid long sets)', variable=self.safe_search_var)
+        self.safe_search_chk.grid(row=4, column=1, sticky='w', padx=(20,0))
 
         # Threads + Convert/Stop
         row_actions = ttk.Frame(body_out, style='CardBody.TFrame')
@@ -400,6 +410,36 @@ class Music2MP3GUI:
         else:
             self.browse_csv()
 
+    def _setup_csv_drop_target(self):
+        if not DND_FILES:
+            self.drop_label.config(text='Click to browse CSV')
+            return
+        for widget in (self.drop_frame, self.drop_label):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind('<<Drop>>', self._on_csv_drop)
+            except Exception:
+                log.debug("GUI: DnD registration failed for %s", widget, exc_info=True)
+                self.drop_label.config(text='Click to browse CSV')
+                return
+
+    def _on_csv_drop(self, event):
+        files = self.root.tk.splitlist(event.data)
+        path = next((p for p in files if p.lower().endswith('.csv') and os.path.isfile(p)), None)
+        if not path:
+            messagebox.showerror('Error', 'Drop a valid CSV file.')
+            return
+        self._load_csv_path(path)
+
+    def _load_csv_path(self, path: str):
+        self.csv_path = path
+        self.last_directory = os.path.dirname(path)
+        self._style_drop_loaded(os.path.basename(path))
+        self.status_label.config(text='CSV loaded.')
+        self._loaded_playlist_name_from_spotify = None
+        self._loaded_source_info = {"type": "csv", "url": path, "name": os.path.splitext(os.path.basename(path))[0]}
+        self.update_convert_button_state()
+
     # ---------- Spotify loader ----------
     def load_from_spotify_link_wrapper(self):
         log.info("UI: Spotify load button clicked")
@@ -465,6 +505,7 @@ class Music2MP3GUI:
                     tmp, name, n = payload
                     self.csv_path = tmp
                     self._loaded_playlist_name_from_spotify = name or "SpotifyPlaylist"
+                    self._loaded_source_info = {"type": "spotify", "url": url, "name": self._loaded_playlist_name_from_spotify}
                     self._style_drop_loaded(os.path.basename(tmp))
                     self.status_label.config(text=f'Loaded: {self._loaded_playlist_name_from_spotify} ({n} tracks)')
                     self._stop_indeterminate(); self._set_controls(True)
@@ -522,6 +563,7 @@ class Music2MP3GUI:
                     tmp, name, n = payload
                     self.csv_path = tmp
                     self._loaded_playlist_name_from_spotify = name or "SoundCloud"
+                    self._loaded_source_info = {"type": "soundcloud", "url": url, "name": self._loaded_playlist_name_from_spotify}
                     self._style_drop_loaded(os.path.basename(tmp))
                     self.status_label.config(text=f'Loaded SoundCloud: {self._loaded_playlist_name_from_spotify} ({n} tracks)')
                     self._stop_indeterminate(); self._set_controls(True)
@@ -568,6 +610,7 @@ class Music2MP3GUI:
 
         self.csv_path = tmp
         self._loaded_playlist_name_from_spotify = "ManualList"
+        self._loaded_source_info = {"type": "manual", "url": "", "name": "ManualList"}
         self._style_drop_loaded(os.path.basename(tmp))
         self.status_label.config(text=f'Loaded text list ({len(rows)} tracks)')
         self.update_convert_button_state()
@@ -580,11 +623,7 @@ class Music2MP3GUI:
     def browse_csv(self, _=None):
         path = filedialog.askopenfilename(initialdir=self.last_directory, filetypes=[('CSV files','*.csv')])
         if path:
-            self.csv_path = path; self.last_directory = os.path.dirname(path)
-            self._style_drop_loaded(os.path.basename(path))
-            self.status_label.config(text='CSV loaded.')
-            self._loaded_playlist_name_from_spotify = None
-            self.update_convert_button_state()
+            self._load_csv_path(path)
 
     def clear_selection(self):
         self.csv_path = None
@@ -593,6 +632,7 @@ class Music2MP3GUI:
         self.status_label.config(text='Status: Waiting…')
         self.progress['value'] = 0
         self._loaded_playlist_name_from_spotify = None
+        self._loaded_source_info = None
         self._clear_track_list()
         self.info_label.config(text='')
         self.time_label.config(text='')
@@ -632,6 +672,7 @@ class Music2MP3GUI:
         self.config['prefix_numbers']        = bool(self.prefix_numbers_var.get())
         self.config['deep_search']           = bool(self.deep_search_var.get())
         self.config['strict_match']          = bool(self.strict_match_var.get())
+        self.config['safe_search']           = bool(self.safe_search_var.get())
         mode = self._current_output_mode()
         fmt = str(self.output_format_var.get()).lower() or "mp3"
         self.config['output_mode']           = mode
@@ -676,7 +717,8 @@ class Music2MP3GUI:
                 )
                 self._conv_obj = conv
                 playlist_hint = getattr(self, '_loaded_playlist_name_from_spotify', None)
-                out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint)
+                source_info = getattr(self, '_loaded_source_info', None)
+                out_dir = conv.convert_from_csv(self.csv_path, self.output_folder, playlist_hint, source_info=source_info)
                 log.info("BG: Converter finished -> out_dir=%s", out_dir)
                 self._conv_q.put(('done', out_dir))
             except Exception as e:
@@ -941,7 +983,7 @@ class Music2MP3GUI:
                   self.open_folder_btn, self.sc_load_btn, self.sc_entry,
                   self.thread_spin, getattr(self, "manual_load_btn", None),
                   getattr(self, "manual_text", None), getattr(self, "output_mode_combo", None),
-                  getattr(self, "strict_match_chk", None)):
+                  getattr(self, "strict_match_chk", None), getattr(self, "safe_search_chk", None)):
             try: w.config(state=state)
             except Exception: pass
         try:

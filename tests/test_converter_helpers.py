@@ -1,6 +1,12 @@
 import unittest
+import csv
+import json
+import tempfile
+import time
+from pathlib import Path
 
 from converter import Converter, _looks_instrumental, _sanitize_filename
+from library_manifest import MANIFEST_FILENAME
 
 
 class ConverterHelpersTests(unittest.TestCase):
@@ -100,6 +106,137 @@ class ConverterHelpersTests(unittest.TestCase):
             "url": "https://youtu.be/bad",
         }
         self.assertGreater(conv._score_match_candidate(track, good), conv._score_match_candidate(track, bad))
+
+    def test_match_scoring_rewards_title_coverage_and_topic_channel(self):
+        conv = Converter(config={"strict_match": True})
+        track = {"title": "One More Time", "artists": "Daft Punk", "duration_ms": 320000}
+        official = {
+            "title": "Daft Punk - One More Time",
+            "channel": "Daft Punk - Topic",
+            "duration_s": 321,
+        }
+        weak = {
+            "title": "One More Time lyrics playlist",
+            "channel": "random uploader",
+            "duration_s": 321,
+        }
+
+        self.assertGreater(conv._score_match_candidate(track, official), conv._score_match_candidate(track, weak))
+
+    def test_duration_guard_rejects_hour_long_candidate_without_source_duration(self):
+        conv = Converter(config={"safe_search": True, "duration_min": 30, "duration_max": 600})
+
+        self.assertFalse(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist"},
+            {"title": "Artist - Track full set", "duration_s": 3600},
+        ))
+        self.assertTrue(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist"},
+            {"title": "Artist - Track", "duration_s": 240},
+        ))
+
+    def test_duration_guard_rejects_candidate_far_longer_than_spotify_duration(self):
+        conv = Converter(config={"safe_search": True})
+
+        self.assertFalse(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000},
+            {"title": "Artist - Track full set", "duration_s": 3600},
+        ))
+        self.assertTrue(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000},
+            {"title": "Artist - Track", "duration_s": 185},
+        ))
+
+    def test_pick_best_youtube_match_skips_long_set_candidate(self):
+        class FakeSearchConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [
+                    {
+                        "title": "Artist - Track full set",
+                        "channel": "Artist",
+                        "duration_s": 3600,
+                        "url": "https://youtu.be/long",
+                    },
+                    {
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/short",
+                    },
+                ]
+
+        conv = FakeSearchConverter(config={"safe_search": True, "duration_max": 600})
+        best = conv._pick_best_youtube_match({"title": "Track", "artists": "Artist", "duration_ms": 180000})
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["url"], "https://youtu.be/short")
+
+    def test_soundcloud_set_url_is_not_treated_as_single_track(self):
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets/demo"))
+        self.assertFalse(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/track"))
+
+    def test_m3u_is_written_in_playlist_order_even_when_workers_finish_out_of_order(self):
+        class OutOfOrderConverter(Converter):
+            def _process_one(self, idx, _track, _dest_path, _out_dir, base_name):
+                if idx == 1:
+                    time.sleep(0.03)
+                with self._made_files_lock:
+                    self._made_files.append((idx, f"{base_name}.mp3"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"])
+                writer.writeheader()
+                writer.writerow({"Track Name": "One", "Artist Name(s)": "", "Album Name": "", "Duration (ms)": ""})
+                writer.writerow({"Track Name": "Two", "Artist Name(s)": "", "Album Name": "", "Duration (ms)": ""})
+
+            conv = OutOfOrderConverter(config={"generate_m3u": True, "concurrency": 2})
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(out_dir), "Demo"))
+
+            self.assertEqual((result_dir / "playlist.m3u8").read_text(encoding="utf-8").splitlines(), [
+                "One.mp3",
+                "Two.mp3",
+            ])
+
+    def test_convert_writes_playlist_manifest_with_source_info(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL", "Track URI"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "Album",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://www.youtube.com/watch?v=test",
+                    "Track URI": "",
+                })
+
+            conv = NoDownloadConverter(config={"safe_search": True, "generate_m3u": False})
+            result_dir = Path(conv.convert_from_csv(
+                str(csv_path),
+                str(out_dir),
+                "Demo",
+                source_info={"type": "spotify", "url": "https://open.spotify.com/playlist/demo", "name": "Demo"},
+            ))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["playlist_name"], "Demo")
+            self.assertEqual(manifest["source"]["type"], "spotify")
+            self.assertEqual(manifest["track_count"], 1)
+            self.assertEqual(manifest["tracks"][0]["status"], "done")
+            self.assertEqual(manifest["tracks"][0]["file"], "Artist - Track.mp3")
 
 
 if __name__ == "__main__":

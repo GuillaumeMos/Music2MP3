@@ -48,6 +48,8 @@ _DEFAULT = {
     "output_mode": "manual",
     # Try multiple YouTube candidates and only keep confident matches.
     "strict_match": False,
+    # Guard against long mixes/sets when searching YouTube.
+    "safe_search": True,
     # New unified output format (mp3, m4a, aac, wav, flac, aiff)
     "output_format": "mp3",
     # Remember last manual selection even when output_mode is "auto".

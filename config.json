@@ -9,6 +9,7 @@
   "exclude_instrumentals": false,
   "concurrency": 6,
   "deep_search": true,
+  "safe_search": true,
   "incremental_update": true,
   "prefix_numbers": false
 }

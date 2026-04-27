@@ -29,7 +29,7 @@ Application desktop Tkinter qui:
   - utilitaires UI/tooltips, ouverture dossiers/fichiers, wrappers subprocess.
 - `logging_setup.py`, `log_viewer.py`
   - logging fichier/stdout + viewer live dans l’app.
-- `Music2MP3-*.spec`
+- `packaging/Music2MP3-*.spec`
   - packaging Windows/macOS/Linux.
 
 ### Keep but refactor soon
@@ -51,7 +51,7 @@ Application desktop Tkinter qui:
   - prévu pour persistance refresh token, mais jamais branché dans `gui.py`.
 - `utils_net.py`
   - non utilisé (duplicata partiel du retry de `spotify_api.py`).
-- `ui_preview.py`
+- `devtools/ui_preview.py`
   - utile seulement pour preview dev (à garder en outil interne ou déplacer dans dossier `devtools/`).
 
 ## 3) Gaps and inconsistencies (important)
@@ -155,5 +155,4 @@ Supprimer après validation finale:
 - `artwork.py` (si pas de plan d’embed cover en roadmap)
 
 Garder comme devtool:
-- `ui_preview.py` (déplacer dans `devtools/` + noter usage)
-
+- `devtools/ui_preview.py`

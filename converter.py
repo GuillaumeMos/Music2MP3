@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence, List
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from difflib import SequenceMatcher
+from library_manifest import build_manifest, read_manifest, write_manifest
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,28 @@ _BAD_VARIANTS = {
     "reverb",
     "instrumental",
     "cover",
+}
+
+_BAD_CONTEXTS = {
+    "1 hour",
+    "2 hour",
+    "album complet",
+    "boiler room",
+    "compilation",
+    "continuous mix",
+    "dj set",
+    "full album",
+    "full concert",
+    "full mix",
+    "full set",
+    "hour mix",
+    "live set",
+    "playlist",
+    "reaction",
+    "set complet",
+    "tutorial",
+    "how to play",
+    "lyrics",
 }
 
 
@@ -133,6 +156,9 @@ class Converter:
         self.output_format: str = self._resolve_output_format(self.config)
         self.strict_match: bool = bool(self.config.get("strict_match", False))
         self.match_candidates: int = max(3, min(15, int(self.config.get("match_candidates", 8))))
+        self.safe_search: bool = bool(self.config.get("safe_search", True))
+        self.duration_min: int = max(0, int(self.config.get("duration_min", 30)))
+        self.duration_max: int = max(self.duration_min or 1, int(self.config.get("duration_max", 600)))
         self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
         self.exclude_instr: bool = bool(self.config.get("exclude_instrumentals", False))
         self.incremental: bool = bool(self.config.get("incremental_update", True))
@@ -143,11 +169,19 @@ class Converter:
         # pour la M3U
         self._made_files_lock = threading.Lock()
         self._made_files: List[tuple[int, str]] = []
+        self._manifest_lock = threading.Lock()
+        self._manifest_entries: list[dict] = []
         self._fmt_entry = _FORMAT_MAP[self.output_format] if not self.auto_best else None
 
     # ------------------------------ public API ------------------------------
 
-    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: Optional[str] = None) -> str:
+    def convert_from_csv(
+        self,
+        csv_path: str,
+        output_folder: str,
+        playlist_hint: Optional[str] = None,
+        source_info: Optional[dict] = None,
+    ) -> str:
         """
         Lit un CSV (colonnes: Track Name, Artist Name(s), Album Name, Duration (ms), [Source URL], [Track URI])
         et télécharge les pistes via yt-dlp, en parallèle jusqu’à self.concurrency.
@@ -213,6 +247,8 @@ class Converter:
             except Exception:
                 log.exception("CONV: failed generating M3U")
 
+        self._write_playlist_manifest(out_dir, playlist_hint, source_info)
+
         return str(out_dir)
 
     # ------------------------------ per-track worker ------------------------------
@@ -235,6 +271,7 @@ class Converter:
                 fmt_existing = self._format_label_from_path(existing)
                 self.item_cb("init", {"idx": idx, "title": pretty_title, "format": fmt_existing})
                 self.item_cb("done", {"idx": idx, "format": fmt_existing})
+                self._record_manifest_entry(idx, t, "skipped", existing.name, fmt_existing)
                 with self._made_files_lock:
                     self._made_files.append((idx, existing.name))
                 return
@@ -254,6 +291,7 @@ class Converter:
         if (not self.auto_best) and self.incremental and dest_final.exists() and dest_final.stat().st_size > 0:
             log.info("CONV: skip existing (%s)", dest_final.name)
             self.item_cb("done", {"idx": idx, "format": self.output_format.upper()})
+            self._record_manifest_entry(idx, t, "skipped", dest_final.name, self.output_format.upper())
             with self._made_files_lock:
                 self._made_files.append((idx, dest_final.name))
             return
@@ -261,27 +299,50 @@ class Converter:
         # Construire l’URL et la commande
         url = t.get("source_url") or t.get("track_uri")
         if not url:
-            if self.strict_match:
+            if self.safe_search or self.strict_match:
                 self.status_cb(f"Matching best source for {pretty_title}…")
                 best = self._pick_best_youtube_match(t)
                 if not best:
+                    if self.strict_match or self.safe_search:
+                        self.item_cb(
+                            "error",
+                            {
+                                "idx": idx,
+                                "message": (
+                                    f"No safe YouTube match found for: {pretty_title}. "
+                                    "Try adding artist/title details or disable Safe search."
+                                ),
+                            },
+                        )
+                        self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "No safe YouTube match found")
+                        return
+                    url = self._build_search_query(t)
+                else:
+                    url = best["url"]
                     self.item_cb(
-                        "error",
-                        {"idx": idx, "message": f"No confident YouTube match found for: {pretty_title}"},
+                        "match",
+                        {
+                            "idx": idx,
+                            "title": best.get("title", ""),
+                            "channel": best.get("channel", ""),
+                            "score": round(float(best.get("score", 0.0)), 2),
+                        },
                     )
-                    return
-                url = best["url"]
-                self.item_cb(
-                    "match",
-                    {
-                        "idx": idx,
-                        "title": best.get("title", ""),
-                        "channel": best.get("channel", ""),
-                        "score": round(float(best.get("score", 0.0)), 2),
-                    },
-                )
             else:
                 url = self._build_search_query(t)
+        elif self._is_probable_soundcloud_set_url(url):
+            self.item_cb(
+                "error",
+                {
+                    "idx": idx,
+                    "message": (
+                        "Refusing to download a SoundCloud set/playlist URL as a single track. "
+                        "Load the SoundCloud playlist first so each track gets its own Source URL."
+                    ),
+                },
+            )
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "SoundCloud set URL used as a single track")
+            return
         cmd = self._build_ytdlp_cmd(url=url, out_path=str(dl_target), fmt_entry=fmt_entry)
 
         # Statut
@@ -309,12 +370,14 @@ class Converter:
             )
             log.error("CONV: %s", msg)
             self.item_cb("error", {"idx": idx, "message": msg})
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), msg)
             return
 
         if code != 0:
             msg = f"yt-dlp failed with code {code} for: {pretty_title}"
             log.error("CONV: %s", msg)
             self.item_cb("error", {"idx": idx, "message": msg})
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), msg)
             return
 
         if needs_aiff:
@@ -323,6 +386,7 @@ class Converter:
             except Exception as e:
                 log.exception("CONV: failed to convert WAV to AIFF")
                 self.item_cb("error", {"idx": idx, "message": f"AIFF conversion failed: {e}"})
+                self._record_manifest_entry(idx, t, "failed", None, self.output_format.upper(), f"AIFF conversion failed: {e}")
                 return
             try:
                 if Path(dl_target).exists():
@@ -335,11 +399,15 @@ class Converter:
             fmt_final = self._format_label_from_path(produced) if produced is not None else "AUTO"
             self.item_cb("done", {"idx": idx, "format": fmt_final})
             if produced is not None:
+                self._record_manifest_entry(idx, t, "done", produced.name, fmt_final)
                 with self._made_files_lock:
                     self._made_files.append((idx, produced.name))
+            else:
+                self._record_manifest_entry(idx, t, "done", None, fmt_final)
             return
 
         self.item_cb("done", {"idx": idx, "format": self.output_format.upper()})
+        self._record_manifest_entry(idx, t, "done", dest_final.name, self.output_format.upper())
         with self._made_files_lock:
             self._made_files.append((idx, dest_final.name))
 
@@ -365,6 +433,82 @@ class Converter:
         if (cfg.get("output_format") or "").strip().lower() == "auto":
             return "auto"
         return "manual"
+
+    def _manifest_settings(self) -> dict:
+        keys = [
+            "prefix_numbers",
+            "deep_search",
+            "safe_search",
+            "strict_match",
+            "match_candidates",
+            "output_mode",
+            "output_format",
+            "output_format_manual",
+            "generate_m3u",
+            "exclude_instrumentals",
+            "incremental_update",
+            "concurrency",
+            "duration_min",
+            "duration_max",
+        ]
+        return {key: self.config.get(key) for key in keys if key in self.config}
+
+    def _record_manifest_entry(
+        self,
+        idx: int,
+        t: dict,
+        status: str,
+        file_name: str | None,
+        fmt: str | None,
+        error: str | None = None,
+    ) -> None:
+        entry = {
+            "idx": idx,
+            "title": t.get("title") or "",
+            "artists": t.get("artists") or "",
+            "album": t.get("album") or "",
+            "duration_ms": t.get("duration_ms"),
+            "source_url": t.get("source_url") or "",
+            "track_uri": t.get("track_uri") or "",
+            "file": file_name or "",
+            "status": status,
+            "format": fmt or "",
+        }
+        if error:
+            entry["error"] = error
+        with self._manifest_lock:
+            self._manifest_entries = [e for e in self._manifest_entries if e.get("idx") != idx]
+            self._manifest_entries.append(entry)
+
+    def _write_playlist_manifest(
+        self,
+        out_dir: Path,
+        playlist_hint: Optional[str],
+        source_info: Optional[dict],
+    ) -> None:
+        try:
+            source = source_info if isinstance(source_info, dict) else {}
+            playlist_name = (
+                source.get("name")
+                or playlist_hint
+                or out_dir.name
+                or "Music2MP3"
+            )
+            with self._manifest_lock:
+                tracks = sorted((dict(e) for e in self._manifest_entries), key=lambda e: int(e.get("idx") or 0))
+            previous = read_manifest(out_dir)
+            manifest = build_manifest(
+                playlist_name=str(playlist_name),
+                playlist_dir=out_dir,
+                source=source,
+                settings=self._manifest_settings(),
+                tracks=tracks,
+                previous_manifest=previous,
+            )
+            path = write_manifest(out_dir, manifest)
+            log.info("CONV: manifest generated: %s", path)
+        except Exception:
+            log.exception("CONV: failed generating playlist manifest")
 
     def _list_matching_audio_files(self, out_dir: Path, base_name: str) -> list[Path]:
         files = [p for p in out_dir.glob(f"{base_name}.*") if p.is_file()]
@@ -408,6 +552,14 @@ class Converter:
         best: dict | None = None
         best_score = -1.0
         for cand in candidates:
+            if not self._is_acceptable_candidate_duration(t, cand):
+                log.info(
+                    "CONV: reject candidate by duration: title=%r duration=%r track=%r",
+                    cand.get("title"),
+                    cand.get("duration_s"),
+                    t.get("title"),
+                )
+                continue
             score = self._score_match_candidate(t, cand)
             if score > best_score:
                 best_score = score
@@ -416,9 +568,35 @@ class Converter:
 
         if not best:
             return None
-        if best_score < 0.58:
+        min_score = 0.58 if self.strict_match else 0.42
+        if best_score < min_score:
             return None
         return best
+
+    def _is_acceptable_candidate_duration(self, t: dict, cand: dict) -> bool:
+        cand_s = cand.get("duration_s")
+        if not isinstance(cand_s, int) or cand_s <= 0:
+            return True
+
+        src_ms = t.get("duration_ms")
+        if isinstance(src_ms, int) and src_ms > 0:
+            src_s = src_ms / 1000.0
+            if cand_s > max(src_s + 75, src_s * 1.45):
+                return False
+            if cand_s < max(10, src_s * 0.45):
+                return False
+            return True
+
+        if self.duration_min and cand_s < self.duration_min:
+            return False
+        if self.duration_max and cand_s > self.duration_max:
+            return False
+        return True
+
+    @staticmethod
+    def _is_probable_soundcloud_set_url(url: str) -> bool:
+        low = (url or "").lower()
+        return "soundcloud.com" in low and ("/sets/" in low or "/playlists/" in low)
 
     def _search_youtube_candidates(self, query: str, limit: int) -> list[dict]:
         if self.cancel_event.is_set():
@@ -500,6 +678,10 @@ class Converter:
         cand_hay = f"{cand_title} {cand_channel}".strip()
 
         title_ratio = SequenceMatcher(None, src_title, cand_title).ratio() if src_title and cand_title else 0.0
+        title_tokens = [tk for tk in src_title.split() if len(tk) > 1]
+        title_coverage = 0.0
+        if title_tokens and cand_title:
+            title_coverage = sum(1 for tk in title_tokens if tk in cand_title) / len(title_tokens)
 
         artist_score = 0.0
         if src_primary_artist:
@@ -535,9 +717,25 @@ class Converter:
         cand_low = cand_title_raw.lower()
         for bad in _BAD_VARIANTS:
             if bad in cand_low and bad not in src_raw_title:
-                penalties += 0.08
+                penalties += 0.11
+        for bad in _BAD_CONTEXTS:
+            if bad in cand_low:
+                penalties += 0.07
 
-        score = (0.58 * title_ratio) + (0.27 * artist_score) + (0.20 * duration_score) - penalties
+        bonus = 0.0
+        if title_coverage >= 0.95 and artist_score >= 0.8:
+            bonus += 0.08
+        if "topic" in cand_channel.lower() and artist_score >= 0.8:
+            bonus += 0.03
+
+        score = (
+            (0.43 * title_ratio)
+            + (0.20 * title_coverage)
+            + (0.25 * artist_score)
+            + (0.18 * duration_score)
+            + bonus
+            - penalties
+        )
         return max(0.0, min(1.0, score))
 
     def _rows_to_jobs(self, rows: list[dict]) -> list[dict]:
