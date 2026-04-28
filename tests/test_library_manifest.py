@@ -68,6 +68,46 @@ class LibraryManifestTests(unittest.TestCase):
             self.assertEqual(found[0]["source"]["type"], "legacy")
             self.assertTrue(found[0]["_legacy"])
 
+    def test_scan_library_finds_nested_legacy_audio_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "crate" / "Nested Playlist"
+            nested.mkdir(parents=True)
+            (nested / "Track.flac").write_bytes(b"audio")
+
+            found = scan_library(root)
+
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["playlist_name"], "Nested Playlist")
+            self.assertEqual(found[0]["track_count"], 1)
+
+    def test_scan_library_dedupes_same_source_url_and_keeps_largest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            small_dir = root / "tech pepite"
+            large_dir = root / "tech pépite"
+            source = {"type": "spotify", "url": "https://open.spotify.com/playlist/same", "name": "tech pépite"}
+            write_manifest(small_dir, build_manifest(
+                playlist_name="tech pepite",
+                playlist_dir=small_dir,
+                source=source,
+                settings={},
+                tracks=[{"idx": 1, "title": "One"}],
+            ))
+            write_manifest(large_dir, build_manifest(
+                playlist_name="tech pépite",
+                playlist_dir=large_dir,
+                source=source,
+                settings={},
+                tracks=[{"idx": i, "title": f"Track {i}"} for i in range(1, 50)],
+            ))
+
+            found = scan_library(root)
+
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["playlist_name"], "tech pépite")
+            self.assertEqual(found[0]["track_count"], 49)
+
 
 if __name__ == "__main__":
     unittest.main()

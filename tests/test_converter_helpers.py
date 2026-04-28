@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 
 from converter import Converter, _looks_instrumental, _sanitize_filename
-from library_manifest import MANIFEST_FILENAME
+from ai_matcher import AIMatchAdvice
+from library_manifest import MANIFEST_FILENAME, build_manifest, write_manifest
 
 
 class ConverterHelpersTests(unittest.TestCase):
@@ -166,10 +167,93 @@ class ConverterHelpersTests(unittest.TestCase):
                 ]
 
         conv = FakeSearchConverter(config={"safe_search": True, "duration_max": 600})
-        best = conv._pick_best_youtube_match({"title": "Track", "artists": "Artist", "duration_ms": 180000})
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
 
         self.assertIsNotNone(best)
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
         self.assertEqual(best["url"], "https://youtu.be/short")
+
+    def test_ai_match_can_accept_gray_zone_candidate(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="accept",
+                    candidate_id=0,
+                    confidence=0.88,
+                    reason="same artist and title",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track official audio",
+                    "channel": "Artist",
+                    "duration_s": 181,
+                    "url": "https://youtu.be/ai",
+                    "fake_score": 0.35,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertEqual(best["url"], "https://youtu.be/ai")
+        self.assertEqual(best["ai_confidence"], 0.88)
+
+    def test_ai_match_retry_query_can_use_heuristic_winner(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="retry",
+                    query="Artist Track official audio",
+                    confidence=0.75,
+                    reason="try official audio query",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, query, _limit):
+                if query == "Artist Track official audio":
+                    return [{
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 180,
+                        "url": "https://youtu.be/retry",
+                        "fake_score": 0.85,
+                    }]
+                return [{
+                    "title": "Track lyrics",
+                    "channel": "random",
+                    "duration_s": 180,
+                    "url": "https://youtu.be/weak",
+                    "fake_score": 0.31,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertEqual(best["url"], "https://youtu.be/retry")
 
     def test_soundcloud_set_url_is_not_treated_as_single_track(self):
         self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets/demo"))
@@ -237,6 +321,139 @@ class ConverterHelpersTests(unittest.TestCase):
             self.assertEqual(manifest["track_count"], 1)
             self.assertEqual(manifest["tracks"][0]["status"], "done")
             self.assertEqual(manifest["tracks"][0]["file"], "Artist - Track.mp3")
+
+    def test_sync_existing_playlist_does_not_create_playlist_subfolder(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            playlist_dir = Path(tmp) / "Existing"
+            csv_path = Path(tmp) / "playlist.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://www.youtube.com/watch?v=test",
+                })
+
+            conv = NoDownloadConverter(config={
+                "safe_search": True,
+                "generate_m3u": False,
+                "sync_existing_playlist": True,
+            })
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(playlist_dir), "Renamed From Source"))
+
+            self.assertEqual(result_dir, playlist_dir)
+            self.assertFalse((playlist_dir / "Renamed From Source").exists())
+
+    def test_convert_writes_match_details_to_manifest(self):
+        class MatchedConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track",
+                    "channel": "Artist - Topic",
+                    "duration_s": 180,
+                    "url": "https://youtu.be/match",
+                }]
+
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "Album",
+                    "Duration (ms)": "180000",
+                })
+
+            conv = MatchedConverter(config={"safe_search": True, "generate_m3u": False})
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(out_dir), "Demo"))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+            match = manifest["tracks"][0]["match"]
+
+            self.assertEqual(match["url"], "https://youtu.be/match")
+            self.assertGreater(match["score"], 0.42)
+            self.assertIn("title_ratio", match["score_details"])
+
+    def test_append_to_existing_playlist_merges_manifest_and_m3u(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Existing"
+            existing_manifest = build_manifest(
+                playlist_name="Existing",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/existing", "name": "Existing"},
+                settings={"safe_search": True},
+                tracks=[{
+                    "idx": 1,
+                    "title": "Old",
+                    "artists": "Artist",
+                    "source_url": "https://soundcloud.com/user/old",
+                    "file": "Artist - Old.mp3",
+                    "status": "done",
+                    "format": "MP3",
+                }],
+            )
+            write_manifest(playlist_dir, existing_manifest)
+            (playlist_dir / "playlist.m3u8").write_text("Artist - Old.mp3\n", encoding="utf-8")
+
+            csv_path = root / "single.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "New",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://soundcloud.com/user/new",
+                })
+
+            conv = NoDownloadConverter(config={
+                "safe_search": True,
+                "generate_m3u": True,
+                "append_to_existing_playlist": True,
+            })
+            result_dir = Path(conv.convert_from_csv(
+                str(csv_path),
+                str(playlist_dir),
+                None,
+                source_info={"type": "spotify", "url": "https://open.spotify.com/playlist/existing", "name": "Existing"},
+            ))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+            self.assertEqual(result_dir, playlist_dir)
+            self.assertEqual(manifest["playlist_name"], "Existing")
+            self.assertEqual(manifest["track_count"], 2)
+            self.assertEqual([t["title"] for t in manifest["tracks"]], ["Old", "New"])
+            self.assertEqual(
+                (playlist_dir / "playlist.m3u8").read_text(encoding="utf-8").splitlines(),
+                ["Artist - Old.mp3", "Artist - New.mp3"],
+            )
 
 
 if __name__ == "__main__":

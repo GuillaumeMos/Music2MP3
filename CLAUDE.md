@@ -8,11 +8,11 @@
 
 ## 1. Le projet en 30 secondes
 
-**Music2MP3** est une app desktop Python (macOS) qui permet à un DJ d'importer ses playlists Spotify / SoundCloud / CSV, de les télécharger en MP3 propres et de les exporter au format DJ-ready (M3U + tags ID3 + filtres anti-long-sets).
+**Music2MP3** est une app desktop Python (macOS / Windows / Linux) qui permet à un DJ d'importer ses playlists Spotify / SoundCloud / CSV, de les télécharger en audio propre et de les exporter au format DJ-ready (M3U + tags ID3 + filtres anti-long-sets).
 
 **Public cible** : DJs / passionnés de musique qui veulent une bibliothèque locale propre à partir de leurs playlists streaming.
 
-**Statut** : MVP fonctionnel. Refonte UI en cours vers une identité visuelle cyberpunk.
+**Statut** : MVP fonctionnel avec UI Qt cyberpunk. L'UI Tkinter legacy (`app.py` + `gui.py`) reste présente mais n'est plus le défaut — le build par défaut cible Qt (`qt_app.py`).
 
 ---
 
@@ -21,18 +21,20 @@
 | Composant | Choix | Notes |
 |---|---|---|
 | **Langage** | Python 3.14 | Très récent — attention à la compat des libs |
-| **UI** | PySide6 (Qt6) | Pas PyQt. Licence LGPL ok pour distrib |
+| **UI active** | PySide6 (Qt6) — `qt_app.py` | Pas PyQt. Licence LGPL ok pour distrib |
+| **UI legacy** | Tkinter — `app.py` + `gui.py` | Maintenu mais non priorisé (`task run:tk`) |
 | **Download engine** | yt-dlp | Bundled dans le `.app` |
 | **Audio processing** | ffmpeg | Bundled (libmp3lame, libavcodec…) |
 | **Credentials** | keyring 25.7+ | Pour stocker les tokens Spotify |
-| **Bundle macOS** | PyInstaller + mypyc | Compilation native partielle pour perfs/protection |
-| **Format de sortie** | `.app` macOS arm64 | Single-file bundle |
+| **Build system** | Taskfile (`Taskfile.yml`) | `task run`, `task build:macos`, etc. |
+| **Bundle** | PyInstaller | macOS + Windows + Linux, specs dans `packaging/` |
+| **Formats de sortie** | mp3, m4a, aac, wav, flac, aiff | Mode "auto" = meilleure qualité disponible |
 
-### Dépendances tierces présentes dans le bundle
-- `yt-dlp` (download YouTube/SoundCloud)
-- `certifi`, `charset_normalizer` (réseau)
-- `setuptools`, `shiboken6` (Qt bindings runtime)
-- `ffmpeg` + libs (`libmp3lame`, `libavcodec`, `libx264`, `libopus`, etc.)
+### Dépendances (requirements.txt)
+- `requests>=2.31.0`
+- `tkinterdnd2>=0.3.0` (legacy Tk)
+- `keyring>=25.6.0`
+- `PySide6>=6.7.0`
 
 ### Configuration par défaut (`config.json`)
 ```json
@@ -42,15 +44,31 @@
   "duration_min": 30,
   "duration_max": 600,
   "output_format": "mp3",
+  "output_format_manual": "mp3",
+  "output_mode": "manual",
   "transcode_mp3": false,
   "generate_m3u": true,
   "exclude_instrumentals": false,
   "concurrency": 6,
   "deep_search": true,
+  "safe_search": true,
+  "strict_match": false,
+  "ai_match_enabled": false,
+  "ai_match_provider": "vertex",
+  "ai_match_model": "gemini-2.5-flash",
+  "ai_match_gray_min": 0.30,
+  "ai_match_prompt": "<prompt métier éditable depuis Settings>",
   "incremental_update": true,
   "prefix_numbers": false
 }
 ```
+
+**Champs clés :**
+- `output_mode` : `"auto"` (yt-dlp choisit la meilleure source) ou `"manual"` (force `output_format_manual`)
+- `safe_search` : filtre les variantes indésirables (live, remix, nightcore…) — actif par défaut
+- `strict_match` : seuil de score plus élevé (0.58 vs 0.42) avant d'accepter un résultat
+- `ai_match_enabled` : active l'aide Google/Vertex sur les scores gris uniquement; clé API stockée dans le keychain depuis Settings, jamais dans `config.json`
+- `ai_match_prompt` : consignes métier passées à Gemini pour juger accept/reject/retry sur les candidats gray-zone
 
 ### ⚠️ Sécurité — points d'attention
 
@@ -139,115 +157,100 @@ Style "CLI" : `[x] flag_name` (activé) / `[ ] flag_name` (désactivé), en UPPE
 └──────────────┴─────────────────────────────────────────┘
 ```
 
-### Composants principaux à créer/maintenir
+### Composants implémentés dans `qt_app.py` (état actuel)
 
-- **`MainWindow`** (`QMainWindow`) — conteneur principal, applique le QSS global
-- **`Sidebar`** (`QWidget`, 240px fixe) — navigation et sources
-- **`AddSourceGrid`** — 4 cartes cliquables (Spotify / SoundCloud / CSV / Local scan) qui ouvrent une `AddSourceDialog`
-- **`PlaylistList`** — liste verticale de `PlaylistItem` avec artwork généré
-- **`PlaylistArtwork`** (`QWidget` custom) — `paintEvent` qui peint un `QLinearGradient` dont les 2 couleurs sont dérivées d'un `hashlib.md5(playlist.name)` → vibrancy stable et reproductible
-- **`HeroHeader`** — `paintEvent` custom : gradient principal + grid pattern + 2 orbes radiaux
-- **`GlowButton`** — `QPushButton` avec `QGraphicsDropShadowEffect` magenta
-- **`OptionPill`** — `QPushButton` checkable, style `[x]`/`[ ]` selon état
-- **`TrackTable`** — `QTableView` + modèle custom + delegate pour les badges de match score colorés
-- **`NeonProgressBar`** — `QProgressBar` avec QSS gradient magenta→cyan
-- **`AddSourceDialog`** (`QDialog`) — modal qui apparaît au click sur une source, contient le QLineEdit pour l'URL et un bouton "Load"
+Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~2010 lignes). Les classes clés :
 
-### Structure de fichiers recommandée
+- **`QtMusic2MP3Window`** (`QMainWindow`) — conteneur principal, QSS global inline (`APP_QSS`)
+- **`ArtworkWidget`** (`QWidget`) — `paintEvent` avec `QLinearGradient` dérivé du nom via `hashlib.md5`
+- **`PlaylistItemWidget`** (`QFrame`) — item sidebar, méthode `setSelected()`
+- **`HeroWidget`** (`QFrame`) — `paintEvent` custom : gradient + grid 32×32 + orbes radiaux
+- **`ConverterWorker`** (`QObject`) — worker Qt pour la conversion, signaux `status/item/done/failed/finished`
+- **`PlaylistLoadWorker`** (`QObject`) — worker pour le fetch Spotify/SoundCloud
+- **`AddSourceDialog`** (`QDialog`) — modal URL pour Spotify / SoundCloud
+- **`SettingsDialog`** (`QDialog`) — panneau de configuration
+- **`VisibleCheckStyle`** (`QProxyStyle`) — style custom pour les checkboxes
+
+### Structure de fichiers actuelle (plate, à la racine)
 
 ```
-music2mp3/
-├── __main__.py                 # entry point
+Music2MP3/
+├── qt_app.py               # UI Qt principale (monolithe ~2010 lignes)
+├── app.py                  # entry point UI Tk (legacy)
+├── gui.py                  # UI Tkinter (~1085 lignes, legacy)
+├── converter.py            # logique download + matching (~972 lignes)
+├── spotify_api.py          # client Spotify API REST
+├── spotify_auth.py         # OAuth PKCE flow
+├── soundcloud_api.py       # client SoundCloud via yt-dlp
+├── library_manifest.py     # scan + manifest JSON de la bibliothèque locale
+├── token_store.py          # wrapper keyring
+├── config.py               # chargement/sauvegarde config.json
+├── logging_setup.py        # configuration du logging
+├── log_viewer.py           # widget live log (Tk, utilisé par legacy)
+├── utils.py                # utilitaires divers
+├── config.json             # config utilisateur
+├── requirements.txt        # dépendances Python
+├── Taskfile.yml            # build system (task run, task build:macos…)
+├── packaging/              # specs PyInstaller (Qt + Tk × macOS/Windows/Linux)
+│   ├── Music2MP3-Qt-macOS.spec
+│   ├── Music2MP3-Qt-Windows.spec
+│   ├── Music2MP3-Qt-Linux.spec
+│   ├── Music2MP3-macOS.spec  (Tk legacy)
+│   ├── Music2MP3-Windows.spec
+│   └── Music2MP3-Linux.spec
+├── devtools/
+│   └── ui_preview.py       # outil de preview UI hors app
+├── tests/
+│   ├── test_converter_helpers.py
+│   ├── test_library_manifest.py
+│   ├── test_soundcloud_api.py
+│   ├── test_spotify_api.py
+│   └── test_spotify_auth.py
+├── icon.icns / icon.ico / icon.png
+└── docs/
+```
+
+### Structure cible (refactoring futur de qt_app.py)
+
+Si `qt_app.py` est découpé en modules, respecter cette organisation :
+
+```
+ui/
 ├── main_window.py
-├── ui/
-│   ├── sidebar.py
-│   ├── hero_header.py
-│   ├── track_table.py
-│   ├── widgets/
-│   │   ├── playlist_artwork.py
-│   │   ├── glow_button.py
-│   │   ├── option_pill.py
-│   │   └── neon_progress.py
-│   └── dialogs/
-│       └── add_source.py
-├── core/                       # logique métier
-│   ├── sources/
-│   │   ├── spotify.py          # spotipy + OAuth PKCE
-│   │   ├── soundcloud.py
-│   │   ├── csv_source.py
-│   │   └── local_scan.py
-│   ├── downloader.py           # wrapper yt-dlp
-│   ├── library.py              # gestion bibliothèque locale
-│   ├── matching.py             # algo de match score
-│   └── m3u.py                  # génération M3U
-├── models/                     # dataclasses
-│   ├── playlist.py
-│   ├── track.py
-│   └── status.py               # enum DownloadStatus
-├── styles/
-│   ├── theme.qss               # QSS global
-│   └── colors.py               # constantes Python des couleurs
-├── resources/
-│   ├── icons/
-│   └── icon.icns
-├── config.json                 # config par défaut
-├── pyproject.toml
-└── Music2MP3.spec              # PyInstaller
+├── sidebar.py
+├── hero_header.py
+├── track_table.py
+├── widgets/
+│   ├── playlist_artwork.py
+│   ├── option_pill.py
+│   └── neon_progress.py
+└── dialogs/
+    ├── add_source.py
+    └── settings.py
 ```
+
+Le QSS global (`APP_QSS`) actuellement inline dans `qt_app.py` devrait migrer vers `styles/theme.qss` lors de ce découpage.
 
 ---
 
-## 5. Modèle de données
+## 5. Logique métier (converter.py)
 
-### Dataclasses
+### Classe `Converter`
 
-```python
-from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
-from datetime import datetime
+Gère l'ensemble du pipeline de téléchargement :
+- **Résolution du format** : `output_mode` = `"auto"` ou `"manual"` → `_resolve_output_mode()`
+- **Match scoring** : `SequenceMatcher` sur titre + artiste + durée. Seuil 0.58 si `strict_match`, 0.42 sinon
+- **AI match assist** : si `ai_match_enabled=True` et une clé Google/Gemini est configurée, Gemini tranche seulement les candidats en zone grise ou propose une requête alternative
+- **Détail score** : chaque match réussi stocke `match.score_details` dans le manifest; clic sur la colonne MATCH pour voir title/artist/duration/penalties + impact IA
+- **Safe search** : quand `safe_search=True` (défaut), filtre les variantes `_BAD_VARIANTS` (live, remix, nightcore, karaoke…)
+- **Deep search** : si score < seuil et `deep_search=True`, fallback SoundCloud
+- **Formats supportés** : mp3 / m4a / aac / wav / flac / aiff (aiff = download WAV + post-conversion ffmpeg)
+- **Incremental** : skip les tracks déjà présents dans le manifest
+- **M3U** : généré en fin de batch si `generate_m3u=True`
 
-class DownloadStatus(Enum):
-    QUEUED = "queued"
-    DOWNLOADING = "downloading"
-    DONE = "done"
-    FAILED = "failed"
-    SKIPPED = "skipped"
+### Library manifest
 
-class Source(Enum):
-    SPOTIFY = "spotify"
-    SOUNDCLOUD = "soundcloud"
-    CSV = "csv"
-    LOCAL = "local"
-
-@dataclass
-class Track:
-    artist: str
-    title: str
-    album: str | None = None
-    duration_s: int | None = None
-    isrc: str | None = None        # International Standard Recording Code
-    spotify_id: str | None = None
-    match_score: int | None = None  # 0-100
-    status: DownloadStatus = DownloadStatus.QUEUED
-    file_path: Path | None = None
-    error: str | None = None
-
-@dataclass
-class Playlist:
-    id: str
-    name: str
-    source: Source
-    source_url: str | None
-    tracks: list[Track]
-    last_synced: datetime | None = None
-```
-
-### État applicatif
-
-- **`LibraryManager`** (singleton) — détient toutes les playlists, émet des signaux Qt à chaque changement
-- **`DownloadManager`** — gère les workers `QThread`, émet `track_status_changed`, `progress_updated`
-- **L'UI ne stocke jamais d'état métier**, elle s'abonne aux signaux
+`library_manifest.py` gère un fichier `music2mp3.manifest.json` par dossier de playlist, qui permet l'update incrémental. Le scan est récursif, trouve les dossiers audio legacy, et déduplique les manifests qui partagent la même source URL en gardant la playlist la plus complète.
 
 ---
 
@@ -255,42 +258,32 @@ class Playlist:
 
 ### Au démarrage
 1. Charger `config.json` (créer avec defaults si absent)
-2. Scanner le `root_dir` configuré (si défini) pour reconstruire la library locale
+2. Scanner le `root_dir` configuré (si défini) pour reconstruire la library locale via `scan_library()`
 3. Afficher la sidebar avec les playlists trouvées
 
 ### Quand l'utilisateur clique "Add from Spotify"
 1. Ouvrir `AddSourceDialog` avec un champ URL
 2. Au submit, valider l'URL (regex `open.spotify.com/playlist/...`)
-3. Si pas de token Spotify en cache : lancer le flow OAuth PKCE
-4. Fetcher la playlist via spotipy
-5. Créer un objet `Playlist`, l'ajouter à la library, l'afficher dans la sidebar
+3. Si pas de token Spotify en cache : lancer le flow OAuth PKCE (port local 8765)
+4. Fetcher la playlist via `SpotifyClient`
+5. Écrire un CSV temporaire, l'ajouter à la sidebar
 6. La sélectionner automatiquement
 
-### Quand l'utilisateur sélectionne une playlist
-1. Le `HeroHeader` se met à jour avec un gradient dérivé de l'artwork de la playlist (mêmes 2 couleurs)
-2. La `TrackTable` se peuple avec les tracks
-3. Le bouton Convert affiche `Convert · N`
-4. Si la playlist a déjà été partiellement téléchargée (incremental), les tracks Done s'affichent direct avec leur badge vert mint
-
 ### Quand l'utilisateur clique Convert
-1. Le bouton se transforme en "Pause" (gradient cyan→magenta inversé)
-2. La `FooterProgress` apparaît / s'active
-3. Le `DownloadManager` lance N workers (`concurrency` de la config, default 6)
-4. Pour chaque track :
-   - **Recherche** : query yt-dlp avec `f"ytsearch:{artist} {title}"`
-   - **Filtre durée** : skip si durée hors [`duration_min`, `duration_max`] (anti-long-sets)
-   - **Filtre instrumental** : si `exclude_instrumentals=true`, skip si "instrumental" dans le titre
-   - **Score de match** : pondération sur titre, artiste, durée (algo dans `core/matching.py`)
-   - **Deep search** : si `deep_search=true` et premier résultat < 70% de match, essayer SoundCloud en fallback
-   - **Download** : yt-dlp avec post-processor mp3 320kbps
-   - **Tag ID3** : mutagen — title, artist, album, track number si `prefix_numbers`
-   - **Status** : émettre signal pour mettre à jour l'UI
-5. Une fois fini, si `generate_m3u=true` : créer le `.m3u8` dans le root dir
+1. `ConverterWorker` lancé dans un `QThread`
+2. La `FooterProgress` s'active
+3. Pour chaque track :
+   - Filtre durée hors `[duration_min, duration_max]` (anti-long-sets)
+   - Filtre variantes si `safe_search=True`
+   - Score de match (SequenceMatcher)
+   - Deep search SoundCloud si score insuffisant
+   - Download yt-dlp + post-processing ffmpeg
+   - Signaux Qt pour update UI ligne par ligne
+4. Une fois fini : manifest mis à jour + M3U si configuré
 
 ### Stop
-- Annule immédiatement les workers (pas de "soft stop")
-- Les tracks `DOWNLOADING` repassent en `QUEUED`
-- Le fichier partiel est supprimé
+- `ConverterWorker.stop()` lève un événement — annulation immédiate
+- Les tracks en cours repassent à l'état annulé dans l'UI
 
 ---
 
@@ -311,31 +304,17 @@ import PySide6  # import du package entier
 ### Threading
 
 - **Toute opération > 50ms** passe par `QThread` + worker `QObject`
-- yt-dlp est **synchrone et lent** → toujours dans un worker
-- Utiliser `QtConcurrent` ou un `QThreadPool` pour les downloads parallèles
+- yt-dlp est **synchrone et lent** → toujours dans un worker (`ConverterWorker`)
 - Communication worker → UI via signals/slots uniquement (jamais d'accès direct aux widgets depuis un thread)
-
-```python
-class DownloadWorker(QObject):
-    progress = Signal(str, int)        # track_id, percent
-    finished = Signal(str, Path)       # track_id, file_path
-    failed = Signal(str, str)          # track_id, error
-
-    @Slot(Track)
-    def download(self, track: Track) -> None:
-        ...
-```
 
 ### QSS
 
-- Tout le styling passe par `styles/theme.qss`
-- **Pas de `setStyleSheet()` inline** sauf cas exceptionnels (états dynamiques type "playlist sélectionnée")
-- Les couleurs sont **aussi** dans `styles/colors.py` pour les usages Python (`QColor`, `QLinearGradient` dans paintEvents)
-- Si tu changes une couleur, change-la dans **les deux fichiers** (sinon désynchro)
+- Le QSS global est actuellement inline dans `qt_app.py` (`APP_QSS`). Pas de `setStyleSheet()` inline sur les widgets sauf états dynamiques.
+- Les couleurs Python (pour `QColor`, `QLinearGradient` dans les `paintEvent`) sont directement dans `qt_app.py` — si on extrait un fichier `colors.py`, synchroniser les deux.
 
 ### Naming
 
-- Classes : `PascalCase` (`PlaylistArtwork`)
+- Classes : `PascalCase` (`PlaylistItemWidget`)
 - Fonctions / variables : `snake_case` (`load_playlist`)
 - Constantes : `UPPER_SNAKE` (`PRIMARY_MAGENTA`)
 - Signals : `verb_noun` (`playlist_selected`, `download_finished`)
@@ -344,66 +323,80 @@ class DownloadWorker(QObject):
 ### Logging
 
 - **Pas de `print()`** en prod — utiliser `logging`
-- Le panel "Logs" en haut à droite affiche le `logging` handler en temps réel
+- Le panel "Logs" (bouton dans la TopBar) affiche le logging en temps réel
 - Niveaux : `DEBUG` pour le détail, `INFO` pour les events utilisateur, `WARNING` pour les retry, `ERROR` pour les échecs
-- Activer `DEBUG` via `MUSIC2MP3_DEBUG=1`
+- Activer `DEBUG` via `APP_LOG_LEVEL=DEBUG`
 
 ---
 
 ## 8. Build & distribution
 
-### Dev local
+### Dev local (Taskfile)
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-python -m music2mp3
+# Installation
+task install         # crée .venv + installe requirements.txt
+
+# Lancement
+task run:qt          # UI Qt (défaut recommandé)
+task run:tk          # UI Tkinter (legacy)
+
+# Tests
+task test            # unittest discover -s tests
+
+# Vérification syntaxe
+task compile
 ```
 
-### Build macOS (.app)
+### Build par plateforme
 ```bash
-pyinstaller Music2MP3.spec
-# génère dist/Music2MP3.app
+task build:macos     # → dist/Music2MP3.app  (Qt, nécessite ffmpeg + yt-dlp locaux)
+task build:windows   # → dist/Music2MP3.exe  (Qt)
+task build:linux     # → dist/Music2MP3      (Qt)
+
+# Builds Tk legacy
+task build:macos:tk
+task build:windows:tk
+task build:linux:tk
 ```
 
-Le `.spec` doit inclure :
-- `--windowed` (pas de console)
-- Bundle de `ffmpeg` dans `Frameworks/`
-- Bundle de yt-dlp + ses dépendances
-- Icon `.icns`
-- `Info.plist` avec `NSHighResolutionCapable=true`
+Les specs PyInstaller sont dans `packaging/`. Chaque plateforme a une variante Qt et une variante Tk.
 
-### Compilation mypyc (optionnel)
-
-Pour la prod, compilation des modules `core/` avec mypyc → speedup + protection light du code.
-**Ne pas** mypyc-compiler les modules UI (incompatibilités fréquentes avec Qt).
-
+### macOS : outils requis avant build
 ```bash
-mypyc music2mp3/core/
+task tools:install:macos   # brew install ffmpeg yt-dlp python-tk@3.14
+```
+
+### Signing + notarization macOS
+```bash
+export MACOS_SIGN_IDENTITY="Developer ID Application: ..."
+task sign:macos      # codesign
+
+export APPLE_ID=... APPLE_TEAM_ID=... APPLE_APP_PASSWORD=...
+task notarize:macos  # notarytool + staple
 ```
 
 ---
 
 ## 9. Anti-patterns à éviter
 
-- **Pas** de vert Spotify (`#1DB954`) ailleurs que sur le petit dot indiquant "source = Spotify". C'est la marque de Spotify, pas l'identité de l'app.
+- **Pas** de vert Spotify (`#1DB954`) ailleurs que sur le petit dot indiquant "source = Spotify".
 - **Pas** de `border-radius > 8px` (sauf pills de progression ronds) — casse le feel angulaire/tech.
 - **Pas** de `#FFFFFF` blanc pur — toujours `#E8F4FF` (blanc bleuté).
 - **Pas** de `print()` pour le debug en prod — `logging` only.
-- **Pas** d'appels réseau ou yt-dlp dans le main thread — bloque l'UI et casse les animations néon.
-- **Pas** d'emojis dans l'UI — préférer des SVG icons ou caractères ASCII (`▸`, `●`, `○`, `↓`, `■`).
+- **Pas** d'appels réseau ou yt-dlp dans le main thread — bloque l'UI.
+- **Pas** d'emojis dans l'UI — préférer des caractères ASCII (`▸`, `●`, `○`, `↓`, `■`).
 - **Pas** de gradients pastel ou couleurs douces — la palette est saturée et contrastée par design.
 - **Pas** de Title Case pour les labels — soit UPPERCASE (système) soit sentence case (contenu).
 - **Pas** de tokens / secrets dans `config.json` ou les logs — `keyring` only.
 - **Pas** de PyQt5 ou PyQt6 — `PySide6` only (cohérence + licence LGPL).
-- **Pas** de mypyc sur les modules `ui/` — bugs Qt fréquents, peu de gain perf.
+- **Ne pas toucher** à `gui.py` / `app.py` (Tk legacy) pour des features Qt — les deux UIs coexistent mais évoluent séparément.
 
 ---
 
 ## 10. Quand tu n'es pas sûr
 
-- **Sur le design** : reste fidèle aux mockups et à la palette section 3. Demande validation avant d'introduire une nouvelle couleur ou un nouveau pattern.
-- **Sur l'archi** : préfère ajouter un widget custom plutôt que polluer un widget existant.
+- **Sur le design** : reste fidèle à la palette section 3. Demande validation avant d'introduire une nouvelle couleur ou un nouveau pattern.
+- **Sur l'archi** : si `qt_app.py` grossit encore, proposer un découpage en modules (voir structure cible section 4) plutôt que d'ajouter inline.
 - **Sur les perfs** : si une opération peut bloquer > 50ms, elle passe en `QThread`.
 - **Sur les libs** : ne pas ajouter de dépendance lourde sans valider — on reste sur **PySide6 + stdlib + libs métier déjà en place** (yt-dlp, mutagen, spotipy, keyring).
 - **Sur la sécu** : tout ce qui touche aux tokens / OAuth / credentials passe par `keyring`. Si tu hésites, demande.
@@ -411,25 +404,84 @@ mypyc music2mp3/core/
 
 ---
 
-## 11. Workflow de contribution
+## 11. Planning courant
+
+### Topo d'avancement
+
+| Zone | État | Notes |
+|---|---:|---|
+| Core download | ✅ Fonctionnel | yt-dlp + ffmpeg, formats manual/auto, M3U, incrémental |
+| Matching sécurisé | ✅ Fonctionnel | multi-candidats YouTube, durée, safe/strict/deep search |
+| Sources | ✅ MVP | Spotify OAuth PKCE, SoundCloud URL/secret, CSV |
+| Library locale | ✅ Avancé | manifest par playlist, scan root, sync selected, sync all |
+| UI Qt cyberpunk | ✅ Avancé | hero, sidebar, track table, settings, logs, dialogs |
+| Actions library | ✅ Avancé | rename, open folder, merge, export CSV, delete |
+| Gestion erreurs | ✅ Avancé | dialog d'erreur, meilleur candidat, retry manuel par URL |
+| Build | ✅ OK | Taskfile + PyInstaller Qt par défaut |
+| Tests | ✅ Base solide | converter, manifest, Spotify/SoundCloud/auth, smoke Qt offscreen |
+
+### Backlog terminé
+
+| Item | Statut |
+|---|---:|
+| Refonte Qt comme UI par défaut | ✅ |
+| Direction visuelle cyberpunk documentée | ✅ |
+| Safe search anti-sets longs | ✅ |
+| Manifest `music2mp3.manifest.json` | ✅ |
+| Scan bibliothèque + playlists legacy | ✅ |
+| Sync manuel + sync all | ✅ |
+| Logs panel Qt | ✅ |
+| Menu contextuel library | ✅ |
+| Retry manuel sur track en erreur | ✅ |
+| Packaging déplacé sous `packaging/` | ✅ |
+| Tests UI smoke Qt | ✅ |
+| Normalisation LF de `converter.py` | ✅ |
+| Agent IA de matching gray-zone | ✅ |
+
+### Backlog futur priorisé
+
+| Priorité | Item | Pourquoi |
+|---:|---|---|
+| P0 | Étendre smoke tests Qt | Couvrir settings, logs, source dialogs sans réseau |
+| P0 | Valider AI matching en réel | Tester avec clé Google/Gemini sur playlists difficiles |
+| P1 | Bandcamp source | Facile via yt-dlp, très pertinent DJ/électro |
+| P1 | Validation sync all | Progression, erreurs partielles, reprise après stop |
+| P2 | Refactor UI modules | `ui/main_window.py`, `sidebar.py`, `dialogs/`, `widgets/` |
+| P2 | Export Rekordbox | M3U déjà là, pousser vers workflow DJ plus complet |
+| P2 | Auto-pull planifié | À faire après sync all stable |
+| P3 | Soulseek via slskd | Puissant mais dépendance lourde à assumer |
+
+### Décision produit actuelle
+
+| Option | Verdict | Raison |
+|---|---|---|
+| Agent IA matching | ✅ MVP intégré | Google/Vertex via Settings + keychain |
+| Bandcamp | ✅ À faire ensuite | Source DJ naturelle, intégration simple via yt-dlp |
+| Soulseek/slskd | ⚠️ Plus tard | Très utile pour raretés/FLAC, mais setup lourd |
+
+---
+
+## 12. Workflow de contribution
 
 1. **Avant de coder** : relire la section concernée de ce fichier
 2. **Si tu changes l'archi ou la direction visuelle** : update ce fichier **en premier**
 3. **Commits** : préfixe le scope (`ui:`, `core:`, `build:`, `docs:`)
-4. **Tests** : pour `core/`, pytest avec mocks de yt-dlp / spotipy
-5. **Avant un build** : `python -m music2mp3` doit fonctionner en dev sans erreur
+4. **Tests** : `task test` — les tests couvrent converter, library_manifest, spotify_api, soundcloud_api, spotify_auth
+5. **Avant un build** : `task run:qt` doit fonctionner sans erreur
 
 ---
 
-## 12. Variables d'env
+## 13. Variables d'env
 
 - `SPOTIFY_CLIENT_ID` — override le Client ID du `config.json`
-- `MUSIC2MP3_DEBUG=1` — active le logging DEBUG
+- `GOOGLE_API_KEY` / `GEMINI_API_KEY` — override optionnel de la clé IA; Settings stocke sinon dans le keychain
+- `GEMINI_MODEL` / `GOOGLE_AI_MODEL` — override le modèle IA, défaut `gemini-2.5-flash`
+- `APP_LOG_LEVEL=DEBUG` — active le logging DEBUG
 - `MUSIC2MP3_CONFIG=/path/to/config.json` — utilise un autre fichier de config
 - `MUSIC2MP3_ROOT=/path/to/library` — override le root dir
 
 ---
 
 *Direction visuelle cyberpunk validée — voir `/docs/mockup-cyberpunk.png` pour la référence.*
-*Stack actuelle : Python 3.14 + PySide6 + yt-dlp + ffmpeg, build PyInstaller + mypyc.*
-*Dernière mise à jour : refonte UI v2 — sidebar avec sources, hero header, palette néon.*
+*Stack actuelle : Python 3.14 + PySide6 + yt-dlp + ffmpeg, build PyInstaller via Taskfile.*
+*Dernière mise à jour : audit complet du code réel — synchronisation archi cible vs état actuel (2026-04-28).*

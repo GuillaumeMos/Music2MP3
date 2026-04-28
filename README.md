@@ -162,6 +162,11 @@ Current repo organization:
 - **SoundCloud** usage requires **no authentication**:
   - Public playlists work out of the box.
   - Private playlists shared via **secret links** also work (the token is in the URL).
+- **AI match assist** is optional:
+  - Enable it in Settings or the `ai` pill.
+  - Paste your Google/Gemini API key in Settings; it is stored in the OS keychain, not in `config.json`.
+  - It only runs on gray-zone YouTube matches and can reject, accept, or propose a better query.
+  - The matching prompt is editable in Settings.
 - When loading from URLs, the generated CSV is **temporary**, used internally by the converter.
 
 ---
@@ -175,8 +180,10 @@ Current repo organization:
   - macOS: `~/Library/Application Support/Music2MP3/config.json`
   - Linux: `~/.music2mp3/config.json`
 - UI work is done in background threads; the app stays responsive and shows live progress.
+- Local library scan is recursive, includes legacy audio folders, and hides duplicate manifests with the same source URL.
+- Click a downloaded track's match score to inspect score details and AI impact.
 - If a track fails, try:
-  - **Safe search**, **Deep search** or **Strict matching**,
+  - **Safe search**, **Deep search**, **Strict matching**, or **AI match assist**,
   - checking the URL availability,
   - or providing a **cookies** file in `config.json` (helps with region locks, age restrictions, etc.).
 

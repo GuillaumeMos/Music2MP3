@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -102,15 +103,18 @@ def scan_library(root_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
             manifest_dirs.add(path.parent)
         playlists.append(data)
 
-    for child in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name.casefold()):
-        try:
-            resolved = child.resolve()
-        except Exception:
-            resolved = child
-        if resolved in manifest_dirs:
+    legacy_dirs = [root]
+    legacy_dirs.extend(p for p in root.rglob("*") if p.is_dir())
+    for child in sorted(legacy_dirs, key=lambda p: str(p).casefold()):
+        resolved = _resolve_path(child)
+        if _is_under_any(resolved, manifest_dirs):
             continue
-        audio_files = [p for p in child.iterdir() if p.is_file() and p.suffix.lower() in _AUDIO_EXTS]
-        m3u_files = [p for p in child.iterdir() if p.is_file() and p.suffix.lower() in {".m3u", ".m3u8"}]
+        try:
+            direct_files = [p for p in child.iterdir() if p.is_file()]
+        except Exception:
+            continue
+        audio_files = [p for p in direct_files if p.suffix.lower() in _AUDIO_EXTS]
+        m3u_files = [p for p in direct_files if p.suffix.lower() in {".m3u", ".m3u8"}]
         if not audio_files and not m3u_files:
             continue
         playlists.append({
@@ -127,8 +131,67 @@ def scan_library(root_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
             "_legacy": True,
         })
 
-    playlists.sort(key=lambda item: str(item.get("playlist_name") or "").casefold())
-    return playlists
+    return dedupe_playlists(playlists)
+
+
+def dedupe_playlists(playlists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept: dict[str, dict[str, Any]] = {}
+    no_key: list[dict[str, Any]] = []
+    for playlist in playlists:
+        key = playlist_identity(playlist)
+        if not key:
+            no_key.append(playlist)
+            continue
+        current = kept.get(key)
+        if current is None or _playlist_rank(playlist) > _playlist_rank(current):
+            kept[key] = playlist
+
+    out = list(kept.values()) + no_key
+    out.sort(key=lambda item: str(item.get("playlist_name") or "").casefold())
+    return out
+
+
+def playlist_identity(manifest: dict[str, Any]) -> str:
+    source = manifest_source(manifest)
+    source_url = source.get("url", "").strip().lower()
+    source_type = source.get("type", "").strip().lower()
+    if source_url and source_type:
+        return f"source:{source_type}:{source_url}"
+    playlist_dir = str(manifest.get("playlist_dir") or "").strip()
+    if playlist_dir:
+        return f"path:{_resolve_path(Path(playlist_dir))}"
+    name = _norm_name(str(manifest.get("playlist_name") or source.get("name") or ""))
+    return f"name:{source_type}:{name}" if name else ""
+
+
+def _playlist_rank(manifest: dict[str, Any]) -> tuple[int, int, str]:
+    has_manifest = 0 if manifest.get("_legacy") else 1
+    track_count = int(manifest.get("track_count") or len(manifest.get("tracks") or []))
+    updated_at = str(manifest.get("updated_at") or manifest.get("created_at") or "")
+    return has_manifest, track_count, updated_at
+
+
+def _resolve_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except Exception:
+        return path.expanduser()
+
+
+def _is_under_any(path: Path, parents: set[Path]) -> bool:
+    for parent in parents:
+        if path == parent:
+            return True
+        try:
+            path.relative_to(parent)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _norm_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().casefold())
 
 
 def playlist_output_parent(manifest: dict[str, Any]) -> str:

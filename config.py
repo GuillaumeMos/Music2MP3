@@ -4,6 +4,8 @@ import platform
 import sys
 from pathlib import Path
 
+from ai_matcher import DEFAULT_AI_MATCH_PROMPT
+
 
 APP_NAME = "Music2MP3"
 
@@ -50,6 +52,12 @@ _DEFAULT = {
     "strict_match": False,
     # Guard against long mixes/sets when searching YouTube.
     "safe_search": True,
+    # Optional Google/Vertex-assisted matching for gray-zone YouTube results.
+    "ai_match_enabled": False,
+    "ai_match_provider": "vertex",
+    "ai_match_model": "gemini-2.5-flash",
+    "ai_match_gray_min": 0.30,
+    "ai_match_prompt": DEFAULT_AI_MATCH_PROMPT,
     # New unified output format (mp3, m4a, aac, wav, flac, aiff)
     "output_format": "mp3",
     # Remember last manual selection even when output_mode is "auto".
