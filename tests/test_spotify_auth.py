@@ -33,6 +33,14 @@ class SpotifyAuthTests(unittest.TestCase):
         self.assertIsNone(auth._refresh_token)
         auth_mock.assert_called_once()
 
+    def test_authorize_reports_callback_port_start_failure(self):
+        from spotify_auth import PKCEAuth
+        auth = PKCEAuth(client_id="dummy", redirect_uri="http://127.0.0.1:9999/callback")
+
+        with patch("spotify_auth.HTTPServer", side_effect=OSError("address in use")):
+            with self.assertRaisesRegex(RuntimeError, "callback server could not start"):
+                auth._authorize()
+
 
 if __name__ == "__main__":
     unittest.main()

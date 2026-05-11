@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from library_manifest import (
+    IGNORE_FILENAME,
     MANIFEST_FILENAME,
     build_manifest,
     manifest_source,
@@ -80,6 +81,30 @@ class LibraryManifestTests(unittest.TestCase):
             self.assertEqual(len(found), 1)
             self.assertEqual(found[0]["playlist_name"], "Nested Playlist")
             self.assertEqual(found[0]["track_count"], 1)
+
+    def test_ignore_marker_hides_legacy_audio_folder_until_manifest_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "Removed"
+            legacy.mkdir()
+            (legacy / "Track.mp3").write_bytes(b"audio")
+            ignore_path = legacy / IGNORE_FILENAME
+            ignore_path.write_text("hide", encoding="utf-8")
+
+            self.assertEqual(scan_library(root), [])
+
+            write_manifest(legacy, build_manifest(
+                playlist_name="Removed",
+                playlist_dir=legacy,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/removed", "name": "Removed"},
+                settings={},
+                tracks=[],
+            ))
+
+            self.assertFalse(ignore_path.exists())
+            found = scan_library(root)
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["playlist_name"], "Removed")
 
     def test_scan_library_dedupes_same_source_url_and_keeps_largest(self):
         with tempfile.TemporaryDirectory() as tmp:

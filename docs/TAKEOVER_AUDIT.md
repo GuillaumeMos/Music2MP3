@@ -9,32 +9,35 @@ Music2MP3 est maintenant principalement une app desktop Python/PySide6. Le flux 
 Fonctions confirmees dans le code et les tests :
 - import Spotify via OAuth PKCE sans client secret,
 - import SoundCloud public/secret link via `yt-dlp`,
+- import Bandcamp album/track via `yt-dlp`,
 - import CSV,
 - conversion audio via `yt-dlp` + `ffmpeg`,
 - formats manual/auto : mp3, m4a, aac, wav, flac, aiff,
 - matching securise avec safe/strict/deep search,
-- aide IA Gemini optionnelle pour les matchs en zone grise,
+- aide IA Gemini optionnelle quand le matcher local ne trouve pas de résultat fiable, avec validation manuelle obligatoire,
 - generation `playlist.m3u8`,
 - manifest par playlist (`music2mp3.manifest.json`),
-- scan de bibliotheque locale, sync selected et sync all,
+- scan de bibliotheque locale, sync selected et sync all avec erreurs partielles,
 - UI Qt avec library panel, logs, settings, actions contextuelles.
 
 Etat verifie localement :
 - branche : `new-ui`,
 - working tree propre avant les changements d'audit,
 - Python local : 3.14.4,
-- tests : `50` tests OK via `.venv/bin/python -m unittest discover -s tests -v`.
+- tests : `69` tests OK via `.venv/bin/python -m unittest discover -s tests -v`.
 
 ## 2) Cartographie des modules
 
 ### Chemin produit principal
 
 - `qt_app.py` : UI PySide6 principale, orchestration sources, library, conversion, settings, logs.
+- `qt_workers.py` : workers Qt pour conversion et chargement Spotify/SoundCloud/Bandcamp.
 - `converter.py` : pipeline de conversion, matching, workers paralleles, M3U, manifest.
 - `library_manifest.py` : lecture/ecriture manifest, scan recursif, dedup des playlists.
 - `spotify_auth.py` : OAuth PKCE + refresh token.
 - `spotify_api.py` : client REST Spotify, extraction playlist.
 - `soundcloud_api.py` : extraction SoundCloud via `yt-dlp`.
+- `bandcamp_api.py` : extraction Bandcamp album/track via `yt-dlp`.
 - `ai_matcher.py` : conseil Gemini optionnel, cle stockee via keyring ou variables d'env.
 - `config.py` : defaults depuis le bundle + overrides utilisateur par OS.
 - `token_store.py` : wrapper keyring pour refresh token Spotify.
@@ -57,15 +60,15 @@ Etat verifie localement :
 ## 3) Points forts
 
 - Base de tests solide pour un MVP desktop : converter, manifest, auth/API et smoke UI Qt.
-- Separation fonctionnelle correcte entre conversion, API sources, manifest et UI, meme si `qt_app.py` reste monolithique.
+- Separation fonctionnelle correcte entre conversion, API sources, manifest, workers Qt et UI, meme si `qt_app.py` reste gros.
 - Les points critiques de l'ancien audit sont traites : config utilisateur stable, M3U ordonne, token store branche, manifests reels, tests presents.
 - README et `CLAUDE.md` refletent globalement la direction actuelle : Qt par defaut, Tk legacy.
 
 ## 4) Risques et incoherences restantes
 
-1. `qt_app.py` est tres gros (~3100 lignes).
+1. `qt_app.py` est tres gros (~3178 lignes).
    - Risque : evolution UI plus lente, tests plus difficiles a cibler.
-   - Action : extraire progressivement `dialogs/`, `widgets/`, `library/`, `workers/`.
+   - Action : continuer l'extraction progressive `dialogs/`, `widgets/`, `library/`; `workers/` a demarre avec `qt_workers.py`.
 
 2. Des artefacts de cache Python etaient encore suivis par Git.
    - Risque : bruit dans les diffs, confusion entre environnements Python.
@@ -89,9 +92,9 @@ Etat verifie localement :
 
 ### P1 - Fiabilite produit
 
-1. Ajouter des tests sur les actions destructives library : delete, merge, rename.
-2. Ajouter un test de non-regression sur `task run`/entrypoint Qt si possible via smoke import.
-3. Durcir les erreurs OAuth/port local deja occupe.
+1. Valider sync all en reel sur un mix Spotify/SoundCloud/Bandcamp/CSV, avec erreurs partielles et stop/reprise.
+2. Valider Bandcamp sur des releases reelles en build packagé.
+3. Durcir encore les erreurs OAuth/navigateur apres le cas port local deja occupe.
 
 ### P2 - Architecture
 

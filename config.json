@@ -15,7 +15,9 @@
   "ai_match_provider": "vertex",
   "ai_match_model": "gemini-2.5-flash",
   "ai_match_gray_min": 0.3,
-  "ai_match_prompt": "You are a strict music matching assistant for a DJ downloader.\nDecide whether one YouTube result is the same music track as the source track.\nPrefer official audio, topic channels, and matching artist/title/duration.\nReject full sets, DJ mixes, live recordings, covers, karaoke, nightcore, sped up/slowed, lyrics-only, or remixes unless the source title explicitly asks for that variant.\nIf no candidate is acceptable, propose one better YouTube search query.",
+  "ai_match_min_confidence": 0.72,
+  "ai_match_accept_margin": 0.12,
+  "ai_match_prompt": "You are a strict music matching assistant for a DJ downloader.\nDecide whether one YouTube result is the same music track as the source track.\nPrefer official audio, topic channels, and matching artist/title/duration.\nUse accept only when artist, title, and duration strongly point to the same recording.\nIn this app, accept means recommend for manual user validation, not automatic download.\nIf confidence is below 0.72, use reject or retry instead of accept.\nReject full sets, DJ mixes, live recordings, covers, karaoke, nightcore, sped up/slowed, lyrics-only, or remixes unless the source title explicitly asks for that variant.\nIf no candidate is acceptable, propose one better YouTube search query.",
   "incremental_update": true,
   "prefix_numbers": false
 }

@@ -176,7 +176,7 @@ class ConverterHelpersTests(unittest.TestCase):
         self.assertIsNone(best_url)
         self.assertEqual(best["url"], "https://youtu.be/short")
 
-    def test_ai_match_can_accept_gray_zone_candidate(self):
+    def test_ai_match_suggests_gray_zone_candidate_for_manual_validation(self):
         class FakeAdvisor:
             def advise(self, **_kwargs):
                 return AIMatchAdvice(
@@ -206,13 +206,56 @@ class ConverterHelpersTests(unittest.TestCase):
             {"title": "Track", "artists": "Artist", "duration_ms": 180000}
         )
 
-        self.assertIsNotNone(best)
-        self.assertEqual(reject_reason, "")
-        self.assertIsNone(best_url)
-        self.assertEqual(best["url"], "https://youtu.be/ai")
-        self.assertEqual(best["ai_confidence"], 0.88)
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/ai")
 
-    def test_ai_match_retry_query_can_use_heuristic_winner(self):
+    def test_ai_match_rejects_low_confidence_accept(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="accept",
+                    candidate_id=0,
+                    confidence=0.61,
+                    reason="probably same",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track official audio",
+                    "channel": "Artist",
+                    "duration_s": 181,
+                    "url": "https://youtu.be/ai",
+                    "fake_score": 0.35,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI assist", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/ai")
+
+    def test_ai_match_rejects_accept_below_heuristic_floor(self):
+        conv = Converter(config={"ai_match_enabled": True})
+        accepted = conv._apply_ai_match_advice(
+            AIMatchAdvice(action="accept", candidate_id=0, confidence=0.95, reason="same words"),
+            [{"ai_id": 0, "score": 0.25, "url": "https://youtu.be/weak"}],
+            min_score=0.42,
+        )
+
+        self.assertIsNone(accepted)
+
+    def test_ai_match_retry_query_suggests_heuristic_winner_for_manual_validation(self):
         class FakeAdvisor:
             def advise(self, **_kwargs):
                 return AIMatchAdvice(
@@ -250,14 +293,57 @@ class ConverterHelpersTests(unittest.TestCase):
             {"title": "Track", "artists": "Artist", "duration_ms": 180000}
         )
 
-        self.assertIsNotNone(best)
-        self.assertEqual(reject_reason, "")
-        self.assertIsNone(best_url)
-        self.assertEqual(best["url"], "https://youtu.be/retry")
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/retry")
+
+    def test_ai_match_retry_query_can_help_when_initial_search_has_no_results(self):
+        class FakeAdvisor:
+            def advise(self, **kwargs):
+                if not kwargs["candidates"]:
+                    return AIMatchAdvice(
+                        action="retry",
+                        query="Artist Track official audio",
+                        confidence=0.80,
+                        reason="try a cleaner artist title query",
+                    )
+                return AIMatchAdvice(action="reject", reason="not enough confidence")
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, query, _limit):
+                if query == "Artist Track official audio":
+                    return [{
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 180,
+                        "url": "https://youtu.be/retry",
+                        "fake_score": 0.85,
+                    }]
+                return []
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/retry")
 
     def test_soundcloud_set_url_is_not_treated_as_single_track(self):
         self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets/demo"))
         self.assertFalse(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/track"))
+
+    def test_bandcamp_album_url_is_not_treated_as_single_track(self):
+        self.assertTrue(Converter._is_probable_bandcamp_album_url("https://artist.bandcamp.com/album/demo"))
+        self.assertFalse(Converter._is_probable_bandcamp_album_url("https://artist.bandcamp.com/track/demo"))
 
     def test_m3u_is_written_in_playlist_order_even_when_workers_finish_out_of_order(self):
         class OutOfOrderConverter(Converter):

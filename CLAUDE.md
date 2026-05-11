@@ -8,7 +8,7 @@
 
 ## 1. Le projet en 30 secondes
 
-**Music2MP3** est une app desktop Python (macOS / Windows / Linux) qui permet à un DJ d'importer ses playlists Spotify / SoundCloud / CSV, de les télécharger en audio propre et de les exporter au format DJ-ready (M3U + tags ID3 + filtres anti-long-sets).
+**Music2MP3** est une app desktop Python (macOS / Windows / Linux) qui permet à un DJ d'importer ses playlists Spotify / SoundCloud / Bandcamp / CSV, de les télécharger en audio propre et de les exporter au format DJ-ready (M3U + tags ID3 + filtres anti-long-sets).
 
 **Public cible** : DJs / passionnés de musique qui veulent une bibliothèque locale propre à partir de leurs playlists streaming.
 
@@ -57,6 +57,8 @@
   "ai_match_provider": "vertex",
   "ai_match_model": "gemini-2.5-flash",
   "ai_match_gray_min": 0.30,
+  "ai_match_min_confidence": 0.72,
+  "ai_match_accept_margin": 0.12,
   "ai_match_prompt": "<prompt métier éditable depuis Settings>",
   "incremental_update": true,
   "prefix_numbers": false
@@ -67,8 +69,10 @@
 - `output_mode` : `"auto"` (yt-dlp choisit la meilleure source) ou `"manual"` (force `output_format_manual`)
 - `safe_search` : filtre les variantes indésirables (live, remix, nightcore…) — actif par défaut
 - `strict_match` : seuil de score plus élevé (0.58 vs 0.42) avant d'accepter un résultat
-- `ai_match_enabled` : active l'aide Google/Vertex sur les scores gris uniquement; clé API stockée dans le keychain depuis Settings, jamais dans `config.json`
-- `ai_match_prompt` : consignes métier passées à Gemini pour juger accept/reject/retry sur les candidats gray-zone
+- `ai_match_enabled` : active l'aide Google/Vertex quand le matcher local ne trouve pas de résultat fiable ou quand la première recherche ne retourne rien; clé API stockée dans le keychain depuis Settings, jamais dans `config.json`
+- `ai_match_min_confidence` : confiance minimale pour qu'une proposition IA soit affichée; défaut 0.72
+- `ai_match_accept_margin` : marge maximale sous le seuil heuristique pour afficher une proposition IA; défaut 0.12
+- `ai_match_prompt` : consignes métier passées à Gemini pour juger accept/reject/retry; `accept` signifie proposer à l'utilisateur, pas télécharger automatiquement
 
 ### ⚠️ Sécurité — points d'attention
 
@@ -157,17 +161,17 @@ Style "CLI" : `[x] flag_name` (activé) / `[ ] flag_name` (désactivé), en UPPE
 └──────────────┴─────────────────────────────────────────┘
 ```
 
-### Composants implémentés dans `qt_app.py` (état actuel)
+### Composants Qt (état actuel)
 
-Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~3100 lignes). Les classes clés :
+La fenêtre principale reste dans `qt_app.py` (~3178 lignes), mais les workers Qt sont maintenant isolés dans `qt_workers.py`. Les classes clés :
 
 - **`QtMusic2MP3Window`** (`QMainWindow`) — conteneur principal, QSS global inline (`APP_QSS`)
 - **`ArtworkWidget`** (`QWidget`) — `paintEvent` avec `QLinearGradient` dérivé du nom via `hashlib.md5`
 - **`PlaylistItemWidget`** (`QFrame`) — item sidebar, méthode `setSelected()`
 - **`HeroWidget`** (`QFrame`) — `paintEvent` custom : gradient + grid 32×32 + orbes radiaux
-- **`ConverterWorker`** (`QObject`) — worker Qt pour la conversion, signaux `status/item/done/failed/finished`
-- **`PlaylistLoadWorker`** (`QObject`) — worker pour le fetch Spotify/SoundCloud
-- **`AddSourceDialog`** (`QDialog`) — modal URL pour Spotify / SoundCloud
+- **`ConverterWorker`** (`QObject`, `qt_workers.py`) — worker Qt pour la conversion, signaux `status/item/done/failed/finished`
+- **`PlaylistLoadWorker`** (`QObject`, `qt_workers.py`) — worker pour le fetch Spotify/SoundCloud/Bandcamp
+- **`AddSourceDialog`** (`QDialog`) — modal URL pour Spotify / SoundCloud / Bandcamp
 - **`SettingsDialog`** (`QDialog`) — panneau de configuration
 - **`VisibleCheckStyle`** (`QProxyStyle`) — style custom pour les checkboxes
 
@@ -175,13 +179,15 @@ Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~3100
 
 ```
 Music2MP3/
-├── qt_app.py               # UI Qt principale (monolithe ~3100 lignes)
+├── qt_app.py               # UI Qt principale (~3178 lignes)
+├── qt_workers.py           # workers Qt conversion + chargement sources
 ├── app.py                  # entry point UI Tk (legacy)
 ├── gui.py                  # UI Tkinter (~1085 lignes, legacy)
 ├── converter.py            # logique download + matching (~1260 lignes)
 ├── spotify_api.py          # client Spotify API REST
 ├── spotify_auth.py         # OAuth PKCE flow
 ├── soundcloud_api.py       # client SoundCloud via yt-dlp
+├── bandcamp_api.py         # client Bandcamp via yt-dlp
 ├── library_manifest.py     # scan + manifest JSON de la bibliothèque locale
 ├── token_store.py          # wrapper keyring
 ├── config.py               # chargement/sauvegarde config.json
@@ -242,7 +248,7 @@ Le QSS global (`APP_QSS`) actuellement inline dans `qt_app.py` devrait migrer ve
 Gère l'ensemble du pipeline de téléchargement :
 - **Résolution du format** : `output_mode` = `"auto"` ou `"manual"` → `_resolve_output_mode()`
 - **Match scoring** : `SequenceMatcher` sur titre + artiste + durée. Seuil 0.58 si `strict_match`, 0.42 sinon
-- **AI match assist** : si `ai_match_enabled=True` et une clé Google/Gemini est configurée, Gemini tranche seulement les candidats en zone grise ou propose une requête alternative
+- **AI match assist** : si `ai_match_enabled=True` et une clé Google/Gemini est configurée, Gemini intervient seulement quand le matcher local ne trouve pas de résultat fiable ou quand la première recherche ne retourne rien. L'IA peut proposer une URL ou une requête alternative, mais le téléchargement reste bloqué jusqu'à validation manuelle dans le détail du track échoué.
 - **Détail score** : chaque match réussi stocke `match.score_details` dans le manifest; clic sur la colonne MATCH pour voir title/artist/duration/penalties + impact IA
 - **Safe search** : quand `safe_search=True` (défaut), filtre les variantes `_BAD_VARIANTS` (live, remix, nightcore, karaoke…)
 - **Deep search** : si score < seuil et `deep_search=True`, fallback SoundCloud
@@ -415,13 +421,13 @@ task notarize:macos  # notarytool + staple
 |---|---:|---|
 | Core download | ✅ Fonctionnel | yt-dlp + ffmpeg, formats manual/auto, M3U, incrémental |
 | Matching sécurisé | ✅ Fonctionnel | multi-candidats YouTube, durée, safe/strict/deep search |
-| Sources | ✅ MVP | Spotify OAuth PKCE, SoundCloud URL/secret, CSV |
-| Library locale | ✅ Avancé | manifest par playlist, scan root, sync selected, sync all |
+| Sources | ✅ MVP+ | Spotify OAuth PKCE, SoundCloud URL/secret, Bandcamp, CSV |
+| Library locale | ✅ Avancé | manifest par playlist, scan root, sync selected, sync all avec erreurs partielles |
 | UI Qt cyberpunk | ✅ Avancé | hero, sidebar, track table, settings, logs, dialogs |
 | Actions library | ✅ Avancé | rename, open folder, merge, export CSV, delete |
 | Gestion erreurs | ✅ Avancé | dialog d'erreur, meilleur candidat, retry manuel par URL |
 | Build | ✅ OK | Taskfile + PyInstaller Qt par défaut |
-| Tests | ✅ Base solide | converter, manifest, Spotify/SoundCloud/auth, smoke Qt offscreen |
+| Tests | ✅ Base solide | converter, manifest, Bandcamp, Spotify/SoundCloud/auth, smoke Qt offscreen |
 
 ### Backlog terminé
 
@@ -433,13 +439,14 @@ task notarize:macos  # notarytool + staple
 | Manifest `music2mp3.manifest.json` | ✅ |
 | Scan bibliothèque + playlists legacy | ✅ |
 | Sync manuel + sync all | ✅ |
+| Sync all robuste | ✅ |
 | Logs panel Qt | ✅ |
 | Menu contextuel library | ✅ |
 | Retry manuel sur track en erreur | ✅ |
 | Packaging déplacé sous `packaging/` | ✅ |
 | Tests UI smoke Qt | ✅ |
 | Normalisation LF de `converter.py` | ✅ |
-| Agent IA de matching gray-zone | ✅ |
+| Agent IA de matching avec validation manuelle | ✅ |
 
 ### Backlog futur priorisé
 
@@ -447,9 +454,8 @@ task notarize:macos  # notarytool + staple
 |---:|---|---|
 | P0 | Étendre smoke tests Qt | Couvrir settings, logs, source dialogs sans réseau |
 | P0 | Valider AI matching en réel | Tester avec clé Google/Gemini sur playlists difficiles |
-| P1 | Bandcamp source | Facile via yt-dlp, très pertinent DJ/électro |
-| P1 | Validation sync all | Progression, erreurs partielles, reprise après stop |
-| P2 | Refactor UI modules | `ui/main_window.py`, `sidebar.py`, `dialogs/`, `widgets/` |
+| P1 | Valider sync all en réel | Playlists Spotify/SoundCloud/Bandcamp mixtes, erreurs partielles, stop/reprise |
+| P2 | Continuer refactor UI modules | `dialogs/`, `widgets/`, puis `ui/main_window.py` |
 | P2 | Export Rekordbox | M3U déjà là, pousser vers workflow DJ plus complet |
 | P2 | Auto-pull planifié | À faire après sync all stable |
 | P3 | Soulseek via slskd | Puissant mais dépendance lourde à assumer |
@@ -459,7 +465,7 @@ task notarize:macos  # notarytool + staple
 | Option | Verdict | Raison |
 |---|---|---|
 | Agent IA matching | ✅ MVP intégré | Google/Vertex via Settings + keychain |
-| Bandcamp | ✅ À faire ensuite | Source DJ naturelle, intégration simple via yt-dlp |
+| Bandcamp | ✅ Intégré | Source DJ naturelle, via yt-dlp |
 | Soulseek/slskd | ⚠️ Plus tard | Très utile pour raretés/FLAC, mais setup lourd |
 
 ---
@@ -469,7 +475,7 @@ task notarize:macos  # notarytool + staple
 1. **Avant de coder** : relire la section concernée de ce fichier
 2. **Si tu changes l'archi ou la direction visuelle** : update ce fichier **en premier**
 3. **Commits** : préfixe le scope (`ui:`, `core:`, `build:`, `docs:`)
-4. **Tests** : `task test` — les tests couvrent converter, library_manifest, IA matching, Qt smoke, spotify_api, soundcloud_api, spotify_auth
+4. **Tests** : `task test` — les tests couvrent converter, library_manifest, IA matching, Qt smoke, bandcamp_api, spotify_api, soundcloud_api, spotify_auth
 5. **Avant un build** : `task run` ou `task run:qt` doit fonctionner sans erreur
 
 ---

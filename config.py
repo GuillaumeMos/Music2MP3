@@ -57,6 +57,8 @@ _DEFAULT = {
     "ai_match_provider": "vertex",
     "ai_match_model": "gemini-2.5-flash",
     "ai_match_gray_min": 0.30,
+    "ai_match_min_confidence": 0.72,
+    "ai_match_accept_margin": 0.12,
     "ai_match_prompt": DEFAULT_AI_MATCH_PROMPT,
     # New unified output format (mp3, m4a, aac, wav, flac, aiff)
     "output_format": "mp3",

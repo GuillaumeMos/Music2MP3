@@ -1,7 +1,7 @@
 # Music2MP3
 
 **Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
-You can either **load a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**).
+You can either **load a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**), or **paste a Bandcamp album/track link**.
 
 The app downloads each track via **yt-dlp**. In **Manual** mode it resamples to **44.1 kHz** and saves to your chosen format (MP3, WAV, FLAC, AIFF, AAC, M4A – default MP3). In **Auto** mode it keeps the best available audio format from the source.
 
@@ -15,6 +15,8 @@ Everything is bundled—no Python or external installs required.
   Uses **OAuth PKCE** in your browser (scopes: `playlist-read-private`, `playlist-read-collaborative`). No client secret stored.
 - **Load from SoundCloud URL (no auth)**  
   Paste any **public playlist** or **private “secret link”** URL and it just works. No account login, no credentials.
+- **Load from Bandcamp URL (no auth)**  
+  Paste a Bandcamp album or track URL. The app expands album releases into per-track rows via yt-dlp.
 - **CSV still supported**  
   Any CSV with the usual headers (`Track Name`, `Artist Name(s)`, `Album Name`, `Duration (ms)`…) works (Exportify, TuneMyMusic…).
 - **Incremental updates**  
@@ -56,8 +58,8 @@ The **PySide6 / Qt** frontend is the default build target.
 
 - Run default app: `task run`
 - Run: `task run:qt`
-- Scope: Spotify/SoundCloud/CSV loading + output options + live downloads panel
-- Library panel: choose a root folder, scan playlist manifests, open a playlist folder, or sync a selected Spotify/SoundCloud/CSV-backed playlist.
+- Scope: Spotify/SoundCloud/Bandcamp/CSV loading + output options + live downloads panel
+- Library panel: choose a root folder, scan playlist manifests, open a playlist folder, or sync a selected Spotify/SoundCloud/Bandcamp/CSV-backed playlist.
 - Tk frontend is still available: `task run:tk`
 
 ### Option A — From a CSV
@@ -90,6 +92,13 @@ The **PySide6 / Qt** frontend is the default build target.
 4. Choose an **output folder**, then click **Convert**.
 
 > Note: If some tracks are region-locked or not streamable, yt-dlp may fail those entries. You can optionally provide a cookies file in `config.json` to improve access when needed.
+
+### Option D — From a Bandcamp album or track URL (no auth)
+
+1. Copy a Bandcamp album or track URL, e.g. `https://artist.bandcamp.com/album/release`.
+2. Paste it and click **Load from Bandcamp**.
+3. The app parses the release and builds a temp CSV with `Source URL` for each track.
+4. Choose an **output folder**, then click **Convert**.
 
 ---
 
@@ -143,7 +152,8 @@ In the Qt app, the **Library** panel already supports:
 - choosing/scanning a library root,
 - listing converted playlists from `music2mp3.manifest.json`,
 - opening the selected playlist folder,
-- manually syncing selected Spotify, SoundCloud, or CSV-backed playlists.
+- manually syncing selected Spotify, SoundCloud, Bandcamp, or CSV-backed playlists,
+- syncing all eligible playlists with progress and partial-error handling.
 
 Current repo organization:
 - Root app entrypoints stay at the top level for PyInstaller compatibility.
@@ -160,13 +170,16 @@ Current repo organization:
   - Local redirect: `http://127.0.0.1:8765/callback`
   - Access token is kept in memory for the current session.
   - Refresh token is stored in your OS keychain when available (via `keyring`).
-- **SoundCloud** usage requires **no authentication**:
+- **SoundCloud and Bandcamp** usage requires **no authentication**:
   - Public playlists work out of the box.
-  - Private playlists shared via **secret links** also work (the token is in the URL).
+  - SoundCloud private playlists shared via **secret links** also work (the token is in the URL).
 - **AI match assist** is optional:
   - Enable it in Settings or the `ai` pill.
   - Paste your Google/Gemini API key in Settings; it is stored in the OS keychain, not in `config.json`.
-  - It only runs on gray-zone YouTube matches and can reject, accept, or propose a better query.
+  - It only runs when the local matcher cannot confidently select a YouTube result, or when the first query returns no result.
+  - It can propose a candidate or a better query, but never downloads automatically.
+  - You validate the AI proposal from the failed-track details before clicking Download.
+  - AI proposals are gated by confidence and by the local title/artist/duration score.
   - The matching prompt is editable in Settings.
 - When loading from URLs, the generated CSV is **temporary**, used internally by the converter.
 
@@ -174,7 +187,7 @@ Current repo organization:
 
 ## 💡 Notes
 
-- This tool **does not rip Spotify or SoundCloud directly**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded.
+- This tool **does not rip Spotify or SoundCloud directly**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded. Bandcamp URLs are handed to yt-dlp directly.
 - **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
 - Runtime settings are persisted per user:
   - Windows: `%APPDATA%\\Music2MP3\\config.json`

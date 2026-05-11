@@ -16,6 +16,7 @@ import html
 import tempfile
 import platform
 import subprocess
+import shutil
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -56,16 +57,13 @@ _root_logger.addHandler(_LOG_HANDLER)
 _root_logger.setLevel(getattr(logging, os.environ.get("APP_LOG_LEVEL", "INFO").upper(), logging.INFO))
 
 from config import CONFIG_FILE, load_config
-from converter import Converter
 from ai_matcher import has_saved_ai_api_key, set_ai_api_key
-from library_manifest import manifest_source, playlist_output_parent, scan_library
-from soundcloud_api import SoundCloudClient
+from library_manifest import IGNORE_FILENAME, manifest_source, playlist_output_parent, scan_library
 from spotify_api import SpotifyClient
-from spotify_auth import PKCEAuth
-from token_store import RefreshTokenStore
+from qt_workers import ConverterWorker, PlaylistLoadWorker
 
 try:
-    from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
+    from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, Slot
     from PySide6.QtGui import (
         QColor, QDesktopServices, QPainter, QPen, QBrush,
         QLinearGradient, QRadialGradient, QFont,
@@ -452,122 +450,6 @@ def _open_path(path: str | None) -> bool:
         return False
 
 
-# ── Workers (unchanged logic) ──────────────────────────────────────────────────
-
-class ConverterWorker(QObject):
-    status = Signal(str)
-    progress = Signal(int, int)
-    item = Signal(str, object)
-    done = Signal(str)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, config, csv_path, output_folder, playlist_hint, source_info=None):
-        super().__init__()
-        self._config = config
-        self._csv_path = csv_path
-        self._output_folder = output_folder
-        self._playlist_hint = playlist_hint
-        self._source_info = source_info
-        self._cancel_event = threading.Event()
-
-    def stop(self):
-        self._cancel_event.set()
-
-    @Slot()
-    def run(self):
-        try:
-            conv = Converter(
-                config=self._config,
-                status_cb=lambda s: self.status.emit(s),
-                progress_cb=lambda c, m: self.progress.emit(c, m),
-                item_cb=lambda k, d: self.item.emit(k, d),
-                cancel_event=self._cancel_event,
-            )
-            out_dir = conv.convert_from_csv(
-                self._csv_path, self._output_folder,
-                self._playlist_hint, source_info=self._source_info,
-            )
-            self.done.emit(out_dir)
-        except Exception as e:
-            self.failed.emit(str(e))
-        finally:
-            self.finished.emit()
-
-
-class PlaylistLoadWorker(QObject):
-    status = Signal(str)
-    done = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, mode: str, url: str, config: dict):
-        super().__init__()
-        self.mode = mode
-        self.url = url
-        self.config = config or {}
-
-    @Slot()
-    def run(self):
-        try:
-            if self.mode == "spotify":
-                payload = self._load_spotify()
-            elif self.mode == "soundcloud":
-                payload = self._load_soundcloud()
-            else:
-                raise RuntimeError(f"Unsupported mode: {self.mode}")
-            self.done.emit(payload)
-        except Exception as e:
-            self.failed.emit(str(e))
-        finally:
-            self.finished.emit()
-
-    def _load_spotify(self) -> dict:
-        pid = SpotifyClient.extract_playlist_id(self.url)
-        if not pid:
-            raise RuntimeError("Invalid Spotify playlist URL.")
-        client_id = self.config.get("spotify_client_id")
-        if not client_id:
-            raise RuntimeError('Missing "spotify_client_id" in config.')
-        self.status.emit("Opening browser for Spotify authorization...")
-        token_store = RefreshTokenStore(service="Music2MP3", user="spotify_pkce")
-        auth = PKCEAuth(
-            client_id=client_id,
-            redirect_uri="http://127.0.0.1:8765/callback",
-            scopes=["playlist-read-private", "playlist-read-collaborative"],
-            refresh_token_store=token_store,
-        )
-        sp = SpotifyClient(token_supplier=auth.get_token)
-        self.status.emit("Fetching playlist from Spotify...")
-        rows, name = sp.fetch_playlist(pid)
-        tmp = self._write_temp_csv(rows, ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"], "spotify_playlist_")
-        return {"csv_path": tmp, "playlist_name": name or "SpotifyPlaylist", "count": len(rows),
-                "source": "Spotify", "source_type": "spotify", "source_url": self.url}
-
-    def _load_soundcloud(self) -> dict:
-        self.status.emit("Fetching playlist from SoundCloud...")
-        sc = SoundCloudClient()
-        cookies_path = self.config.get("cookies_path")
-        rows, name = sc.fetch_playlist(self.url, cookies_path=cookies_path)
-        tmp = self._write_temp_csv(
-            rows,
-            ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL", "Track URI"],
-            "soundcloud_playlist_",
-        )
-        return {"csv_path": tmp, "playlist_name": name or "SoundCloud", "count": len(rows),
-                "source": "SoundCloud", "source_type": "soundcloud", "source_url": self.url}
-
-    @staticmethod
-    def _write_temp_csv(rows, fieldnames, prefix) -> str:
-        fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".csv")
-        os.close(fd)
-        with open(tmp, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        return tmp
-
-
 # ── UI Components ──────────────────────────────────────────────────────────────
 
 class LogsDialog(QDialog):
@@ -867,7 +749,11 @@ class AddSourceDialog(QDialog):
 
     def __init__(self, mode: str, parent=None):
         super().__init__(parent)
-        titles = {"spotify": "Add Spotify Playlist", "soundcloud": "Add SoundCloud Playlist"}
+        titles = {
+            "spotify": "Add Spotify Playlist",
+            "soundcloud": "Add SoundCloud Playlist",
+            "bandcamp": "Add Bandcamp Release",
+        }
         self.setWindowTitle(titles.get(mode, "Add Source"))
         self.setMinimumWidth(460)
         self.setStyleSheet("background:#06070d;")
@@ -884,8 +770,13 @@ class AddSourceDialog(QDialog):
         placeholders = {
             "spotify": "https://open.spotify.com/playlist/...",
             "soundcloud": "https://soundcloud.com/.../sets/...",
+            "bandcamp": "https://artist.bandcamp.com/album/...",
         }
-        lbl_texts = {"spotify": "Spotify playlist URL", "soundcloud": "SoundCloud playlist URL"}
+        lbl_texts = {
+            "spotify": "Spotify playlist URL",
+            "soundcloud": "SoundCloud playlist URL",
+            "bandcamp": "Bandcamp album or track URL",
+        }
         lbl = QLabel(lbl_texts.get(mode, "URL"))
         lbl.setObjectName("muted")
         layout.addWidget(lbl)
@@ -1074,6 +965,10 @@ class QtMusic2MP3Window(QMainWindow):
         self._sync_target_manifest: dict | None = None
         self._sync_queue: list[dict] = []  # manifests waiting for sync-all
         self._sync_queue_total: int = 0
+        self._sync_queue_active: bool = False
+        self._sync_queue_cancel_requested: bool = False
+        self._sync_queue_results: list[dict] = []
+        self._source_load_failed: bool = False
         self._rows: dict[int, dict] = {}
         self._perc: dict[int, float] = {}
         # (title, msg, best_url, track_t, out_dir)
@@ -1149,6 +1044,7 @@ class QtMusic2MP3Window(QMainWindow):
 
         self.logs_btn = QPushButton("logs")
         self.logs_btn.setObjectName("ghost")
+        self.logs_btn.setToolTip("Open logs")
         self.logs_btn.clicked.connect(self._open_logs)
         header.addWidget(self.logs_btn)
 
@@ -1185,20 +1081,28 @@ class QtMusic2MP3Window(QMainWindow):
         add_grid.setVerticalSpacing(6)
         self.add_spotify_btn = QPushButton("Spotify")
         self.add_soundcloud_btn = QPushButton("SoundCloud")
+        self.add_bandcamp_btn = QPushButton("Bandcamp")
         self.add_csv_btn = QPushButton("CSV file")
         self.add_scan_btn = QPushButton("Local scan")
-        for btn in (self.add_spotify_btn, self.add_soundcloud_btn,
+        self.add_spotify_btn.setToolTip("Load a Spotify playlist URL")
+        self.add_soundcloud_btn.setToolTip("Load a SoundCloud playlist or track URL")
+        self.add_bandcamp_btn.setToolTip("Load a Bandcamp album or track URL")
+        self.add_csv_btn.setToolTip("Load a local CSV file")
+        self.add_scan_btn.setToolTip("Choose and scan a local library folder")
+        for btn in (self.add_spotify_btn, self.add_soundcloud_btn, self.add_bandcamp_btn,
                     self.add_csv_btn, self.add_scan_btn):
             btn.setObjectName("sourceTile")
             btn.setMinimumHeight(44)
         self.add_spotify_btn.clicked.connect(self._on_add_spotify)
         self.add_soundcloud_btn.clicked.connect(self._on_add_soundcloud)
+        self.add_bandcamp_btn.clicked.connect(self._on_add_bandcamp)
         self.add_csv_btn.clicked.connect(self._on_add_csv)
         self.add_scan_btn.clicked.connect(self._choose_library_root)
         add_grid.addWidget(self.add_spotify_btn, 0, 0)
         add_grid.addWidget(self.add_soundcloud_btn, 0, 1)
-        add_grid.addWidget(self.add_csv_btn, 1, 0)
-        add_grid.addWidget(self.add_scan_btn, 1, 1)
+        add_grid.addWidget(self.add_bandcamp_btn, 1, 0)
+        add_grid.addWidget(self.add_csv_btn, 1, 1)
+        add_grid.addWidget(self.add_scan_btn, 2, 0, 1, 2)
         sb.addLayout(add_grid)
         sb.addSpacing(14)
 
@@ -1281,6 +1185,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.library_choose_btn.setObjectName("ghost")
         self.library_choose_btn.setFixedSize(22, 22)
         self.library_choose_btn.setStyleSheet("padding:0; font-size:14px;")
+        self.library_choose_btn.setToolTip("Choose library root folder")
         self.library_choose_btn.clicked.connect(self._choose_library_root)
         rp_row.addWidget(self.library_choose_btn)
         root_box_layout.addLayout(rp_row)
@@ -1319,7 +1224,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.hero_title_label = QLabel("Ready to export")
         self.hero_title_label.setObjectName("heroTitle")
         self.hero_meta_label = QLabel(
-            "Load Spotify, SoundCloud, CSV, or sync a manifest playlist"
+            "Load Spotify, SoundCloud, Bandcamp, CSV, or sync a manifest playlist"
         )
         self.hero_meta_label.setObjectName("heroMeta")
         hero_text.addStretch()
@@ -1342,6 +1247,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.convert_btn.setObjectName("accent")
         self.convert_btn.setMinimumWidth(136)
         self.convert_btn.setFixedHeight(36)
+        self.convert_btn.setToolTip("Convert the loaded source into local audio files")
         self.convert_btn.clicked.connect(self._start_conversion)
         action_layout.addWidget(self.convert_btn)
 
@@ -1350,6 +1256,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.stop_btn.setMinimumWidth(90)
         self.stop_btn.setFixedHeight(36)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setToolTip("Stop the current conversion")
         self.stop_btn.clicked.connect(self._stop_conversion)
         action_layout.addWidget(self.stop_btn)
 
@@ -1358,6 +1265,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.action_output_lbl = QLabel("→ no output folder")
         self.action_output_lbl.setObjectName("outputPath")
         self.action_output_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.action_output_lbl.setToolTip("Choose output folder")
         self.action_output_lbl.mousePressEvent = lambda _e: self._choose_output_folder()
         action_layout.addWidget(self.action_output_lbl)
 
@@ -1497,6 +1405,24 @@ class QtMusic2MP3Window(QMainWindow):
             return
         self._start_source_loader("soundcloud", url)
 
+    def _on_add_bandcamp(self):
+        if self._worker or self._load_worker:
+            QMessageBox.warning(self, "Busy", "Wait for current task to finish.")
+            return
+        dlg = AddSourceDialog("bandcamp", self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        url = dlg.url()
+        if not self._is_bandcamp_url(url):
+            QMessageBox.warning(self, "Bandcamp", "Please enter a valid Bandcamp album or track URL.")
+            return
+        self._start_source_loader("bandcamp", url)
+
+    @staticmethod
+    def _is_bandcamp_url(url: str) -> bool:
+        low = (url or "").strip().lower()
+        return low.startswith(("http://", "https://")) and ".bandcamp.com/" in low
+
     def _on_add_csv(self):
         if self._worker or self._load_worker:
             QMessageBox.warning(self, "Busy", "Wait for current task to finish.")
@@ -1530,6 +1456,7 @@ class QtMusic2MP3Window(QMainWindow):
     # ── Source loader ──────────────────────────────────────────────────────────
 
     def _start_source_loader(self, mode: str, url: str):
+        self._source_load_failed = False
         self._set_footer_state("loading", f"Loading from {mode.title()}...")
         self.footer_bar.show()
         self._load_started_at = time.time()
@@ -1554,14 +1481,29 @@ class QtMusic2MP3Window(QMainWindow):
 
     @Slot(str)
     def _on_source_status(self, text: str):
-        self.footer_status_lbl.setText(text)
+        self.footer_status_lbl.setText((self._sync_queue_status_prefix() + text)[:80])
+
+    def _sync_queue_status_prefix(self) -> str:
+        if not self._sync_queue_active or not self._sync_queue_total:
+            return ""
+        done = len(self._sync_queue_results)
+        current = min(self._sync_queue_total, done + 1)
+        return f"sync all {current}/{self._sync_queue_total} · "
 
     @Slot(object)
     def _on_source_loaded(self, payload_obj: object):
         payload = payload_obj if isinstance(payload_obj, dict) else {}
         csv_path = str(payload.get("csv_path", "")).strip()
         if not csv_path or not os.path.isfile(csv_path):
-            QMessageBox.warning(self, "Source", "Source loaded but no CSV was produced.")
+            self._source_load_failed = True
+            msg = "Source loaded but no CSV was produced."
+            log.error(msg)
+            if self._sync_queue_active and self._sync_target_manifest:
+                self._record_sync_queue_result(self._sync_target_manifest, "load_failed", msg)
+                self._pending_sync_manifest = None
+                self._sync_target_manifest = None
+            else:
+                QMessageBox.warning(self, "Source", msg)
             return
         if not self._sync_target_manifest:
             self._append_to_library_manifest = None
@@ -1576,14 +1518,21 @@ class QtMusic2MP3Window(QMainWindow):
             "name": self.loaded_playlist_name or "",
         }
         count = int(payload.get("count", 0))
-        self._session_playlist = {
-            "name": self.loaded_playlist_name or "Playlist",
-            "source_type": source_type,
-            "count": count,
-        }
-        self._prepare_single_track_append_if_possible(source_type, source_url, count)
+        sync_manifest = self._sync_target_manifest
+        if sync_manifest:
+            # A sync reload is an implementation detail of the selected library item.
+            # Showing it as a fresh session creates a duplicate sidebar entry.
+            self._session_playlist = None
+            self._selected_playlist_idx = self._library_index_for_manifest(sync_manifest)
+        else:
+            self._session_playlist = {
+                "name": self.loaded_playlist_name or "Playlist",
+                "source_type": source_type,
+                "count": count,
+            }
+            self._prepare_single_track_append_if_possible(source_type, source_url, count)
+            self._selected_playlist_idx = -1
         self._rebuild_playlist_sidebar()
-        self._selected_playlist_idx = -1
         self._update_playlist_selection()
         self._update_hero()
         self._update_convert_state()
@@ -1591,14 +1540,21 @@ class QtMusic2MP3Window(QMainWindow):
 
     @Slot(str)
     def _on_source_failed(self, error_text: str):
+        self._source_load_failed = True
         self._timer.stop()
         self._load_started_at = None
         self.global_progress.setRange(0, 100)
         self.global_progress.setValue(0)
         self._restyle(self.convert_btn, "accent")
         log.error("Source loading failed: %s", error_text)
-        QMessageBox.critical(self, "Source loading error", error_text)
-        self._set_footer_state("error", "Source loading failed")
+        if self._sync_queue_active and self._sync_target_manifest:
+            self._record_sync_queue_result(self._sync_target_manifest, "load_failed", error_text)
+            self._pending_sync_manifest = None
+            self._sync_target_manifest = None
+            self._set_footer_state("warning", "sync all · source failed · continuing")
+        else:
+            QMessageBox.critical(self, "Source loading error", error_text)
+            self._set_footer_state("error", "Source loading failed")
 
     def _prepare_single_track_append_if_possible(self, source_type: str, source_url: str, count: int):
         if source_type != "soundcloud" or count != 1:
@@ -1634,6 +1590,7 @@ class QtMusic2MP3Window(QMainWindow):
         return "soundcloud.com" in low and ("/sets/" in low or "/playlists/" in low)
 
     def _on_source_loader_finished(self):
+        source_load_failed = self._source_load_failed
         self._timer.stop()
         self._load_started_at = None
         self.global_progress.setRange(0, 100)
@@ -1645,6 +1602,11 @@ class QtMusic2MP3Window(QMainWindow):
         self._restyle(self.convert_btn, "accent")  # restore normal style
         self._set_ui_enabled(True)
         self._update_convert_state()
+        if source_load_failed:
+            self._source_load_failed = False
+            if self._sync_queue_active:
+                self._advance_sync_queue()
+            return
         if self._pending_sync_manifest and self.csv_path and self.output_folder and not self._worker:
             manifest = self._pending_sync_manifest
             self._pending_sync_manifest = None
@@ -1735,7 +1697,8 @@ class QtMusic2MP3Window(QMainWindow):
                         if error:
                             self._set_row_error(idx, error)
                     elif status == "skipped":
-                        self._set_row_state(idx, "cancelled")
+                        self._set_row_state(idx, "skipped")
+                        self._set_row_progress(idx, 100.0)
                     match = t.get("match")
                     if isinstance(match, dict):
                         self._set_row_match_score(
@@ -1794,6 +1757,23 @@ class QtMusic2MP3Window(QMainWindow):
             return None
         return self.library_items[idx]
 
+    def _library_index_for_manifest(self, manifest: dict | None) -> int:
+        if not manifest:
+            return self._selected_playlist_idx
+        try:
+            return self.library_items.index(manifest)
+        except ValueError:
+            pass
+        wanted_source = manifest_source(manifest)
+        wanted_dir = str(manifest.get("playlist_dir") or "").strip()
+        for idx, item in enumerate(self.library_items):
+            source = manifest_source(item)
+            if wanted_source.get("type") and wanted_source == source:
+                return idx
+            if wanted_dir and wanted_dir == str(item.get("playlist_dir") or "").strip():
+                return idx
+        return self._selected_playlist_idx
+
     # ── Hero update ────────────────────────────────────────────────────────────
 
     def _update_hero(self):
@@ -1837,7 +1817,7 @@ class QtMusic2MP3Window(QMainWindow):
         self.hero_source_label.setText("// source_pending")
         self.hero_title_label.setText("Ready to export")
         self.hero_meta_label.setText(
-            "Load Spotify, SoundCloud, CSV, or sync a manifest playlist"
+            "Load Spotify, SoundCloud, Bandcamp, CSV, or sync a manifest playlist"
         )
 
     # ── Flag pills ─────────────────────────────────────────────────────────────
@@ -1861,10 +1841,22 @@ class QtMusic2MP3Window(QMainWindow):
             "strict_match": "strict",
             "exclude_instrumentals": "no_instrumental",
         }
+        tooltips = {
+            "deep_search": "Deep search: add an audio-focused query fallback",
+            "incremental_update": "Incremental update: skip tracks already downloaded",
+            "safe_search": "Safe search: reject long sets, live/remix variants, and bad durations",
+            "ai_match_enabled": "AI match assist: propose candidates only when local matching is uncertain",
+            "generate_m3u": "Generate M3U: write a playlist.m3u8 file",
+            "prefix_numbers": "Number files: prefix filenames with 001, 002, ...",
+            "strict_match": "Strict matching: require a higher local match score",
+            "exclude_instrumentals": "Exclude instrumental versions",
+        }
         for cfg_key, btn in self.flag_btns.items():
             enabled = bool(self.config.get(cfg_key, False))
             label_text = labels.get(cfg_key, cfg_key)
             btn.setText(f"[x] {label_text}" if enabled else f"[ ] {label_text}")
+            state = "enabled" if enabled else "disabled"
+            btn.setToolTip(f"{tooltips.get(cfg_key, label_text)} ({state})")
             btn.setObjectName("flagOn" if enabled else "flagOff")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
@@ -1872,6 +1864,7 @@ class QtMusic2MP3Window(QMainWindow):
         fmt = str(self.config.get("output_format_manual", self.config.get("output_format", "mp3")))
         threads = int(self.config.get("concurrency", 3))
         self.format_pill.setText(f"{fmt} · t{threads}")
+        self.format_pill.setToolTip(f"Open settings: output format {fmt.upper()}, {threads} thread(s)")
 
     # ── Settings dialog ────────────────────────────────────────────────────────
 
@@ -1942,34 +1935,40 @@ class QtMusic2MP3Window(QMainWindow):
     def _update_library_actions(self):
         manifest = self._selected_library_manifest()
         has_selection = manifest is not None
-        busy = self._worker is not None or self._load_worker is not None
+        busy = self._worker is not None or self._load_worker is not None or self._sync_queue_active
         source = manifest_source(manifest or {})
         syncable = (
-            source.get("type") in {"spotify", "soundcloud"} and bool(source.get("url"))
+            source.get("type") in {"spotify", "soundcloud", "bandcamp"} and bool(source.get("url"))
         ) or (
             source.get("type") == "csv"
             and bool(source.get("url"))
             and os.path.isfile(source.get("url", ""))
         )
         self.sync_btn.setEnabled(has_selection and syncable and not busy)
-        if has_selection and not syncable:
-            self.sync_btn.setToolTip("Sync needs a Spotify, SoundCloud, or CSV source.")
+        if busy:
+            self.sync_btn.setToolTip("Sync selected playlist: wait for current work to finish")
+        elif not has_selection:
+            self.sync_btn.setToolTip("Sync selected playlist: select a library playlist first")
+        elif not syncable:
+            self.sync_btn.setToolTip("Sync selected playlist: needs a Spotify, SoundCloud, Bandcamp, or CSV source")
         else:
-            self.sync_btn.setToolTip("")
+            self.sync_btn.setToolTip("Sync selected playlist")
         syncable_count = sum(
             1 for m in self.library_items
             if self._manifest_is_syncable(m)
         )
         self.sync_all_btn.setEnabled(syncable_count > 0 and not busy)
-        self.sync_all_btn.setToolTip(
-            f"Sync all {syncable_count} playlists with a saved URL"
-            if syncable_count > 0 else "No playlists with a saved URL"
-        )
+        if busy:
+            self.sync_all_btn.setToolTip("Sync all playlists: wait for current work to finish")
+        elif syncable_count > 0:
+            self.sync_all_btn.setToolTip(f"Sync all {syncable_count} playlists with a saved URL")
+        else:
+            self.sync_all_btn.setToolTip("Sync all playlists: no playlists with a saved URL")
 
     def _manifest_is_syncable(self, manifest: dict) -> bool:
         source = manifest_source(manifest)
         return (
-            source.get("type") in {"spotify", "soundcloud"} and bool(source.get("url"))
+            source.get("type") in {"spotify", "soundcloud", "bandcamp"} and bool(source.get("url"))
         ) or (
             source.get("type") == "csv"
             and bool(source.get("url"))
@@ -1986,17 +1985,25 @@ class QtMusic2MP3Window(QMainWindow):
             return
         self._sync_queue = queue
         self._sync_queue_total = len(queue)
+        self._sync_queue_active = True
+        self._sync_queue_cancel_requested = False
+        self._sync_queue_results = []
+        self._set_footer_state("running", f"sync all · 0 / {self._sync_queue_total}")
+        self.footer_bar.show()
         log.info("Sync All: %d playlists queued", self._sync_queue_total)
         self._advance_sync_queue()
 
     def _advance_sync_queue(self):
         if not self._sync_queue:
-            self._sync_queue_total = 0
-            self._scan_library_root(show_empty=False)
+            self._finish_sync_queue()
             return
         manifest = self._sync_queue.pop(0)
         remaining = len(self._sync_queue)
         done = self._sync_queue_total - remaining - 1
+        self._set_footer_state(
+            "running",
+            f"sync all · {done + 1} / {self._sync_queue_total} · {manifest.get('playlist_name', '?')}",
+        )
         log.info(
             "Sync All: starting %s (%d/%d)",
             manifest.get("playlist_name", "?"),
@@ -2017,6 +2024,7 @@ class QtMusic2MP3Window(QMainWindow):
         output_parent = playlist_output_parent(manifest)
         if not output_parent:
             log.warning("Sync All: skipping %s — no output parent", manifest.get("playlist_name"))
+            self._record_sync_queue_result(manifest, "skipped", "missing output parent")
             self._advance_sync_queue()
             return
         self.output_folder = output_parent
@@ -2024,7 +2032,7 @@ class QtMusic2MP3Window(QMainWindow):
         self._refresh_action_context()
         self._pending_sync_manifest = manifest
         self._sync_target_manifest = manifest
-        if source_type in {"spotify", "soundcloud"} and source_url:
+        if source_type in {"spotify", "soundcloud", "bandcamp"} and source_url:
             self._start_source_loader(source_type, source_url)
             return
         if source_type == "csv" and source_url and os.path.isfile(source_url):
@@ -2038,9 +2046,61 @@ class QtMusic2MP3Window(QMainWindow):
             self._start_conversion()
             return
         log.warning("Sync All: skipping %s — unsupported source type %s", manifest.get("playlist_name"), source_type)
+        self._record_sync_queue_result(manifest, "skipped", f"unsupported source type {source_type or '?'}")
         self._pending_sync_manifest = None
         self._sync_target_manifest = None
         self._advance_sync_queue()
+
+    def _record_sync_queue_result(
+        self,
+        manifest: dict,
+        status: str,
+        message: str = "",
+        error_count: int = 0,
+    ):
+        name = str(manifest.get("playlist_name") or manifest_source(manifest).get("name") or "?")
+        result = {
+            "name": name,
+            "status": status,
+            "message": message,
+            "error_count": error_count,
+        }
+        self._sync_queue_results.append(result)
+        detail = f" ({message})" if message else ""
+        log.info("Sync All: %s -> %s%s", name, status, detail)
+
+    def _finish_sync_queue(self):
+        if not self._sync_queue_active:
+            self._scan_library_root(show_empty=False)
+            return
+
+        results = list(self._sync_queue_results)
+        total = self._sync_queue_total or len(results)
+        ok_count = sum(1 for r in results if r.get("status") == "done")
+        warning_count = sum(1 for r in results if r.get("status") == "done_with_errors")
+        failed_count = sum(1 for r in results if r.get("status") in {"failed", "load_failed", "skipped"})
+        cancelled = self._sync_queue_cancel_requested
+
+        self._sync_queue.clear()
+        self._sync_queue_total = 0
+        self._sync_queue_active = False
+        self._sync_queue_cancel_requested = False
+        self._pending_sync_manifest = None
+        self._sync_target_manifest = None
+        self._scan_library_root(show_empty=False)
+
+        summary = (
+            f"sync all · {ok_count} ok"
+            + (f" · {warning_count} with errors" if warning_count else "")
+            + (f" · {failed_count} failed/skipped" if failed_count else "")
+        )
+        if cancelled:
+            self._set_footer_state("cancelled", f"{summary} · cancelled")
+            return
+        if failed_count or warning_count:
+            self._set_footer_state("warning", summary)
+        else:
+            self._set_footer_state("done", f"sync all · {total} playlist(s)")
 
     # ── Playlist context menu ──────────────────────────────────────────────────
 
@@ -2050,7 +2110,7 @@ class QtMusic2MP3Window(QMainWindow):
             return
         manifest = self.library_items[idx]
         source = manifest_source(manifest)
-        busy = self._worker is not None or self._load_worker is not None
+        busy = self._worker is not None or self._load_worker is not None or self._sync_queue_active
 
         menu = QMenu(self)
         if self._manifest_is_syncable(manifest) and not busy:
@@ -2107,6 +2167,37 @@ class QtMusic2MP3Window(QMainWindow):
         self._selected_playlist_idx = idx
         self._update_playlist_selection()
         self._update_hero()
+
+    @staticmethod
+    def _merge_playlist_audio_files(src_dir: str, dst_dir: str) -> tuple[int, int, list[str]]:
+        audio_exts = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aiff", ".aif", ".opus", ".ogg", ".webm"}
+        moved, skipped, errors = 0, 0, []
+        for p in Path(src_dir).iterdir():
+            if not p.is_file() or p.suffix.lower() not in audio_exts:
+                continue
+            dst_path = Path(dst_dir) / p.name
+            if dst_path.exists():
+                skipped += 1
+                continue
+            try:
+                shutil.move(str(p), str(dst_path))
+                moved += 1
+            except Exception as e:
+                errors.append(f"{p.name}: {e}")
+        return moved, skipped, errors
+
+    @staticmethod
+    def _delete_playlist_folder(playlist_dir: str) -> None:
+        shutil.rmtree(playlist_dir)
+
+    @staticmethod
+    def _remove_manifest_file(manifest_file: str) -> None:
+        path = Path(manifest_file)
+        os.remove(path)
+        (path.parent / IGNORE_FILENAME).write_text(
+            "Removed from Music2MP3 library. Delete this file or resync/reconvert to show it again.\n",
+            encoding="utf-8",
+        )
 
     def _ctx_open_folder(self, manifest: dict):
         playlist_dir = str(manifest.get("playlist_dir") or "")
@@ -2167,21 +2258,7 @@ class QtMusic2MP3Window(QMainWindow):
         dst_manifest = self.library_items[dst_idx]
         dst_dir = str(dst_manifest.get("playlist_dir") or "")
 
-        _AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".aiff", ".aif", ".opus", ".ogg", ".webm"}
-        moved, skipped, errors = 0, 0, []
-        for p in Path(src_dir).iterdir():
-            if not p.is_file() or p.suffix.lower() not in _AUDIO_EXTS:
-                continue
-            dst_path = Path(dst_dir) / p.name
-            if dst_path.exists():
-                skipped += 1
-                continue
-            try:
-                import shutil as _shutil
-                _shutil.move(str(p), str(dst_path))
-                moved += 1
-            except Exception as e:
-                errors.append(f"{p.name}: {e}")
+        moved, skipped, errors = self._merge_playlist_audio_files(src_dir, dst_dir)
         if errors:
             QMessageBox.warning(self, "Merge", f"Moved {moved}, skipped {skipped}.\nErrors:\n" + "\n".join(errors[:5]))
         else:
@@ -2251,8 +2328,7 @@ class QtMusic2MP3Window(QMainWindow):
             if confirm != QMessageBox.StandardButton.Yes:
                 return
             try:
-                import shutil as _shutil
-                _shutil.rmtree(playlist_dir)
+                self._delete_playlist_folder(playlist_dir)
                 log.info("Deleted playlist folder: %s", playlist_dir)
             except Exception as e:
                 QMessageBox.critical(self, "Delete failed", str(e))
@@ -2261,7 +2337,7 @@ class QtMusic2MP3Window(QMainWindow):
             # Remove from library = delete manifest only
             if manifest_file and os.path.isfile(manifest_file):
                 try:
-                    os.remove(manifest_file)
+                    self._remove_manifest_file(manifest_file)
                     log.info("Removed manifest: %s", manifest_file)
                 except Exception as e:
                     QMessageBox.critical(self, "Delete failed", str(e))
@@ -2293,7 +2369,7 @@ class QtMusic2MP3Window(QMainWindow):
         self._append_to_library_manifest = None
         self._pending_sync_manifest = manifest
         self._sync_target_manifest = manifest
-        if source_type in {"spotify", "soundcloud"} and source_url:
+        if source_type in {"spotify", "soundcloud", "bandcamp"} and source_url:
             self._start_source_loader(source_type, source_url)
             return
         if source_type == "csv" and source_url and os.path.isfile(source_url):
@@ -2378,7 +2454,8 @@ class QtMusic2MP3Window(QMainWindow):
     @Slot(str)
     def _on_status(self, text: str):
         if self._worker:
-            self.footer_status_lbl.setText(text[:60])
+            prefix = self._sync_queue_status_prefix()
+            self.footer_status_lbl.setText((prefix + text)[:80])
 
     @Slot(str, object)
     def _on_item(self, ev: str, data_obj: object):
@@ -2475,6 +2552,8 @@ class QtMusic2MP3Window(QMainWindow):
 
     @Slot(str)
     def _on_done(self, out_dir: str):
+        sync_manifest = self._sync_target_manifest
+        appended_to_library = self._append_to_library_manifest is not None
         self.last_output_dir = out_dir
         elapsed = int(time.time() - self._started_at) if self._started_at else 0
         self._timer.stop()
@@ -2487,13 +2566,34 @@ class QtMusic2MP3Window(QMainWindow):
             self._set_footer_state("warning", f"done · {len(self._errors)} error(s)")
         else:
             self._set_footer_state("done", f"done · {self._total_tracks} tracks")
+        if sync_manifest or appended_to_library:
+            self._session_playlist = None
+            self._selected_playlist_idx = self._library_index_for_manifest(
+                sync_manifest or self._append_to_library_manifest
+            )
+        if self._sync_queue_active and sync_manifest:
+            if self._was_cancelled:
+                self._record_sync_queue_result(sync_manifest, "cancelled", "stopped by user")
+            elif self._errors:
+                self._record_sync_queue_result(
+                    sync_manifest,
+                    "done_with_errors",
+                    f"{len(self._errors)} track error(s)",
+                    error_count=len(self._errors),
+                )
+            else:
+                self._record_sync_queue_result(sync_manifest, "done")
         self._scan_library_root(show_empty=False)
 
     @Slot(str)
     def _on_failed(self, error_text: str):
         self._timer.stop()
         self._set_footer_state("error", "failed")
-        QMessageBox.critical(self, "Conversion error", error_text)
+        if self._sync_queue_active and self._sync_target_manifest:
+            self._record_sync_queue_result(self._sync_target_manifest, "failed", error_text)
+            self._set_footer_state("warning", "sync all · conversion failed · continuing")
+        else:
+            QMessageBox.critical(self, "Conversion error", error_text)
 
     def _on_worker_finished(self):
         sync_was_active = self._sync_target_manifest is not None
@@ -2506,16 +2606,20 @@ class QtMusic2MP3Window(QMainWindow):
         self._set_ui_enabled(True)
         self.stop_btn.setEnabled(False)
         self._update_convert_state()
-        if sync_was_active and self._sync_queue:
+        if sync_was_active and self._sync_queue_active:
             self._advance_sync_queue()
 
     def _stop_conversion(self):
         if self._worker:
-            self._sync_queue.clear()  # abort any pending sync-all queue
-            self._sync_queue_total = 0
+            if self._sync_queue_active:
+                self._sync_queue_cancel_requested = True
+                self._sync_queue.clear()  # abort any pending sync-all queue
+            else:
+                self._sync_queue.clear()
+                self._sync_queue_total = 0
             self._worker.stop()
             self._restyle(self.stop_btn, "danger")
-            self._set_footer_state("cancelled", "cancelling...")
+            self._set_footer_state("cancelled", "sync all · cancelling..." if self._sync_queue_active else "cancelling...")
             self.stop_btn.setEnabled(False)
 
     # ── Table helpers ──────────────────────────────────────────────────────────
@@ -2579,6 +2683,7 @@ class QtMusic2MP3Window(QMainWindow):
             "downloading": ("↓ {pct}%",       "#ff4d9e"),
             "converting":  ("↺ converting",   "#ffc857"),
             "done":        ("● done",         "#4fe6bf"),
+            "skipped":     ("↷ skipped",      "#00f5ff"),
             "failed":      ("✕ failed",       "#ff3355"),
             "cancelled":   ("■ cancelled",    "#9aa8ba"),
         }
@@ -2702,6 +2807,7 @@ class QtMusic2MP3Window(QMainWindow):
     def _show_error_dialog(self, idx: int):
         error_data = self._errors.get(idx, (f"Track {idx}", "No details.", "", {}, ""))
         title, msg, best_url, track_t, out_dir = error_data
+        is_ai_proposal = "AI suggested candidate" in msg
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Match failed — {title}")
@@ -2724,7 +2830,7 @@ class QtMusic2MP3Window(QMainWindow):
         # ── Best candidate link (if available) ──
         if best_url:
             link_row = QHBoxLayout()
-            link_lbl = QLabel("// best_candidate")
+            link_lbl = QLabel("// ai_proposal" if is_ai_proposal else "// best_candidate")
             link_lbl.setObjectName("kicker")
             link_row.addWidget(link_lbl)
             link_row.addSpacing(6)
@@ -2742,7 +2848,7 @@ class QtMusic2MP3Window(QMainWindow):
             layout.addLayout(link_row)
 
         # ── Custom URL input ──
-        url_sep = QLabel("// use_url")
+        url_sep = QLabel("// validate_url" if is_ai_proposal else "// use_url")
         url_sep.setObjectName("kicker")
         layout.addWidget(url_sep)
         url_row = QHBoxLayout()
@@ -2756,7 +2862,7 @@ class QtMusic2MP3Window(QMainWindow):
             "QLineEdit:focus { border-color:rgba(0,245,255,0.7); }"
         )
         url_row.addWidget(url_input)
-        retry_btn = QPushButton("↓  Download")
+        retry_btn = QPushButton("Validate + Download" if is_ai_proposal else "↓  Download")
         retry_btn.setObjectName("accent")
         retry_btn.setFixedHeight(32)
         retry_btn.setMinimumWidth(110)
@@ -2941,7 +3047,7 @@ class QtMusic2MP3Window(QMainWindow):
 
     def _mark_inflight_rows_cancelled(self):
         for idx, row in self._rows.items():
-            if row.get("state") not in {"done", "failed", "cancelled"}:
+            if row.get("state") not in {"done", "skipped", "failed", "cancelled"}:
                 self._set_row_state(idx, "cancelled")
 
     def _clear_download_rows(self):
@@ -3022,7 +3128,7 @@ class QtMusic2MP3Window(QMainWindow):
 
     def _update_convert_state(self):
         ok = bool(self.csv_path and os.path.isfile(self.csv_path) and self.output_folder)
-        busy = self._worker is not None or self._load_worker is not None
+        busy = self._worker is not None or self._load_worker is not None or self._sync_queue_active
         self.convert_btn.setEnabled(ok and not busy)
         self._update_library_actions()
 
@@ -3034,7 +3140,7 @@ class QtMusic2MP3Window(QMainWindow):
 
     def _set_ui_enabled(self, enabled: bool):
         for btn in (
-            self.add_spotify_btn, self.add_soundcloud_btn,
+            self.add_spotify_btn, self.add_soundcloud_btn, self.add_bandcamp_btn,
             self.add_csv_btn, self.add_scan_btn,
             self.library_scan_btn, self.library_choose_btn,
         ):

@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from unittest.mock import patch
 
@@ -52,6 +53,40 @@ class AIMatcherTests(unittest.TestCase):
     def test_google_advisor_uses_custom_prompt(self):
         advisor = GoogleGeminiMatchAdvisor("key", "gemini-2.5-flash", prompt="Custom DJ prompt")
         self.assertEqual(advisor.prompt, "Custom DJ prompt")
+
+    def test_google_advisor_sends_score_details(self):
+        class CapturingAdvisor(GoogleGeminiMatchAdvisor):
+            def _post_json(self, body):
+                self.body = body
+                return {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": '{"action":"reject","reason":"bad"}'}],
+                        }
+                    }]
+                }
+
+        advisor = CapturingAdvisor("key", "gemini-2.5-flash")
+        advisor.advise(
+            track={"title": "Track", "artists": "Artist", "duration_ms": 180000},
+            candidates=[{
+                "ai_id": 0,
+                "title": "Track lyrics",
+                "channel": "random",
+                "duration_s": 180,
+                "score": 0.31,
+                "score_details": {"artist_score": 0.0, "penalties": 0.07},
+                "url": "https://youtu.be/weak",
+            }],
+            query="Artist Track",
+            threshold=0.42,
+            strict=False,
+        )
+
+        prompt = advisor.body["contents"][0]["parts"][0]["text"]
+        payload = json.loads(prompt.split("Data:\n", 1)[1])
+        self.assertEqual(payload["candidates"][0]["score_details"]["artist_score"], 0.0)
+        self.assertEqual(payload["candidates"][0]["score_details"]["penalties"], 0.07)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from typing import Any
 
 
 MANIFEST_FILENAME = "music2mp3.manifest.json"
+IGNORE_FILENAME = ".music2mp3.ignore"
 SCHEMA_VERSION = 1
 _AUDIO_EXTS = {
     ".mp3",
@@ -49,6 +50,12 @@ def read_manifest(path_or_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
 def write_manifest(playlist_dir: str | os.PathLike[str], manifest: dict[str, Any]) -> Path:
     path = manifest_path(playlist_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ignore_path = path.parent / IGNORE_FILENAME
+    if ignore_path.exists():
+        try:
+            ignore_path.unlink()
+        except Exception:
+            pass
     with path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -108,6 +115,8 @@ def scan_library(root_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
     for child in sorted(legacy_dirs, key=lambda p: str(p).casefold()):
         resolved = _resolve_path(child)
         if _is_under_any(resolved, manifest_dirs):
+            continue
+        if (child / IGNORE_FILENAME).is_file():
             continue
         try:
             direct_files = [p for p in child.iterdir() if p.is_file()]

@@ -160,6 +160,8 @@ class Converter:
         self.safe_search: bool = bool(self.config.get("safe_search", True))
         self.ai_match_enabled: bool = bool(self.config.get("ai_match_enabled", False))
         self.ai_match_gray_min: float = max(0.0, min(1.0, float(self.config.get("ai_match_gray_min", 0.30))))
+        self.ai_match_min_confidence: float = max(0.0, min(1.0, float(self.config.get("ai_match_min_confidence", 0.72))))
+        self.ai_match_accept_margin: float = max(0.0, min(0.4, float(self.config.get("ai_match_accept_margin", 0.12))))
         self.duration_min: int = max(0, int(self.config.get("duration_min", 30)))
         self.duration_max: int = max(self.duration_min or 1, int(self.config.get("duration_max", 600)))
         self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
@@ -372,6 +374,19 @@ class Converter:
             )
             self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "SoundCloud set URL used as a single track")
             return
+        elif self._is_probable_bandcamp_album_url(url):
+            self.item_cb(
+                "error",
+                {
+                    "idx": idx,
+                    "message": (
+                        "Refusing to download a Bandcamp album URL as a single track. "
+                        "Load the Bandcamp release first so each track gets its own Source URL."
+                    ),
+                },
+            )
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "Bandcamp album URL used as a single track")
+            return
         cmd = self._build_ytdlp_cmd(url=url, out_path=str(dl_target), fmt_entry=fmt_entry)
 
         # Statut
@@ -482,6 +497,8 @@ class Converter:
             "ai_match_provider",
             "ai_match_model",
             "ai_match_gray_min",
+            "ai_match_min_confidence",
+            "ai_match_accept_margin",
             "output_mode",
             "output_format",
             "output_format_manual",
@@ -660,12 +677,25 @@ class Converter:
     def _pick_best_youtube_match(self, t: dict) -> tuple[dict | None, str, str | None]:
         """Returns (best_match, reject_reason, best_url_even_if_rejected)."""
         query = self._build_search_terms(t)
+        min_score = 0.58 if self.strict_match else 0.42
         candidates = self._search_youtube_candidates(query, self.match_candidates)
         if not candidates:
-            return None, (
-                f"No YouTube results for query: {query!r}\n"
-                "The track title/artist may be too obscure or misspelled."
-            ), None
+            ai_best, ai_reason = self._try_ai_youtube_match(
+                t=t,
+                original_query=query,
+                ranked_candidates=[],
+                min_score=min_score,
+                best_score=0.0,
+            )
+            if ai_best:
+                return self._ai_manual_validation_result(ai_best, ai_reason, min_score)
+            reason_lines = [
+                f"No YouTube results for query: {query!r}",
+                "The track title/artist may be too obscure or misspelled.",
+            ]
+            if ai_reason:
+                reason_lines.append(f"AI assist: {ai_reason}")
+            return None, "\n".join(reason_lines), None
 
         n_total = len(candidates)
         ranked, n_rejected_duration = self._rank_youtube_candidates(t, candidates)
@@ -694,7 +724,6 @@ class Converter:
                 )
             return None, reason, None
 
-        min_score = 0.58 if self.strict_match else 0.42
         if best_score < min_score:
             ai_best, ai_reason = self._try_ai_youtube_match(
                 t=t,
@@ -704,7 +733,7 @@ class Converter:
                 best_score=best_score,
             )
             if ai_best:
-                return ai_best, "", None
+                return self._ai_manual_validation_result(ai_best, ai_reason, min_score)
 
             best_title = str(best.get("title") or "?")
             best_channel = str(best.get("channel") or "")
@@ -732,6 +761,33 @@ class Converter:
             return None, "\n".join(reason_lines), best_url or None
 
         return best, "", None
+
+    def _ai_manual_validation_result(
+        self,
+        ai_best: dict,
+        ai_reason: str,
+        min_score: float,
+    ) -> tuple[None, str, str | None]:
+        ai_title = str(ai_best.get("title") or "?")
+        ai_channel = str(ai_best.get("channel") or "")
+        ai_url = str(ai_best.get("url") or "")
+        ai_score = float(ai_best.get("score") or 0.0)
+        ai_conf = ai_best.get("ai_confidence")
+        ai_reason_detail = str(ai_best.get("ai_reason") or ai_reason or "")
+        threshold_label = "strict (0.58)" if min_score >= 0.58 else "normal (0.42)"
+        reason_lines = [
+            f"AI suggested candidate: \"{ai_title}\"" + (f" — {ai_channel}" if ai_channel else ""),
+            f"Local match score: {ai_score:.2f}  |  Threshold: {threshold_label}",
+        ]
+        if isinstance(ai_conf, (int, float)):
+            reason_lines.append(f"AI confidence: {float(ai_conf):.2f}")
+        if ai_reason_detail:
+            reason_lines.append(f"AI reason: {ai_reason_detail}")
+        reason_lines.extend([
+            "",
+            "Manual validation required: open the failed track details and click Download only if this candidate is correct.",
+        ])
+        return None, "\n".join(reason_lines), ai_url or None
 
     def _rank_youtube_candidates(self, t: dict, candidates: list[dict]) -> tuple[list[dict], int]:
         ranked: list[dict] = []
@@ -765,7 +821,7 @@ class Converter:
     ) -> tuple[dict | None, str]:
         if not self.ai_match_enabled or not self._ai_match_advisor:
             return None, ""
-        if best_score < self.ai_match_gray_min:
+        if ranked_candidates and best_score < self.ai_match_gray_min:
             return None, "skipped; heuristic score below AI gray zone"
 
         first = self._ask_ai_match_advisor(
@@ -774,9 +830,9 @@ class Converter:
             query=original_query,
             threshold=min_score,
         )
-        best = self._apply_ai_match_advice(first, ranked_candidates)
+        best = self._apply_ai_match_advice(first, ranked_candidates, min_score=min_score)
         if best:
-            return best, f"accepted candidate ({first.confidence:.2f})"
+            return best, f"AI suggested candidate ({first.confidence:.2f})"
 
         if first.action == "retry" and first.query:
             retry_query = first.query[:160]
@@ -786,17 +842,18 @@ class Converter:
             if retry_ranked:
                 retry_best = retry_ranked[0]
                 if float(retry_best.get("score") or 0.0) >= min_score:
+                    retry_best["ai_confidence"] = first.confidence
                     retry_best["ai_reason"] = first.reason
-                    return retry_best, "accepted AI retry query by heuristic score"
+                    return retry_best, "AI retry query found a candidate"
                 second = self._ask_ai_match_advisor(
                     t=t,
                     candidates=retry_ranked[:6],
                     query=retry_query,
                     threshold=min_score,
                 )
-                best = self._apply_ai_match_advice(second, retry_ranked)
+                best = self._apply_ai_match_advice(second, retry_ranked, min_score=min_score)
                 if best:
-                    return best, f"accepted AI retry candidate ({second.confidence:.2f})"
+                    return best, f"AI suggested retry candidate ({second.confidence:.2f})"
                 return None, second.reason or "AI rejected retry candidates"
             return None, "AI retry query returned no acceptable candidates"
 
@@ -810,8 +867,6 @@ class Converter:
         query: str,
         threshold: float,
     ) -> AIMatchAdvice:
-        if not candidates:
-            return AIMatchAdvice(action="reject", reason="no candidates to inspect")
         for i, cand in enumerate(candidates):
             cand["ai_id"] = i
         try:
@@ -834,14 +889,27 @@ class Converter:
             log.warning("CONV: AI match advisor failed: %s", e)
             return AIMatchAdvice(action="reject", reason=f"AI unavailable: {e}")
 
-    @staticmethod
-    def _apply_ai_match_advice(advice: AIMatchAdvice, candidates: list[dict]) -> dict | None:
+    def _apply_ai_match_advice(self, advice: AIMatchAdvice, candidates: list[dict], *, min_score: float) -> dict | None:
         if advice.action != "accept" or advice.candidate_id is None:
             return None
-        if advice.confidence < 0.60:
+        if advice.confidence < self.ai_match_min_confidence:
+            log.info(
+                "CONV: AI suggestion ignored; confidence %.2f below %.2f",
+                advice.confidence,
+                self.ai_match_min_confidence,
+            )
             return None
+        accept_floor = max(self.ai_match_gray_min, min_score - self.ai_match_accept_margin)
         for cand in candidates:
             if int(cand.get("ai_id", -1)) == advice.candidate_id:
+                score = float(cand.get("score") or 0.0)
+                if score < accept_floor:
+                    log.info(
+                        "CONV: AI suggestion ignored; heuristic score %.2f below AI floor %.2f",
+                        score,
+                        accept_floor,
+                    )
+                    return None
                 item = dict(cand)
                 item["ai_confidence"] = advice.confidence
                 item["ai_reason"] = advice.reason
@@ -872,6 +940,11 @@ class Converter:
     def _is_probable_soundcloud_set_url(url: str) -> bool:
         low = (url or "").lower()
         return "soundcloud.com" in low and ("/sets/" in low or "/playlists/" in low)
+
+    @staticmethod
+    def _is_probable_bandcamp_album_url(url: str) -> bool:
+        low = (url or "").lower()
+        return ".bandcamp.com" in low and "/album/" in low
 
     def _search_youtube_candidates(self, query: str, limit: int) -> list[dict]:
         if self.cancel_event.is_set():

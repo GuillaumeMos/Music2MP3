@@ -59,7 +59,7 @@ tasks:
     desc: Vérifie la syntaxe Python (compileall)
     deps: [venv]
     cmds:
-      - '{{.PYTHON}} -m compileall ai_matcher.py app.py config.py converter.py gui.py library_manifest.py log_viewer.py logging_setup.py qt_app.py soundcloud_api.py spotify_api.py spotify_auth.py token_store.py utils.py tests'
+      - '{{.PYTHON}} -m compileall ai_matcher.py app.py bandcamp_api.py config.py converter.py gui.py library_manifest.py log_viewer.py logging_setup.py qt_app.py qt_workers.py soundcloud_api.py spotify_api.py spotify_auth.py token_store.py utils.py tests'
 
   check:
     desc: Exécute les vérifications de base (compile + tests)

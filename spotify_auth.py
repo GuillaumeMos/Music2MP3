@@ -71,7 +71,13 @@ class PKCEAuth:
 
         host = urlparse.urlparse(self.redirect_uri).hostname
         port = urlparse.urlparse(self.redirect_uri).port or 8765
-        httpd = HTTPServer((host, port), Handler)
+        try:
+            httpd = HTTPServer((host, port), Handler)
+        except OSError as e:
+            raise RuntimeError(
+                f"Spotify callback server could not start on {host}:{port}. "
+                "Close the app using that port or retry later."
+            ) from e
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
 

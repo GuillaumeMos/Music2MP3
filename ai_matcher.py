@@ -22,6 +22,9 @@ DEFAULT_AI_MATCH_PROMPT = (
     "You are a strict music matching assistant for a DJ downloader.\n"
     "Decide whether one YouTube result is the same music track as the source track.\n"
     "Prefer official audio, topic channels, and matching artist/title/duration.\n"
+    "Use accept only when artist, title, and duration strongly point to the same recording.\n"
+    "In this app, accept means recommend for manual user validation, not automatic download.\n"
+    "If confidence is below 0.72, use reject or retry instead of accept.\n"
     "Reject full sets, DJ mixes, live recordings, covers, karaoke, nightcore, sped up/slowed, "
     "lyrics-only, or remixes unless the source title explicitly asks for that variant.\n"
     "If no candidate is acceptable, propose one better YouTube search query."
@@ -70,13 +73,20 @@ class GoogleGeminiMatchAdvisor:
                     "channel": c.get("channel") or "",
                     "duration_s": c.get("duration_s"),
                     "heuristic_score": round(float(c.get("score") or 0.0), 3),
+                    "score_details": c.get("score_details") or {},
                     "url": c.get("url") or "",
                 }
                 for i, c in enumerate(candidates)
             ],
         }
+        safety_prompt = (
+            "Hard gates: use accept only when confidence is at least 0.72 and the candidate is clearly the same recording. "
+            "When title, artist, duration, or score_details are weak, return reject or retry. "
+            "Accept recommends a candidate for user validation; it never authorizes automatic download."
+        )
         prompt = (
             f"{self.prompt}\n"
+            f"{safety_prompt}\n"
             "Return only JSON with this shape: "
             '{"action":"accept|reject|retry","candidate_id":0,"query":"","confidence":0.0,"reason":"short"}\n'
             f"Data:\n{json.dumps(payload, ensure_ascii=False)}"

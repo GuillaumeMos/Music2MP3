@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import tempfile
 import unittest
@@ -18,6 +19,73 @@ from library_manifest import build_manifest, write_manifest
 
 def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+class _FakeButton:
+    def __init__(self, text: str):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+
+class _FakeDeleteMessageBox:
+    question_calls = 0
+    _click_text = ""
+
+    class ButtonRole:
+        AcceptRole = object()
+        DestructiveRole = object()
+        RejectRole = object()
+
+    class StandardButton:
+        Yes = 1
+        No = 2
+
+    @classmethod
+    def for_click(cls, click_text: str):
+        class _ConfiguredFakeDeleteMessageBox(cls):
+            pass
+
+        _ConfiguredFakeDeleteMessageBox._click_text = click_text
+        _ConfiguredFakeDeleteMessageBox.question_calls = 0
+        return _ConfiguredFakeDeleteMessageBox
+
+    def __init__(self, *_args, **_kwargs):
+        self._buttons: dict[str, _FakeButton] = {}
+
+    def setWindowTitle(self, _title):
+        pass
+
+    def setText(self, _text):
+        pass
+
+    def setInformativeText(self, _text):
+        pass
+
+    def addButton(self, text, _role):
+        btn = _FakeButton(text)
+        self._buttons[text] = btn
+        return btn
+
+    def exec(self):
+        return None
+
+    def clickedButton(self):
+        return self._buttons.get(self._click_text)
+
+    @classmethod
+    def question(cls, *_args, **_kwargs):
+        cls.question_calls += 1
+        return cls.StandardButton.Yes
+
+    @staticmethod
+    def warning(*_args, **_kwargs):
+        pass
+
+    @staticmethod
+    def critical(*_args, **_kwargs):
+        pass
 
 
 class QtAppSmokeTests(unittest.TestCase):
@@ -90,6 +158,44 @@ class QtAppSmokeTests(unittest.TestCase):
                 self.assertTrue(window.sync_btn.isEnabled())
                 self.assertEqual(window.hero_title_label.text(), "Warehouse")
                 self.assertIn("mp3", window.format_pill.text().lower())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_manifest_skipped_tracks_show_skipped_not_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Warehouse"
+            audio_file = playlist_dir / "Midnight Signal.mp3"
+            audio_file.parent.mkdir(parents=True, exist_ok=True)
+            audio_file.write_bytes(b"audio")
+            manifest = build_manifest(
+                playlist_name="Warehouse",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/demo",
+                    "name": "Warehouse",
+                },
+                settings={"incremental_update": True},
+                tracks=[{
+                    "idx": 1,
+                    "title": "Midnight Signal",
+                    "artists": "Local Artist",
+                    "status": "skipped",
+                    "format": "MP3",
+                    "file": audio_file.name,
+                }],
+            )
+            write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                window._on_playlist_item_clicked(0)
+                state_item = window.table.item(0, 4)
+                self.assertIsNotNone(state_item)
+                self.assertIn("skipped", state_item.text())
+                self.assertNotIn("cancelled", state_item.text())
             finally:
                 window.close()
                 window.deleteLater()
@@ -203,10 +309,323 @@ class QtAppSmokeTests(unittest.TestCase):
             root = Path(tmp)
             window = self._make_window(root)
             try:
-                self.assertIn(window.sync_btn.toolTip(), {"", "Sync selected playlist"})
-                self.assertEqual(window.sync_all_btn.toolTip(), "No playlists with a saved URL")
+                self.assertIn("Sync selected playlist", window.sync_btn.toolTip())
+                self.assertEqual(window.sync_all_btn.toolTip(), "Sync all playlists: no playlists with a saved URL")
                 self.assertLessEqual(window.sync_btn.height(), 24)
                 self.assertLessEqual(window.sync_all_btn.height(), 24)
+                self.assertEqual(window.library_scan_btn.toolTip(), "Scan library root")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_hover_tooltips_describe_icon_and_flag_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            window = self._make_window(root)
+            try:
+                self.assertEqual(window.logs_btn.toolTip(), "Open logs")
+                self.assertEqual(window.library_choose_btn.toolTip(), "Choose library root folder")
+                self.assertIn("Convert", window.convert_btn.toolTip())
+                self.assertIn("Stop", window.stop_btn.toolTip())
+                self.assertIn("Safe search", window.flag_btns["safe_search"].toolTip())
+                self.assertIn("Open settings", window.format_pill.toolTip())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_bandcamp_manifest_is_syncable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Bandcamp Release"
+            manifest = build_manifest(
+                playlist_name="Bandcamp Release",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "bandcamp",
+                    "url": "https://artist.bandcamp.com/album/release",
+                    "name": "Bandcamp Release",
+                },
+                settings={},
+                tracks=[],
+            )
+            write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                self.assertEqual(len(window.library_items), 1)
+                self.assertTrue(window._manifest_is_syncable(window.library_items[0]))
+                window._on_playlist_item_clicked(0)
+                self.assertTrue(window.sync_btn.isEnabled())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_sync_all_continues_after_source_load_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("One", "Two"):
+                playlist_dir = root / name
+                manifest = build_manifest(
+                    playlist_name=name,
+                    playlist_dir=playlist_dir,
+                    source={
+                        "type": "spotify",
+                        "url": f"https://open.spotify.com/playlist/{name.lower()}",
+                        "name": name,
+                    },
+                    settings={},
+                    tracks=[],
+                )
+                write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                started: list[str] = []
+
+                def fail_loader(_mode, url):
+                    started.append(url)
+                    window._on_source_failed(f"boom {len(started)}")
+                    window._on_source_loader_finished()
+
+                window._start_source_loader = fail_loader
+                with patch("qt_app.QMessageBox.critical") as critical:
+                    window._sync_all_library_playlists()
+
+                self.assertEqual(len(started), 2)
+                self.assertFalse(window._sync_queue_active)
+                self.assertEqual(
+                    [r["status"] for r in window._sync_queue_results],
+                    ["load_failed", "load_failed"],
+                )
+                critical.assert_not_called()
+                self.assertIn("failed/skipped", window.footer_status_lbl.text().lower())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_sync_source_load_does_not_create_duplicate_session_playlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Test"
+            manifest = build_manifest(
+                playlist_name="Test",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/test",
+                    "name": "Test",
+                },
+                settings={},
+                tracks=[],
+            )
+            write_manifest(playlist_dir, manifest)
+
+            csv_path = root / "loaded.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                })
+
+            window = self._make_window(root)
+            try:
+                window._on_playlist_item_clicked(0)
+                target = window._selected_library_manifest()
+                window._pending_sync_manifest = target
+                window._sync_target_manifest = target
+
+                window._on_source_loaded({
+                    "csv_path": str(csv_path),
+                    "playlist_name": "Test",
+                    "count": 1,
+                    "source": "Spotify",
+                    "source_type": "spotify",
+                    "source_url": "https://open.spotify.com/playlist/test",
+                })
+
+                self.assertIsNone(window._session_playlist)
+                self.assertEqual(window._selected_playlist_idx, 0)
+                self.assertEqual(len(window._playlist_item_widgets), len(window.library_items))
+                self.assertEqual([w._name_lbl.text() for w in window._playlist_item_widgets], ["Test"])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_done_after_sync_clears_temporary_session_playlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Test"
+            manifest = build_manifest(
+                playlist_name="Test",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/test",
+                    "name": "Test",
+                },
+                settings={},
+                tracks=[],
+            )
+            write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                target = window.library_items[0]
+                window._selected_playlist_idx = 0
+                window._sync_target_manifest = target
+                window._session_playlist = {"name": "Test", "source_type": "spotify", "count": 1}
+
+                window._on_done(str(playlist_dir))
+
+                self.assertIsNone(window._session_playlist)
+                self.assertEqual(len(window._playlist_item_widgets), len(window.library_items))
+                self.assertEqual([w._name_lbl.text() for w in window._playlist_item_widgets], ["Test"])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_bandcamp_loader_writes_csv_payload(self):
+        rows = [{
+            "Track Name": "Track",
+            "Artist Name(s)": "Artist",
+            "Album Name": "Release",
+            "Duration (ms)": 180000,
+            "Source URL": "https://artist.bandcamp.com/track/track",
+            "Track URI": "bandcamp:track:1",
+        }]
+        worker = qt_app.PlaylistLoadWorker(
+            "bandcamp",
+            "https://artist.bandcamp.com/album/release",
+            {},
+        )
+        with patch("qt_workers.BandcampClient.fetch_playlist", return_value=(rows, "Release")):
+            payload = worker._load_bandcamp()
+
+        try:
+            self.assertEqual(payload["source_type"], "bandcamp")
+            self.assertEqual(payload["playlist_name"], "Release")
+            with open(payload["csv_path"], newline="", encoding="utf-8") as f:
+                loaded = list(csv.DictReader(f))
+            self.assertEqual(loaded[0]["Track Name"], "Track")
+            self.assertEqual(loaded[0]["Track URI"], "bandcamp:track:1")
+        finally:
+            Path(payload["csv_path"]).unlink(missing_ok=True)
+
+    def test_library_file_helpers_move_skip_and_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            dst = root / "dst"
+            src.mkdir()
+            dst.mkdir()
+            (src / "move.mp3").write_bytes(b"audio")
+            (src / "skip.mp3").write_bytes(b"src")
+            (src / "notes.txt").write_text("ignore", encoding="utf-8")
+            (dst / "skip.mp3").write_bytes(b"dst")
+
+            moved, skipped, errors = qt_app.QtMusic2MP3Window._merge_playlist_audio_files(str(src), str(dst))
+
+            self.assertEqual((moved, skipped, errors), (1, 1, []))
+            self.assertFalse((src / "move.mp3").exists())
+            self.assertTrue((dst / "move.mp3").is_file())
+            self.assertTrue((src / "notes.txt").is_file())
+
+            manifest_file = src / "music2mp3.manifest.json"
+            manifest_file.write_text("{}", encoding="utf-8")
+            qt_app.QtMusic2MP3Window._remove_manifest_file(str(manifest_file))
+            self.assertFalse(manifest_file.exists())
+
+            qt_app.QtMusic2MP3Window._delete_playlist_folder(str(src))
+            self.assertFalse(src.exists())
+
+    def test_context_rename_updates_manifest_and_sidebar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Old"
+            manifest = build_manifest(
+                playlist_name="Old",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/old", "name": "Old"},
+                settings={},
+                tracks=[],
+            )
+            manifest_path = write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                self.assertEqual(window.library_items[0]["playlist_name"], "Old")
+                with patch("qt_app.QInputDialog.getText", return_value=("New Name", True)):
+                    window._ctx_rename(0, window.library_items[0])
+
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(data["playlist_name"], "New Name")
+                self.assertEqual(window.library_items[0]["playlist_name"], "New Name")
+                self.assertEqual(window._playlist_item_widgets[0]._name_lbl.text(), "New Name")
+                self.assertEqual(window.hero_title_label.text(), "New Name")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_context_delete_remove_from_library_keeps_audio_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Keep Audio"
+            audio_file = playlist_dir / "Track.mp3"
+            audio_file.parent.mkdir(parents=True, exist_ok=True)
+            audio_file.write_bytes(b"audio")
+            manifest = build_manifest(
+                playlist_name="Keep Audio",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/keep", "name": "Keep Audio"},
+                settings={},
+                tracks=[],
+            )
+            manifest_path = write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                with patch("qt_app.QMessageBox", _FakeDeleteMessageBox.for_click("Remove from library")):
+                    window._ctx_delete(0, window.library_items[0])
+
+                self.assertFalse(manifest_path.exists())
+                self.assertTrue(audio_file.exists())
+                self.assertEqual(window.library_items, [])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_context_delete_everything_removes_playlist_folder_after_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Delete All"
+            audio_file = playlist_dir / "Track.mp3"
+            audio_file.parent.mkdir(parents=True, exist_ok=True)
+            audio_file.write_bytes(b"audio")
+            manifest = build_manifest(
+                playlist_name="Delete All",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/delete", "name": "Delete All"},
+                settings={},
+                tracks=[],
+            )
+            write_manifest(playlist_dir, manifest)
+
+            window = self._make_window(root)
+            try:
+                fake_box = _FakeDeleteMessageBox.for_click("Delete everything")
+                with patch("qt_app.QMessageBox", fake_box):
+                    window._ctx_delete(0, window.library_items[0])
+
+                self.assertFalse(playlist_dir.exists())
+                self.assertEqual(window.library_items, [])
+                self.assertEqual(fake_box.question_calls, 1)
             finally:
                 window.close()
                 window.deleteLater()
