@@ -2988,7 +2988,7 @@ class QtMusic2MP3Window(QMainWindow):
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
         except Exception:
-            pass
+            log.exception("Failed to save config to %s", CONFIG_FILE)
 
     def _refresh_action_context(self):
         if not hasattr(self, "action_output_lbl"):

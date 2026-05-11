@@ -159,7 +159,7 @@ Style "CLI" : `[x] flag_name` (activé) / `[ ] flag_name` (désactivé), en UPPE
 
 ### Composants implémentés dans `qt_app.py` (état actuel)
 
-Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~2010 lignes). Les classes clés :
+Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~3100 lignes). Les classes clés :
 
 - **`QtMusic2MP3Window`** (`QMainWindow`) — conteneur principal, QSS global inline (`APP_QSS`)
 - **`ArtworkWidget`** (`QWidget`) — `paintEvent` avec `QLinearGradient` dérivé du nom via `hashlib.md5`
@@ -175,10 +175,10 @@ Tout le code Qt est actuellement dans un fichier monolithique `qt_app.py` (~2010
 
 ```
 Music2MP3/
-├── qt_app.py               # UI Qt principale (monolithe ~2010 lignes)
+├── qt_app.py               # UI Qt principale (monolithe ~3100 lignes)
 ├── app.py                  # entry point UI Tk (legacy)
 ├── gui.py                  # UI Tkinter (~1085 lignes, legacy)
-├── converter.py            # logique download + matching (~972 lignes)
+├── converter.py            # logique download + matching (~1260 lignes)
 ├── spotify_api.py          # client Spotify API REST
 ├── spotify_auth.py         # OAuth PKCE flow
 ├── soundcloud_api.py       # client SoundCloud via yt-dlp
@@ -201,8 +201,10 @@ Music2MP3/
 ├── devtools/
 │   └── ui_preview.py       # outil de preview UI hors app
 ├── tests/
+│   ├── test_ai_matcher.py
 │   ├── test_converter_helpers.py
 │   ├── test_library_manifest.py
+│   ├── test_qt_app_smoke.py
 │   ├── test_soundcloud_api.py
 │   ├── test_spotify_api.py
 │   └── test_spotify_auth.py
@@ -337,7 +339,8 @@ import PySide6  # import du package entier
 task install         # crée .venv + installe requirements.txt
 
 # Lancement
-task run:qt          # UI Qt (défaut recommandé)
+task run             # UI Qt (défaut)
+task run:qt          # UI Qt explicite
 task run:tk          # UI Tkinter (legacy)
 
 # Tests
@@ -466,8 +469,8 @@ task notarize:macos  # notarytool + staple
 1. **Avant de coder** : relire la section concernée de ce fichier
 2. **Si tu changes l'archi ou la direction visuelle** : update ce fichier **en premier**
 3. **Commits** : préfixe le scope (`ui:`, `core:`, `build:`, `docs:`)
-4. **Tests** : `task test` — les tests couvrent converter, library_manifest, spotify_api, soundcloud_api, spotify_auth
-5. **Avant un build** : `task run:qt` doit fonctionner sans erreur
+4. **Tests** : `task test` — les tests couvrent converter, library_manifest, IA matching, Qt smoke, spotify_api, soundcloud_api, spotify_auth
+5. **Avant un build** : `task run` ou `task run:qt` doit fonctionner sans erreur
 
 ---
 
@@ -477,11 +480,9 @@ task notarize:macos  # notarytool + staple
 - `GOOGLE_API_KEY` / `GEMINI_API_KEY` — override optionnel de la clé IA; Settings stocke sinon dans le keychain
 - `GEMINI_MODEL` / `GOOGLE_AI_MODEL` — override le modèle IA, défaut `gemini-2.5-flash`
 - `APP_LOG_LEVEL=DEBUG` — active le logging DEBUG
-- `MUSIC2MP3_CONFIG=/path/to/config.json` — utilise un autre fichier de config
-- `MUSIC2MP3_ROOT=/path/to/library` — override le root dir
 
 ---
 
-*Direction visuelle cyberpunk validée — voir `/docs/mockup-cyberpunk.png` pour la référence.*
-*Stack actuelle : Python 3.14 + PySide6 + yt-dlp + ffmpeg, build PyInstaller via Taskfile.*
-*Dernière mise à jour : audit complet du code réel — synchronisation archi cible vs état actuel (2026-04-28).*
+*Direction visuelle cyberpunk validée dans ce guide.*
+*Stack actuelle : Python 3.14 + PySide6 + yt-dlp + ffmpeg, build PyInstaller via Taskfile et GitHub Actions.*
+*Dernière mise à jour : synchronisation repo/docs/CI (2026-05-11).*

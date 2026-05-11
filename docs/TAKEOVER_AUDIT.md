@@ -1,158 +1,111 @@
-# Music2MP3 - Takeover Audit
+# Music2MP3 - Repo Update Audit
 
-## 1) Snapshot
+Derniere mise a jour : 2026-05-11
 
-Application desktop Tkinter qui:
-- charge une playlist depuis Spotify (OAuth PKCE), SoundCloud (sans auth), CSV, ou liste texte,
-- convertit les pistes via `yt-dlp` + `ffmpeg` en audio local (mp3/m4a/aac/wav/flac/aiff),
-- affiche progression globale + par piste, avec logs live et annulation.
+## 1) Snapshot actuel
 
-## 2) Module Cartography
+Music2MP3 est maintenant principalement une app desktop Python/PySide6. Le flux Tkinter existe encore (`app.py`, `gui.py`), mais le chemin produit actif est `qt_app.py`.
 
-### Core to keep (production path)
+Fonctions confirmees dans le code et les tests :
+- import Spotify via OAuth PKCE sans client secret,
+- import SoundCloud public/secret link via `yt-dlp`,
+- import CSV,
+- conversion audio via `yt-dlp` + `ffmpeg`,
+- formats manual/auto : mp3, m4a, aac, wav, flac, aiff,
+- matching securise avec safe/strict/deep search,
+- aide IA Gemini optionnelle pour les matchs en zone grise,
+- generation `playlist.m3u8`,
+- manifest par playlist (`music2mp3.manifest.json`),
+- scan de bibliotheque locale, sync selected et sync all,
+- UI Qt avec library panel, logs, settings, actions contextuelles.
 
-- `app.py`
-  - Entrypoint, init logging, init fenêtre, bind F12 pour la console de logs.
-- `gui.py`
-  - UI principale, orchestration des loaders (Spotify/SoundCloud/texte/CSV), lancement conversion, polling queue, rendu progrès/erreurs.
-- `converter.py`
-  - Pipeline métier de conversion, workers parallèles, commandes `yt-dlp`, conversion AIFF via `ffmpeg`, génération M3U.
-- `spotify_api.py`
-  - Client Spotify API robuste (retries + pagination), fetch playlist -> rows CSV.
-- `spotify_auth.py`
-  - OAuth PKCE local callback `127.0.0.1:8765`.
-- `soundcloud_api.py`
-  - Extraction métadonnées playlist/track SoundCloud via `yt-dlp --dump-single-json`.
-- `config.py`
-  - Chargement config par défaut + merge `config.json`.
-- `utils.py`
-  - utilitaires UI/tooltips, ouverture dossiers/fichiers, wrappers subprocess.
-- `logging_setup.py`, `log_viewer.py`
-  - logging fichier/stdout + viewer live dans l’app.
-- `packaging/Music2MP3-*.spec`
-  - packaging Windows/macOS/Linux.
+Etat verifie localement :
+- branche : `new-ui`,
+- working tree propre avant les changements d'audit,
+- Python local : 3.14.4,
+- tests : `50` tests OK via `.venv/bin/python -m unittest discover -s tests -v`.
 
-### Keep but refactor soon
+## 2) Cartographie des modules
 
-- `config.json`
-  - utile pour defaults et `spotify_client_id`, mais stratégie de persistance actuelle fragile en binaire packagé.
-- `requirements.txt`
-  - fonctionne pour dev, mais contient des dépendances non utilisées aujourd’hui.
+### Chemin produit principal
 
-### Legacy / currently unused (candidats suppression)
+- `qt_app.py` : UI PySide6 principale, orchestration sources, library, conversion, settings, logs.
+- `converter.py` : pipeline de conversion, matching, workers paralleles, M3U, manifest.
+- `library_manifest.py` : lecture/ecriture manifest, scan recursif, dedup des playlists.
+- `spotify_auth.py` : OAuth PKCE + refresh token.
+- `spotify_api.py` : client REST Spotify, extraction playlist.
+- `soundcloud_api.py` : extraction SoundCloud via `yt-dlp`.
+- `ai_matcher.py` : conseil Gemini optionnel, cle stockee via keyring ou variables d'env.
+- `config.py` : defaults depuis le bundle + overrides utilisateur par OS.
+- `token_store.py` : wrapper keyring pour refresh token Spotify.
+- `logging_setup.py` : logging legacy Tk; Qt a aussi un handler en memoire.
 
-- `spotify_public_scraper.py`
-  - vide.
-- `live_subprocess.py`
-  - helper non référencé.
-- `artwork.py`
-  - non référencé dans le flux actuel.
-- `token_store.py`
-  - prévu pour persistance refresh token, mais jamais branché dans `gui.py`.
-- `utils_net.py`
-  - non utilisé (duplicata partiel du retry de `spotify_api.py`).
-- `devtools/ui_preview.py`
-  - utile seulement pour preview dev (à garder en outil interne ou déplacer dans dossier `devtools/`).
+### Legacy conserve
 
-## 3) Gaps and inconsistencies (important)
+- `app.py` : entrypoint Tkinter.
+- `gui.py` : UI Tk legacy.
+- `log_viewer.py` : viewer de logs Tk.
 
-- README != comportement réel sur 2 points:
-  - Drag & drop CSV annoncé, mais pas de binding DnD effectif dans `gui.py`.
-  - `manifest.json` et dédup avancée annoncés, mais le code fait surtout un skip si le fichier final existe.
-- Persistance config potentiellement cassée en build packagé:
-  - `CONFIG_FILE = resource_path("config.json")` vise un chemin bundle/temp, pas un dossier utilisateur stable.
-- Génération M3U non déterministe:
-  - `self._made_files` est alimenté par des workers en parallèle, donc l’ordre peut dépendre de la fin des threads.
-- Aucune suite de tests (unitaires/intégration) sur le cœur métier (`converter`, parsers API).
+### Build, docs et tests
 
-## 4) Prioritized improvement backlog
+- `Taskfile.yml` : commandes dev, test, build et packaging.
+- `packaging/` : specs PyInstaller Qt et Tk par plateforme.
+- `.github/workflows/build.yml` : workflow manuel de release multi-OS.
+- `tests/` : couverture unittest core + smoke Qt offscreen.
+- `devtools/ui_preview.py` : outil local de preview UI.
 
-## P0 - Stabilize behavior/documentation contract
+## 3) Points forts
 
-1. Corriger la persistance de config utilisateur (critique)
-- Impact: élevé
-- Effort: moyen
-- Action:
-  - Introduire un chemin user-data par OS (ex: `~/.music2mp3/config.json` sur Linux/macOS, `%APPDATA%\\Music2MP3\\config.json` sur Windows).
-  - Utiliser ce chemin pour lecture/écriture; garder `config.json` du repo comme template de defaults.
+- Base de tests solide pour un MVP desktop : converter, manifest, auth/API et smoke UI Qt.
+- Separation fonctionnelle correcte entre conversion, API sources, manifest et UI, meme si `qt_app.py` reste monolithique.
+- Les points critiques de l'ancien audit sont traites : config utilisateur stable, M3U ordonne, token store branche, manifests reels, tests presents.
+- README et `CLAUDE.md` refletent globalement la direction actuelle : Qt par defaut, Tk legacy.
 
-2. Aligner README avec le code (ou implémenter les features promises)
-- Impact: élevé
-- Effort: faible à moyen
-- Action:
-  - Soit implémenter vrai drag-and-drop CSV + manifest/dédup avancée,
-  - soit documenter honnêtement le comportement actuel.
+## 4) Risques et incoherences restantes
 
-3. Rendre l’ordre M3U déterministe
-- Impact: moyen/élevé (UX)
-- Effort: faible
-- Action:
-  - Stocker `(idx, filename)` puis trier avant écriture M3U.
+1. `qt_app.py` est tres gros (~3100 lignes).
+   - Risque : evolution UI plus lente, tests plus difficiles a cibler.
+   - Action : extraire progressivement `dialogs/`, `widgets/`, `library/`, `workers/`.
 
-## P1 - Reduce technical debt and regressions
+2. Des artefacts de cache Python etaient encore suivis par Git.
+   - Risque : bruit dans les diffs, confusion entre environnements Python.
+   - Action : retirer les `__pycache__/*.pyc` de l'index et s'appuyer sur `.gitignore`.
 
-4. Brancher `token_store.py` (ou le supprimer)
-- Impact: moyen
-- Effort: faible
-- Action:
-  - soit intégrer `RefreshTokenStore` dans `PKCEAuth` depuis `gui.py`,
-  - soit retirer le module et simplifier.
+3. `logo_test.png` etait suivi mais non reference.
+   - Risque : asset lourd inutile dans le repo.
+   - Action : retire de l'index; le fichier reste local et ignore.
 
-5. Nettoyer dépendances non utilisées
-- Impact: moyen (maintenance, sécurité supply chain)
-- Effort: faible
-- Action:
-  - retirer `selenium`, `webdriver-manager`, `beautifulsoup4` si non requis.
+4. Gestion d'erreurs parfois large.
+   - Exemples : plusieurs `except Exception` dans l'UI et le converter.
+   - Action : continuer a logger les echecs critiques et reduire les handlers larges quand le contexte est clair.
 
-6. Ajouter tests minimaux sur le cœur
-- Impact: élevé
-- Effort: moyen
-- Scope initial:
-  - `converter._sanitize_filename`, `_looks_instrumental`, `_build_search_query`, `_rows_to_jobs`
-  - parsing progression `yt-dlp`
-  - `SpotifyClient.extract_playlist_id`
+## 5) Backlog priorise
 
-## P2 - Product quality improvements
+### P0 - Hygiene et coherence
 
-7. Implémenter vrai drag-and-drop CSV
-- Impact: moyen
-- Effort: faible/moyen
-- Action:
-  - exploiter `tkinterdnd2` quand dispo et fallback browse.
+1. Committer l'hygiene repo : ignores, retrait des caches, retrait de `logo_test.png` de l'index.
+2. Verifier le premier build GitHub Actions en Python 3.14 sur les trois OS.
+3. Garder `CLAUDE.md` synchronise quand `qt_app.py` sera decoupe.
 
-8. Améliorer annulation/robustesse auth
-- Impact: moyen
-- Effort: moyen
-- Action:
-  - timeout/cancel dans boucle d’attente PKCE,
-  - gestion port callback déjà occupé.
+### P1 - Fiabilite produit
 
-9. Factoriser réseau/réessais
-- Impact: faible/moyen
-- Effort: faible
-- Action:
-  - supprimer `utils_net.py` ou l’utiliser réellement partout.
+1. Ajouter des tests sur les actions destructives library : delete, merge, rename.
+2. Ajouter un test de non-regression sur `task run`/entrypoint Qt si possible via smoke import.
+3. Durcir les erreurs OAuth/port local deja occupe.
 
-## 5) Suggested execution plan (short)
+### P2 - Architecture
 
-Sprint 1 (safe + high ROI):
-1. Fix persistance config user-dir.
-2. Fix ordre M3U déterministe.
-3. README sync avec comportement réel.
-4. Supprimer code/dépendances mortes évidentes.
+1. Extraire les dialogs Qt : add source, settings, logs, match detail.
+2. Extraire les widgets purs : artwork, hero, playlist item, progress/status cells.
+3. Isoler la logique library UI dans un module dedie.
 
-Sprint 2 (fiabilité):
-1. Brancher token store + harden PKCE timeout/port.
-2. Ajouter test suite de base + CI simple.
-3. Implémenter vrai DnD CSV.
+## 6) Commandes utiles
 
-## 6) Removal candidates checklist
-
-Supprimer après validation finale:
-- `spotify_public_scraper.py`
-- `live_subprocess.py`
-- `utils_net.py`
-- `artwork.py` (si pas de plan d’embed cover en roadmap)
-
-Garder comme devtool:
-- `devtools/ui_preview.py`
+```bash
+task run          # UI Qt par defaut
+task run:qt       # UI Qt explicite
+task run:tk       # UI Tk legacy
+task test         # unittest
+task compile      # compileall des modules source + tests
+task check        # compile + tests
+```

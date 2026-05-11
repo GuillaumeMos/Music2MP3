@@ -26,10 +26,10 @@ tasks:
       - '{{.PIP}} install -r requirements.txt'
 
   run:
-    desc: Lance l'application
+    desc: Lance l'application Qt
     deps: [install]
     cmds:
-      - '{{.PYTHON}} app.py'
+      - '{{.PYTHON}} qt_app.py'
 
   run:tk:
     desc: Lance l'UI Tk (legacy)
@@ -59,7 +59,7 @@ tasks:
     desc: Vérifie la syntaxe Python (compileall)
     deps: [venv]
     cmds:
-      - '{{.PYTHON}} -m compileall app.py qt_app.py gui.py converter.py library_manifest.py spotify_auth.py token_store.py tests'
+      - '{{.PYTHON}} -m compileall ai_matcher.py app.py config.py converter.py gui.py library_manifest.py log_viewer.py logging_setup.py qt_app.py soundcloud_api.py spotify_api.py spotify_auth.py token_store.py utils.py tests'
 
   check:
     desc: Exécute les vérifications de base (compile + tests)

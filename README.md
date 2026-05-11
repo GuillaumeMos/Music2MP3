@@ -54,6 +54,7 @@ Grab the latest build from the **Releases** page:
 
 The **PySide6 / Qt** frontend is the default build target.
 
+- Run default app: `task run`
 - Run: `task run:qt`
 - Scope: Spotify/SoundCloud/CSV loading + output options + live downloads panel
 - Library panel: choose a root folder, scan playlist manifests, open a playlist folder, or sync a selected Spotify/SoundCloud/CSV-backed playlist.
