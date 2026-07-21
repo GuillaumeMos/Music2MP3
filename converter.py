@@ -175,6 +175,12 @@ class Converter:
         self._segments: int = max(1, min(8, self.concurrency))  # parallélisme segments yt-dlp
         self.auto_best: bool = self.output_mode == "auto"
         self.append_to_existing_playlist: bool = bool(self.config.get("append_to_existing_playlist", False))
+        try:
+            self.replace_manifest_track_idx = max(
+                0, int(self.config.get("replace_manifest_track_idx") or 0)
+            )
+        except (TypeError, ValueError):
+            self.replace_manifest_track_idx = 0
 
         # pour la M3U
         self._made_files_lock = threading.Lock()
@@ -614,7 +620,14 @@ class Converter:
             if self.append_to_existing_playlist and previous:
                 previous_tracks = previous.get("tracks")
                 if isinstance(previous_tracks, list):
-                    tracks = self._merge_manifest_tracks(previous_tracks, tracks)
+                    if self.replace_manifest_track_idx and len(tracks) == 1:
+                        tracks = self._replace_manifest_track(
+                            previous_tracks,
+                            tracks[0],
+                            self.replace_manifest_track_idx,
+                        )
+                    else:
+                        tracks = self._merge_manifest_tracks(previous_tracks, tracks)
             manifest = build_manifest(
                 playlist_name=str(playlist_name),
                 playlist_dir=out_dir,
@@ -639,6 +652,42 @@ class Converter:
         if title or artists:
             return f"title:{artists}|{title}"
         return ""
+
+    @staticmethod
+    def _replace_manifest_track(
+        previous_tracks: list,
+        incoming_track: dict,
+        target_idx: int,
+    ) -> list[dict]:
+        """Replace one retry target by its original manifest index."""
+        replacement = dict(incoming_track)
+        replacement["idx"] = target_idx
+        merged: list[dict] = []
+        replaced = False
+
+        for track in previous_tracks:
+            if not isinstance(track, dict):
+                continue
+            try:
+                current_idx = int(track.get("idx") or 0)
+            except (TypeError, ValueError):
+                current_idx = 0
+            if current_idx != target_idx:
+                merged.append(dict(track))
+                continue
+
+            updated = dict(track)
+            for stale_key in ("error", "suggested_url", "match"):
+                updated.pop(stale_key, None)
+            updated.update(replacement)
+            updated["idx"] = target_idx
+            merged.append(updated)
+            replaced = True
+
+        if not replaced:
+            merged.append(replacement)
+        merged.sort(key=lambda track: int(track.get("idx") or 0))
+        return merged
 
     @classmethod
     def _merge_manifest_tracks(cls, previous_tracks: list, new_tracks: list[dict]) -> list[dict]:

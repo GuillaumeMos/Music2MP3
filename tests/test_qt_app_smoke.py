@@ -90,6 +90,12 @@ class _FakeDeleteMessageBox:
 
 
 class QtAppSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self._config_dir = tempfile.TemporaryDirectory()
+        test_config = Path(self._config_dir.name) / "config.json"
+        self._config_patch = patch.object(qt_app, "CONFIG_FILE", str(test_config))
+        self._config_patch.start()
+
     def _make_window(self, root: Path):
         app = _app()
         original_load_config = qt_app.load_config
@@ -117,6 +123,8 @@ class QtAppSmokeTests(unittest.TestCase):
 
     def tearDown(self):
         _app().processEvents()
+        self._config_patch.stop()
+        self._config_dir.cleanup()
 
     def test_main_window_scans_manifest_library(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +289,140 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
+    def test_retry_success_refreshes_manifest_attention_and_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Retry playlist"
+            failed_manifest = build_manifest(
+                playlist_name="Retry playlist",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/retry",
+                    "name": "Retry playlist",
+                },
+                settings={},
+                tracks=[{
+                    "idx": 7,
+                    "title": "Blocked track",
+                    "artists": "Artist",
+                    "status": "failed",
+                    "file": "",
+                    "error": "Download blocked",
+                }],
+            )
+            write_manifest(playlist_dir, failed_manifest)
+            window = self._make_window(root)
+            try:
+                self.assertEqual(len(window._attention_items), 1)
+                audio_path = playlist_dir / "Artist - Blocked track.mp3"
+                audio_path.write_bytes(b"audio")
+                done_manifest = build_manifest(
+                    playlist_name="Retry playlist",
+                    playlist_dir=playlist_dir,
+                    source=failed_manifest["source"],
+                    settings={},
+                    tracks=[{
+                        "idx": 7,
+                        "title": "Blocked track",
+                        "artists": "Artist",
+                        "status": "done",
+                        "file": audio_path.name,
+                        "format": "MP3",
+                    }],
+                    previous_manifest=failed_manifest,
+                )
+                write_manifest(playlist_dir, done_manifest)
+                window._retry_context = {
+                    "idx": 7,
+                    "title": "Blocked track",
+                    "out_dir": str(playlist_dir),
+                    "succeeded": True,
+                    "failed": False,
+                }
+                window._total_tracks = 1
+                window._started_at = time.time()
+
+                window._on_done(str(playlist_dir))
+
+                self.assertEqual(len(window._attention_items), 0)
+                self.assertEqual(window.needs_attention_btn.text(), "Needs attention · 0")
+                self.assertEqual(
+                    window.footer_status_lbl.text(),
+                    "Retry successful · Blocked track",
+                )
+                self.assertEqual(window.table.item(0, 4).text(), "● done")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_retry_failure_stays_in_attention_with_clear_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Retry playlist"
+            failed_manifest = build_manifest(
+                playlist_name="Retry playlist",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/retry",
+                    "name": "Retry playlist",
+                },
+                settings={},
+                tracks=[{
+                    "idx": 7,
+                    "title": "Blocked track",
+                    "artists": "Artist",
+                    "status": "failed",
+                    "file": "",
+                    "error": "The manual URL is unavailable",
+                }],
+            )
+            write_manifest(playlist_dir, failed_manifest)
+            window = self._make_window(root)
+            try:
+                window._retry_context = {
+                    "idx": 7,
+                    "title": "Blocked track",
+                    "out_dir": str(playlist_dir),
+                    "succeeded": False,
+                    "failed": True,
+                }
+                window._total_tracks = 1
+                window._started_at = time.time()
+
+                window._on_done(str(playlist_dir))
+
+                self.assertEqual(len(window._attention_items), 1)
+                self.assertEqual(window.needs_attention_btn.text(), "Needs attention · 1")
+                self.assertEqual(
+                    window.footer_status_lbl.text(),
+                    "Retry failed · Blocked track",
+                )
+                self.assertIn(7, window._errors)
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_retry_worker_cleanup_removes_temporary_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            retry_csv = root / "retry.csv"
+            retry_csv.write_text("Track Name\nTrack\n", encoding="utf-8")
+            window = self._make_window(root)
+            try:
+                window._retry_tmp_csv = str(retry_csv)
+                window._retry_context = {"title": "Track"}
+
+                window._on_worker_finished()
+
+                self.assertFalse(retry_csv.exists())
+                self.assertIsNone(window._retry_tmp_csv)
+                self.assertIsNone(window._retry_context)
+            finally:
+                window.close()
+                window.deleteLater()
+
     def test_local_scan_button_chooses_root_and_selects_playlist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -370,6 +512,28 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
+    def test_choose_library_root_ignores_stale_temporary_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stale = root / "deleted" / "library"
+            window = self._make_window(root)
+            window.library_root = str(stale)
+            window.output_folder = str(stale)
+            expected = Path.home() / "Music"
+            if not expected.is_dir():
+                expected = Path.home()
+            try:
+                with patch(
+                    "qt_app.QFileDialog.getExistingDirectory",
+                    return_value="",
+                ) as choose:
+                    window._choose_library_root()
+
+                self.assertEqual(Path(choose.call_args.args[2]), expected)
+            finally:
+                window.close()
+                window.deleteLater()
+
     def test_library_actions_use_explicit_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -381,10 +545,47 @@ class QtAppSmokeTests(unittest.TestCase):
                 self.assertEqual(window.sync_all_btn.toolTip(), "Sync all playlists: no playlists with a saved URL")
                 self.assertGreaterEqual(window.sync_btn.minimumHeight(), 28)
                 self.assertGreaterEqual(window.sync_all_btn.minimumHeight(), 28)
-                self.assertEqual(window.library_scan_btn.text(), "Rescan folders")
-                self.assertEqual(window.library_scan_btn.toolTip(), "Rescan the library folder for local playlists")
+                self.assertEqual(window.library_scan_btn.text(), "Refresh library")
+                self.assertIn("no download", window.library_scan_btn.toolTip())
                 self.assertEqual(window.library_cleanup_btn.text(), "Clean library")
                 self.assertIn("orphan files", window.library_cleanup_btn.toolTip())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_refresh_library_reports_result_and_keeps_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "First"
+            second = root / "Second"
+            first.mkdir()
+            second.mkdir()
+            (first / "One.mp3").write_bytes(b"audio")
+            (second / "Two.mp3").write_bytes(b"audio")
+
+            window = self._make_window(root)
+            try:
+                second_idx = next(
+                    i
+                    for i, item in enumerate(window.library_items)
+                    if Path(item["playlist_dir"]).name == "Second"
+                )
+                window._on_playlist_item_clicked(second_idx)
+
+                (root / "Third").mkdir()
+                (root / "Third" / "Three.mp3").write_bytes(b"audio")
+                window.library_scan_btn.click()
+                _app().processEvents()
+
+                selected = window._selected_library_manifest()
+                self.assertIsNotNone(selected)
+                self.assertEqual(Path(selected["playlist_dir"]).name, "Second")
+                self.assertEqual(len(window.library_items), 3)
+                self.assertEqual(
+                    window.footer_status_lbl.text(),
+                    "Library refreshed · 3 playlists",
+                )
+                self.assertFalse(window.footer_bar.isHidden())
             finally:
                 window.close()
                 window.deleteLater()
@@ -483,20 +684,75 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
+    def test_error_dialog_focuses_manual_url_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = self._make_window(Path(tmp))
+            observed = {}
+
+            def fake_exec(dialog):
+                dialog.show()
+                _app().processEvents()
+                url_input = next(
+                    edit
+                    for edit in dialog.findChildren(qt_app.QLineEdit)
+                    if "YouTube URL" in edit.placeholderText()
+                )
+                observed["focused"] = url_input.hasFocus()
+                observed["cursor_position"] = url_input.cursorPosition()
+                observed["text_length"] = len(url_input.text())
+                dialog.close()
+                return qt_app.QDialog.DialogCode.Rejected
+
+            try:
+                window._errors[1] = (
+                    "Track",
+                    "No reliable match was found.",
+                    "https://youtu.be/candidate",
+                    {},
+                    str(Path(tmp)),
+                )
+                with patch.object(qt_app.QDialog, "exec", new=fake_exec):
+                    window._show_error_dialog(1)
+
+                self.assertTrue(observed["focused"])
+                self.assertEqual(observed["cursor_position"], observed["text_length"])
+            finally:
+                window.close()
+                window.deleteLater()
+
     def test_needs_attention_dialog_exposes_selected_item(self):
-        dialog = qt_app.NeedsAttentionDialog([{
-            "playlist_name": "Playlist",
-            "track_idx": 4,
-            "title": "Track",
-            "artists": "Artist",
-            "kind": "failed",
-            "issue": "Download failed",
-            "error": "yt-dlp failed",
-            "candidate_url": "https://youtu.be/retry",
-        }])
+        _app()
+        dialog = qt_app.NeedsAttentionDialog([
+            {
+                "playlist_name": "First playlist",
+                "track_idx": 4,
+                "title": "First track",
+                "artists": "Artist",
+                "kind": "failed",
+                "issue": "Download failed",
+                "error": "yt-dlp failed",
+                "candidate_url": "",
+            },
+            {
+                "playlist_name": "Retry playlist",
+                "track_idx": 7,
+                "title": "Retry track",
+                "artists": "Artist",
+                "kind": "failed",
+                "issue": "Download blocked",
+                "error": "yt-dlp failed",
+                "candidate_url": "https://youtu.be/retry",
+            },
+        ])
         try:
-            self.assertEqual(dialog.selected_item()["track_idx"], 4)
-            self.assertEqual(dialog.table.item(0, 3).text(), "Retry")
+            retry_btn = dialog.table.cellWidget(1, 3)
+            self.assertIsInstance(retry_btn, qt_app.QPushButton)
+            self.assertEqual(retry_btn.text(), "Retry")
+
+            retry_btn.click()
+
+            self.assertEqual(dialog.result(), qt_app.QDialog.DialogCode.Accepted)
+            self.assertEqual(dialog.selected_item()["track_idx"], 7)
         finally:
             dialog.close()
             dialog.deleteLater()

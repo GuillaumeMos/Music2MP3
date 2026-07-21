@@ -767,6 +767,97 @@ class ConverterHelpersTests(unittest.TestCase):
                 ["Artist - Old.mp3", "Artist - New.mp3"],
             )
 
+    def test_retry_replaces_original_manifest_track_even_when_url_changes(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Retry playlist"
+            existing_manifest = build_manifest(
+                playlist_name="Retry playlist",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/retry",
+                    "name": "Retry playlist",
+                },
+                settings={"safe_search": True},
+                tracks=[
+                    {
+                        "idx": 7,
+                        "title": "Blocked track",
+                        "artists": "Artist",
+                        "source_url": "https://old.example/blocked",
+                        "file": "",
+                        "status": "failed",
+                        "format": "MP3",
+                        "error": "Download blocked",
+                        "suggested_url": "https://youtu.be/old-candidate",
+                        "match": {"url": "https://youtu.be/old-candidate"},
+                    },
+                    {
+                        "idx": 8,
+                        "title": "Existing track",
+                        "artists": "Artist",
+                        "source_url": "https://example.com/existing",
+                        "file": "Artist - Existing track.mp3",
+                        "status": "done",
+                        "format": "MP3",
+                    },
+                ],
+            )
+            write_manifest(playlist_dir, existing_manifest)
+
+            csv_path = root / "retry.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "Track Name",
+                        "Artist Name(s)",
+                        "Album Name",
+                        "Duration (ms)",
+                        "Source URL",
+                        "Track URI",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Blocked track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://youtu.be/manual-retry",
+                    "Track URI": "",
+                })
+
+            conv = NoDownloadConverter(config={
+                "safe_search": True,
+                "generate_m3u": False,
+                "incremental_update": False,
+                "append_to_existing_playlist": True,
+                "replace_manifest_track_idx": 7,
+            })
+            result_dir = Path(conv.convert_from_csv(
+                str(csv_path),
+                str(playlist_dir),
+                None,
+                source_info=None,
+            ))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["track_count"], 2)
+            self.assertEqual(manifest["source"]["url"], "https://open.spotify.com/playlist/retry")
+            self.assertEqual([track["idx"] for track in manifest["tracks"]], [7, 8])
+            retried = manifest["tracks"][0]
+            self.assertEqual(retried["status"], "done")
+            self.assertEqual(retried["source_url"], "https://youtu.be/manual-retry")
+            self.assertNotIn("error", retried)
+            self.assertNotIn("suggested_url", retried)
+            self.assertNotIn("match", retried)
+
 
 if __name__ == "__main__":
     unittest.main()

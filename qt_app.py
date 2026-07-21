@@ -253,6 +253,22 @@ QPushButton#ghost:hover {
   background: #242424;
   color: #f5f5f5;
 }
+QPushButton#attentionAction, QPushButton#attentionActionMuted {
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+QPushButton#attentionAction {
+  color: #1ed760;
+}
+QPushButton#attentionActionMuted {
+  color: #b3b3b3;
+}
+QPushButton#attentionAction:hover, QPushButton#attentionActionMuted:hover {
+  background: #242424;
+  color: #f5f5f5;
+}
 QPushButton#libraryAction {
   background: #181818;
   border: none;
@@ -693,10 +709,16 @@ class NeedsAttentionDialog(QDialog):
                 next_action = "Retry"
             else:
                 next_action = "Open"
-            action_item = QTableWidgetItem(next_action)
-            action_item.setForeground(QColor("#1ed760" if item.get("candidate_url") else "#b3b3b3"))
-            action_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 3, action_item)
+            action_btn = QPushButton(next_action)
+            action_btn.setObjectName(
+                "attentionAction" if item.get("candidate_url") else "attentionActionMuted"
+            )
+            action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            action_btn.setToolTip(f"{next_action} this track")
+            action_btn.clicked.connect(
+                lambda _checked=False, selected_row=row: self._activate_row(selected_row)
+            )
+            self.table.setCellWidget(row, 3, action_btn)
 
         if self._items:
             self.table.selectRow(0)
@@ -719,6 +741,12 @@ class NeedsAttentionDialog(QDialog):
             return None
         row = rows[0].row()
         return dict(self._items[row]) if 0 <= row < len(self._items) else None
+
+    def _activate_row(self, row: int):
+        if not 0 <= row < len(self._items):
+            return
+        self.table.selectRow(row)
+        self.accept()
 
 
 class ArtworkWidget(QWidget):
@@ -1189,6 +1217,8 @@ class QtMusic2MP3Window(QMainWindow):
 
         self._thread: QThread | None = None
         self._worker: ConverterWorker | None = None
+        self._retry_context: dict | None = None
+        self._retry_tmp_csv: str | None = None
         self._load_thread: QThread | None = None
         self._load_worker: PlaylistLoadWorker | None = None
         self._cleanup_thread: QThread | None = None
@@ -1367,11 +1397,13 @@ class QtMusic2MP3Window(QMainWindow):
         self.sync_all_btn.clicked.connect(self._sync_all_library_playlists)
         library_actions.addWidget(self.sync_all_btn, 0, 1)
 
-        self.library_scan_btn = QPushButton("Rescan folders")
+        self.library_scan_btn = QPushButton("Refresh library")
         self.library_scan_btn.setObjectName("libraryAction")
         self.library_scan_btn.setMinimumHeight(28)
-        self.library_scan_btn.setToolTip("Rescan the library folder for local playlists")
-        self.library_scan_btn.clicked.connect(self._scan_library_root)
+        self.library_scan_btn.setToolTip(
+            "Reload playlists and local files from the library folder (no download)"
+        )
+        self.library_scan_btn.clicked.connect(self._refresh_library)
         library_actions.addWidget(self.library_scan_btn, 1, 0)
 
         self.library_cleanup_btn = QPushButton("Clean library")
@@ -2211,8 +2243,27 @@ class QtMusic2MP3Window(QMainWindow):
 
     # ── Library ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _dialog_start_directory(*candidates: str | os.PathLike | None) -> str:
+        """Return the first existing folder so macOS never opens in a stale temp path."""
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                path = Path(candidate).expanduser()
+            except (TypeError, ValueError):
+                continue
+            if path.is_dir():
+                return str(path)
+        return str(Path.home())
+
     def _choose_library_root(self):
-        initial = self.library_root or self.output_folder or str(Path.home() / "Music")
+        initial = self._dialog_start_directory(
+            self.library_root,
+            self.output_folder,
+            Path.home() / "Music",
+            Path.home(),
+        )
         path = QFileDialog.getExistingDirectory(self, "Select Library Root", initial)
         if not path:
             return
@@ -2267,6 +2318,24 @@ class QtMusic2MP3Window(QMainWindow):
             self._update_hero()
             self._populate_table_for_selection()
         self._update_library_actions()
+
+    def _refresh_library(self, _checked: bool = False):
+        """Reload the local library index without syncing remote sources."""
+        root = self.library_root
+        if not root or not os.path.isdir(root):
+            self._scan_library_root(show_empty=True)
+            return
+
+        selected = self._selected_library_manifest()
+        selected_dir = str(selected.get("playlist_dir") or "") if selected else None
+        self._scan_library_root(show_empty=True, select_playlist_dir=selected_dir)
+
+        count = len(self.library_items)
+        suffix = "playlist" if count == 1 else "playlists"
+        self.global_progress.setRange(0, 100)
+        self.global_progress.setValue(100)
+        self.footer_eta_lbl.setText("")
+        self._set_footer_state("done", f"Library refreshed · {count} {suffix}")
 
     def _refresh_needs_attention(self):
         self._attention_items = collect_attention_items(self.library_items)
@@ -3137,6 +3206,7 @@ class QtMusic2MP3Window(QMainWindow):
 
     @Slot(str)
     def _on_done(self, out_dir: str):
+        retry_context = self._retry_context
         sync_manifest = self._sync_target_manifest
         appended_to_library = self._append_to_library_manifest is not None
         self.last_output_dir = out_dir
@@ -3173,10 +3243,24 @@ class QtMusic2MP3Window(QMainWindow):
             else:
                 self._record_sync_queue_result(sync_manifest, "done")
         self._scan_library_root(show_empty=False, select_playlist_dir=out_dir)
+        if retry_context and not self._was_cancelled:
+            title = str(retry_context.get("title") or "Track")
+            if retry_context.get("succeeded") and not retry_context.get("failed"):
+                self._set_footer_state("done", f"Retry successful · {title}")
+            else:
+                self._set_footer_state("warning", f"Retry failed · {title}")
 
     @Slot(str)
     def _on_failed(self, error_text: str):
         self._timer.stop()
+        if self._retry_context:
+            self._retry_context["failed"] = True
+            title = str(self._retry_context.get("title") or "Track")
+            out_dir = str(self._retry_context.get("out_dir") or "")
+            self._set_footer_state("error", f"Retry failed · {title}")
+            self._scan_library_root(show_empty=False, select_playlist_dir=out_dir)
+            QMessageBox.critical(self, "Retry failed", error_text)
+            return
         self._set_footer_state("error", "failed")
         if self._sync_queue_active and self._sync_target_manifest:
             self._record_sync_queue_result(self._sync_target_manifest, "failed", error_text)
@@ -3190,6 +3274,14 @@ class QtMusic2MP3Window(QMainWindow):
             self._thread.deleteLater()
             self._thread = None
         self._worker = None
+        retry_tmp_csv = self._retry_tmp_csv
+        self._retry_tmp_csv = None
+        self._retry_context = None
+        if retry_tmp_csv:
+            try:
+                Path(retry_tmp_csv).unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not remove retry CSV %s: %s", retry_tmp_csv, exc)
         self._sync_target_manifest = None
         self._restyle(self.stop_btn, "danger")  # restore normal stop style
         self._set_ui_enabled(True)
@@ -3482,6 +3574,14 @@ class QtMusic2MP3Window(QMainWindow):
         close_btn.clicked.connect(dlg.accept)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+        def _focus_url_input():
+            url_input.setFocus(Qt.FocusReason.OtherFocusReason)
+            url_input.setCursorPosition(len(url_input.text()))
+
+        # The read-only error details appear first in the dialog and otherwise
+        # receive initial focus, leaving the editable URL field without a caret.
+        QTimer.singleShot(0, _focus_url_input)
         dlg.exec()
 
     def _open_soulseek_search_dialog(self, track_t: dict):
@@ -3619,6 +3719,10 @@ class QtMusic2MP3Window(QMainWindow):
                 })
         except Exception as e:
             log.error("Retry: failed to create temp CSV: %s", e)
+            try:
+                Path(tmp_csv).unlink(missing_ok=True)
+            except OSError:
+                pass
             QMessageBox.critical(self, "Retry error", str(e))
             return
 
@@ -3631,6 +3735,16 @@ class QtMusic2MP3Window(QMainWindow):
         retry_config = self.config.copy()
         retry_config["incremental_update"] = False
         retry_config["append_to_existing_playlist"] = True
+        retry_config["replace_manifest_track_idx"] = idx
+        title = str(track_t.get("title") or f"Track {idx}")
+        self._retry_context = {
+            "idx": idx,
+            "title": title,
+            "out_dir": out_dir,
+            "succeeded": False,
+            "failed": False,
+        }
+        self._retry_tmp_csv = tmp_csv
         # Use out_dir directly as output folder with no playlist subdirectory
         self._thread = QThread(self)
         self._worker = ConverterWorker(
@@ -3638,7 +3752,7 @@ class QtMusic2MP3Window(QMainWindow):
             tmp_csv,
             out_dir,          # output_folder = the already-named playlist dir
             None,             # playlist_hint = None so no subdir is created
-            self.loaded_source_info,
+            None,             # preserve the existing manifest playlist source
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -3652,12 +3766,23 @@ class QtMusic2MP3Window(QMainWindow):
         self._restyle(self.stop_btn, "dangerActive")
         self.stop_btn.setEnabled(True)
         self._set_ui_enabled(False)
+        self._was_cancelled = False
+        self._total_tracks = 1
+        self.global_progress.setRange(0, 100)
+        self.global_progress.setValue(0)
+        self.footer_eta_lbl.setText("")
+        self._set_footer_state("running", f"Retrying · {title}")
         self._started_at = time.time()
         self._timer.start(1000)
         self._thread.start()
         log.info("Retry track %d with URL: %s", idx, url)
 
     def _on_retry_item(self, target_idx: int, ev: str, data_obj: object):
+        if self._retry_context:
+            if ev == "done":
+                self._retry_context["succeeded"] = True
+            elif ev == "error":
+                self._retry_context["failed"] = True
         if isinstance(data_obj, dict):
             data = dict(data_obj)
             if "idx" in data:
@@ -3824,8 +3949,14 @@ class QtMusic2MP3Window(QMainWindow):
             self.action_output_lbl.setToolTip("Choose output root folder")
 
     def _choose_output_folder(self):
+        initial = self._dialog_start_directory(
+            self.output_folder,
+            self.library_root,
+            Path.home() / "Downloads",
+            Path.home(),
+        )
         path = QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", str(Path.home() / "Downloads")
+            self, "Select Output Folder", initial
         )
         if not path:
             return
