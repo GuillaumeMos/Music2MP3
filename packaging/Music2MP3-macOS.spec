@@ -2,14 +2,21 @@
 import os
 import shutil
 
+PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
+
+
+def _repo_path(path: str) -> str:
+    return os.path.join(PROJECT_ROOT, path)
+
 
 def _pick_binary(local_path: str, fallback_name: str) -> tuple[str, str]:
     """
     Return (source_path, dest_dir_name) for bundled binaries.
     Priority: local repo path, then PATH lookup.
     """
-    if os.path.isfile(local_path):
-        return (local_path, os.path.dirname(local_path))
+    source_path = _repo_path(local_path)
+    if os.path.isfile(source_path):
+        return (source_path, os.path.dirname(local_path))
     found = shutil.which(fallback_name)
     if found:
         return (found, os.path.dirname(local_path))
@@ -20,15 +27,15 @@ def _pick_binary(local_path: str, fallback_name: str) -> tuple[str, str]:
 
 
 datas = [
-    _pick_binary("ffmpeg/ffmpeg.exe", "ffmpeg.exe"),
-    _pick_binary("yt-dlp/yt-dlp.exe", "yt-dlp.exe"),
-    ("config.json", "."),
-    ("icon.ico", "."),
+    _pick_binary("ffmpeg/ffmpeg", "ffmpeg"),
+    _pick_binary("yt-dlp/yt-dlp", "yt-dlp"),
+    (_repo_path("config.json"), "."),
+    (_repo_path("icon.icns"), "."),
 ]
 
 a = Analysis(
-    ["qt_app.py"],
-    pathex=[],
+     [_repo_path('app.py')],
+    pathex=[PROJECT_ROOT],
     binaries=[],
     datas=datas,
     hiddenimports=[],
@@ -46,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Music2MP3",
+    name='Music2MP3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -57,7 +64,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=["icon.ico"],
+    icon=[_repo_path('icon.icns')],
 )
 coll = COLLECT(
     exe,
@@ -66,5 +73,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="Music2MP3",
+    name='Music2MP3',
+)
+app = BUNDLE(
+    coll,
+    name='Music2MP3.app',
+    icon=_repo_path('icon.icns'),
+    bundle_identifier=None,
 )

@@ -1,6 +1,15 @@
 # ui_preview.py — preview the GUI with fake downloads
-import os, csv, time, tempfile, tkinter as tk
-import gui as appgui  # your gui.py
+import csv
+import os
+import sys
+import tempfile
+import time
+import tkinter as tk
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import gui as appgui  # noqa: E402
 
 # --- Fake converter that simulates events ---
 class FakeConverter:
@@ -10,7 +19,7 @@ class FakeConverter:
         self.item_cb = item_cb
         self.config = config or {}
 
-    def convert_from_csv(self, csv_path, output_folder, playlist_name_hint=None):
+    def convert_from_csv(self, csv_path, output_folder, playlist_name_hint=None, source_info=None):
         with open(csv_path, encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
         total = len(rows)

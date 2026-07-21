@@ -26,18 +26,18 @@ jobs:
         include:
           - os: windows
             runner: windows-latest
-            py: "3.13"
-            spec: Music2MP3-Windows.spec
+            py: "3.14"
+            spec: packaging/Music2MP3-Qt-Windows.spec
             artifact: Music2MP3_Windows.exe
           - os: macos
             runner: macos-latest
-            py: "3.13"
-            spec: Music2MP3-macOS.spec
+            py: "3.14"
+            spec: packaging/Music2MP3-Qt-macOS.spec
             artifact: Music2MP3_macOS.zip
           - os: linux
             runner: ubuntu-22.04
-            py: "3.13"
-            spec: Music2MP3-Linux.spec
+            py: "3.14"
+            spec: packaging/Music2MP3-Qt-Linux.spec
             artifact: Music2MP3_Linux_x86-64.AppImage
 
     steps:

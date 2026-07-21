@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence, List
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from difflib import SequenceMatcher
+from urllib.parse import parse_qs, urlsplit, urlunsplit
+from ai_matcher import AIMatchAdvice, build_ai_match_advisor
+from library_manifest import build_manifest, read_manifest, write_manifest
+from utils import build_ytdlp_cookie_args
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +53,28 @@ _BAD_VARIANTS = {
     "reverb",
     "instrumental",
     "cover",
+}
+
+_BAD_CONTEXTS = {
+    "1 hour",
+    "2 hour",
+    "album complet",
+    "boiler room",
+    "compilation",
+    "continuous mix",
+    "dj set",
+    "full album",
+    "full concert",
+    "full mix",
+    "full set",
+    "hour mix",
+    "live set",
+    "playlist",
+    "reaction",
+    "set complet",
+    "tutorial",
+    "how to play",
+    "lyrics",
 }
 
 
@@ -133,21 +159,44 @@ class Converter:
         self.output_format: str = self._resolve_output_format(self.config)
         self.strict_match: bool = bool(self.config.get("strict_match", False))
         self.match_candidates: int = max(3, min(15, int(self.config.get("match_candidates", 8))))
+        self.youtube_search_timeout_s: float = max(4.0, min(30.0, float(self.config.get("youtube_search_timeout_s", 12.0))))
+        self._ytdlp_cookie_args: list[str] = build_ytdlp_cookie_args(self.config)
+        self.safe_search: bool = bool(self.config.get("safe_search", True))
+        self.ai_match_enabled: bool = bool(self.config.get("ai_match_enabled", False))
+        self.ai_match_gray_min: float = max(0.0, min(1.0, float(self.config.get("ai_match_gray_min", 0.30))))
+        self.ai_match_min_confidence: float = max(0.0, min(1.0, float(self.config.get("ai_match_min_confidence", 0.72))))
+        self.ai_match_accept_margin: float = max(0.0, min(0.4, float(self.config.get("ai_match_accept_margin", 0.12))))
+        self.duration_min: int = max(0, int(self.config.get("duration_min", 30)))
+        self.duration_max: int = max(self.duration_min or 1, int(self.config.get("duration_max", 600)))
         self.generate_m3u: bool = bool(self.config.get("generate_m3u", True))
         self.exclude_instr: bool = bool(self.config.get("exclude_instrumentals", False))
         self.incremental: bool = bool(self.config.get("incremental_update", True))
         self.concurrency: int = max(1, min(8, int(self.config.get("concurrency", 3))))  # pistes en parallèle
         self._segments: int = max(1, min(8, self.concurrency))  # parallélisme segments yt-dlp
         self.auto_best: bool = self.output_mode == "auto"
+        self.append_to_existing_playlist: bool = bool(self.config.get("append_to_existing_playlist", False))
 
         # pour la M3U
         self._made_files_lock = threading.Lock()
         self._made_files: List[tuple[int, str]] = []
+        self._manifest_lock = threading.Lock()
+        self._manifest_entries: list[dict] = []
+        self._match_details_lock = threading.Lock()
+        self._match_details: dict[int, dict] = {}
+        self._ytdlp_tail_lock = threading.Lock()
+        self._ytdlp_tail: dict[int, list[str]] = {}
         self._fmt_entry = _FORMAT_MAP[self.output_format] if not self.auto_best else None
+        self._ai_match_advisor = build_ai_match_advisor(self.config)
 
     # ------------------------------ public API ------------------------------
 
-    def convert_from_csv(self, csv_path: str, output_folder: str, playlist_hint: Optional[str] = None) -> str:
+    def convert_from_csv(
+        self,
+        csv_path: str,
+        output_folder: str,
+        playlist_hint: Optional[str] = None,
+        source_info: Optional[dict] = None,
+    ) -> str:
         """
         Lit un CSV (colonnes: Track Name, Artist Name(s), Album Name, Duration (ms), [Source URL], [Track URI])
         et télécharge les pistes via yt-dlp, en parallèle jusqu’à self.concurrency.
@@ -155,7 +204,7 @@ class Converter:
         """
         out_base = Path(output_folder)
         out_dir = out_base
-        if playlist_hint:
+        if playlist_hint and not bool(self.config.get("sync_existing_playlist", False)):
             safe = _sanitize_filename(playlist_hint, for_dir=True)
             if safe:
                 out_dir = out_base / safe
@@ -206,12 +255,22 @@ class Converter:
             m3u = out_dir / "playlist.m3u8"
             try:
                 ordered = [name for _, name in sorted(self._made_files, key=lambda x: x[0])]
+                if self.append_to_existing_playlist and m3u.is_file():
+                    previous_lines = [
+                        line.strip()
+                        for line in m3u.read_text(encoding="utf-8").splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")
+                    ]
+                    seen = set(previous_lines)
+                    ordered = previous_lines + [name for name in ordered if name not in seen]
                 with m3u.open("w", encoding="utf-8", newline="\n") as f:
                     for name in ordered:
                         f.write(name + "\n")
                 log.info("CONV: M3U generated: %s", m3u)
             except Exception:
                 log.exception("CONV: failed generating M3U")
+
+        self._write_playlist_manifest(out_dir, playlist_hint, source_info)
 
         return str(out_dir)
 
@@ -222,6 +281,7 @@ class Converter:
         if self.cancel_event.is_set():
             return
 
+        self._infer_missing_track_fields_from_source_url(t)
         pretty_title = self._pretty_title(t)
         out_dir_p = Path(out_dir)
         fmt_entry = self._fmt_entry
@@ -234,7 +294,8 @@ class Converter:
                 log.info("CONV: skip existing auto (%s)", existing.name)
                 fmt_existing = self._format_label_from_path(existing)
                 self.item_cb("init", {"idx": idx, "title": pretty_title, "format": fmt_existing})
-                self.item_cb("done", {"idx": idx, "format": fmt_existing})
+                self.item_cb("done", {"idx": idx, "format": fmt_existing, "file": existing.name, "path": str(existing)})
+                self._record_manifest_entry(idx, t, "done", existing.name, fmt_existing)
                 with self._made_files_lock:
                     self._made_files.append((idx, existing.name))
                 return
@@ -253,35 +314,94 @@ class Converter:
         # incrémental
         if (not self.auto_best) and self.incremental and dest_final.exists() and dest_final.stat().st_size > 0:
             log.info("CONV: skip existing (%s)", dest_final.name)
-            self.item_cb("done", {"idx": idx, "format": self.output_format.upper()})
+            self.item_cb("done", {"idx": idx, "format": self.output_format.upper(), "file": dest_final.name, "path": str(dest_final)})
+            self._record_manifest_entry(idx, t, "done", dest_final.name, self.output_format.upper())
             with self._made_files_lock:
                 self._made_files.append((idx, dest_final.name))
             return
 
         # Construire l’URL et la commande
-        url = t.get("source_url") or t.get("track_uri")
+        url = self._normalize_source_url(t.get("source_url") or t.get("track_uri"))
         if not url:
-            if self.strict_match:
+            if self.safe_search or self.strict_match:
                 self.status_cb(f"Matching best source for {pretty_title}…")
-                best = self._pick_best_youtube_match(t)
+                best, reject_reason, best_url = self._pick_best_youtube_match(t)
                 if not best:
+                    if self.strict_match or self.safe_search:
+                        self.item_cb(
+                            "error",
+                            {
+                                "idx": idx,
+                                "message": reject_reason or f"No safe YouTube match found for: {pretty_title}.",
+                                "best_url": best_url,
+                                "track": t,
+                                "out_dir": str(out_dir),
+                            },
+                        )
+                        self._record_manifest_entry(
+                            idx,
+                            t,
+                            "failed",
+                            None,
+                            self._selected_format_label(),
+                            reject_reason or "No safe YouTube match found",
+                            suggested_url=best_url,
+                        )
+                        return
+                    url = self._build_search_query(t)
+                else:
+                    url = best["url"]
+                    self._record_match_detail(idx, best)
                     self.item_cb(
-                        "error",
-                        {"idx": idx, "message": f"No confident YouTube match found for: {pretty_title}"},
+                        "match",
+                        {
+                            "idx": idx,
+                            "title": best.get("title", ""),
+                            "channel": best.get("channel", ""),
+                            "score": round(float(best.get("score", 0.0)), 2),
+                            "score_details": best.get("score_details") or {},
+                            "ai_confidence": best.get("ai_confidence"),
+                            "ai_reason": best.get("ai_reason", ""),
+                            "url": best.get("url", ""),
+                        },
                     )
-                    return
-                url = best["url"]
-                self.item_cb(
-                    "match",
-                    {
-                        "idx": idx,
-                        "title": best.get("title", ""),
-                        "channel": best.get("channel", ""),
-                        "score": round(float(best.get("score", 0.0)), 2),
-                    },
-                )
+                    log.info(
+                        "MATCH: %03d %s -> %s | score %.2f%s",
+                        idx,
+                        pretty_title,
+                        best.get("title", ""),
+                        float(best.get("score", 0.0)),
+                        f" | AI {float(best.get('ai_confidence')):.2f}: {best.get('ai_reason')}"
+                        if isinstance(best.get("ai_confidence"), (int, float)) else "",
+                    )
             else:
                 url = self._build_search_query(t)
+        elif self._is_probable_soundcloud_set_url(url):
+            self.item_cb(
+                "error",
+                {
+                    "idx": idx,
+                    "message": (
+                        "Refusing to download a SoundCloud set/playlist URL as a single track. "
+                        "Load the SoundCloud playlist first so each track gets its own Source URL."
+                    ),
+                },
+            )
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "SoundCloud set URL used as a single track")
+            return
+        elif self._is_probable_bandcamp_album_url(url):
+            self.item_cb(
+                "error",
+                {
+                    "idx": idx,
+                    "message": (
+                        "Refusing to download a Bandcamp album URL as a single track. "
+                        "Load the Bandcamp release first so each track gets its own Source URL."
+                    ),
+                },
+            )
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), "Bandcamp album URL used as a single track")
+            return
         cmd = self._build_ytdlp_cmd(url=url, out_path=str(dl_target), fmt_entry=fmt_entry)
 
         # Statut
@@ -309,12 +429,28 @@ class Converter:
             )
             log.error("CONV: %s", msg)
             self.item_cb("error", {"idx": idx, "message": msg})
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), msg)
+            return
+
+        if code != 0 and "soundcloud.com" in (url or "").lower():
+            direct_detail = self._last_ytdlp_detail(idx)
+            msg = (
+                f"SoundCloud direct download failed for: {pretty_title}"
+                f"\n\nSoundCloud yt-dlp output:\n{direct_detail or '(no detail)'}"
+            )
+            log.error("CONV: %s", msg)
+            self.item_cb("error", {"idx": idx, "message": msg})
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), msg)
             return
 
         if code != 0:
+            detail = self._last_ytdlp_detail(idx)
             msg = f"yt-dlp failed with code {code} for: {pretty_title}"
+            if detail:
+                msg = f"{msg}\n\nLast yt-dlp output:\n{detail}"
             log.error("CONV: %s", msg)
             self.item_cb("error", {"idx": idx, "message": msg})
+            self._record_manifest_entry(idx, t, "failed", None, self._selected_format_label(), msg)
             return
 
         if needs_aiff:
@@ -323,6 +459,7 @@ class Converter:
             except Exception as e:
                 log.exception("CONV: failed to convert WAV to AIFF")
                 self.item_cb("error", {"idx": idx, "message": f"AIFF conversion failed: {e}"})
+                self._record_manifest_entry(idx, t, "failed", None, self.output_format.upper(), f"AIFF conversion failed: {e}")
                 return
             try:
                 if Path(dl_target).exists():
@@ -333,13 +470,25 @@ class Converter:
         if self.auto_best:
             produced = self._find_new_auto_file(out_dir_p, base_name, before_files)
             fmt_final = self._format_label_from_path(produced) if produced is not None else "AUTO"
-            self.item_cb("done", {"idx": idx, "format": fmt_final})
+            self.item_cb(
+                "done",
+                {
+                    "idx": idx,
+                    "format": fmt_final,
+                    "file": produced.name if produced is not None else "",
+                    "path": str(produced) if produced is not None else "",
+                },
+            )
             if produced is not None:
+                self._record_manifest_entry(idx, t, "done", produced.name, fmt_final)
                 with self._made_files_lock:
                     self._made_files.append((idx, produced.name))
+            else:
+                self._record_manifest_entry(idx, t, "done", None, fmt_final)
             return
 
-        self.item_cb("done", {"idx": idx, "format": self.output_format.upper()})
+        self.item_cb("done", {"idx": idx, "format": self.output_format.upper(), "file": dest_final.name, "path": str(dest_final)})
+        self._record_manifest_entry(idx, t, "done", dest_final.name, self.output_format.upper())
         with self._made_files_lock:
             self._made_files.append((idx, dest_final.name))
 
@@ -365,6 +514,164 @@ class Converter:
         if (cfg.get("output_format") or "").strip().lower() == "auto":
             return "auto"
         return "manual"
+
+    def _manifest_settings(self) -> dict:
+        keys = [
+            "prefix_numbers",
+            "deep_search",
+            "safe_search",
+            "strict_match",
+            "match_candidates",
+            "ai_match_enabled",
+            "ai_match_provider",
+            "ai_match_model",
+            "ai_match_gray_min",
+            "ai_match_min_confidence",
+            "ai_match_accept_margin",
+            "output_mode",
+            "output_format",
+            "output_format_manual",
+            "generate_m3u",
+            "exclude_instrumentals",
+            "incremental_update",
+            "concurrency",
+            "duration_min",
+            "duration_max",
+        ]
+        return {key: self.config.get(key) for key in keys if key in self.config}
+
+    def _record_manifest_entry(
+        self,
+        idx: int,
+        t: dict,
+        status: str,
+        file_name: str | None,
+        fmt: str | None,
+        error: str | None = None,
+        suggested_url: str | None = None,
+    ) -> None:
+        entry = {
+            "idx": idx,
+            "title": t.get("title") or "",
+            "artists": t.get("artists") or "",
+            "album": t.get("album") or "",
+            "duration_ms": t.get("duration_ms"),
+            "source_url": t.get("source_url") or "",
+            "track_uri": t.get("track_uri") or "",
+            "file": file_name or "",
+            "status": status,
+            "format": fmt or "",
+        }
+        if error:
+            entry["error"] = error
+        if suggested_url:
+            entry["suggested_url"] = suggested_url
+        with self._match_details_lock:
+            match_detail = dict(self._match_details.get(idx) or {})
+        if match_detail:
+            entry["match"] = match_detail
+        with self._manifest_lock:
+            self._manifest_entries = [e for e in self._manifest_entries if e.get("idx") != idx]
+            self._manifest_entries.append(entry)
+
+    def _record_match_detail(self, idx: int, best: dict) -> None:
+        detail = {
+            "url": best.get("url") or "",
+            "title": best.get("title") or "",
+            "channel": best.get("channel") or "",
+            "score": round(float(best.get("score") or 0.0), 4),
+            "score_details": best.get("score_details") or {},
+        }
+        if isinstance(best.get("ai_confidence"), (int, float)):
+            detail["ai_confidence"] = round(float(best["ai_confidence"]), 4)
+        if best.get("ai_reason"):
+            detail["ai_reason"] = str(best.get("ai_reason"))
+        with self._match_details_lock:
+            self._match_details[idx] = detail
+
+    def _write_playlist_manifest(
+        self,
+        out_dir: Path,
+        playlist_hint: Optional[str],
+        source_info: Optional[dict],
+    ) -> None:
+        try:
+            previous = read_manifest(out_dir)
+            previous = previous if isinstance(previous, dict) else None
+            source = source_info if isinstance(source_info, dict) else {}
+            if self.append_to_existing_playlist and previous and not source:
+                prev_source = previous.get("source")
+                source = prev_source if isinstance(prev_source, dict) else {}
+            playlist_name = (
+                (previous.get("playlist_name") if self.append_to_existing_playlist and previous else "")
+                or source.get("name")
+                or playlist_hint
+                or out_dir.name
+                or "Music2MP3"
+            )
+            with self._manifest_lock:
+                tracks = sorted((dict(e) for e in self._manifest_entries), key=lambda e: int(e.get("idx") or 0))
+            if self.append_to_existing_playlist and previous:
+                previous_tracks = previous.get("tracks")
+                if isinstance(previous_tracks, list):
+                    tracks = self._merge_manifest_tracks(previous_tracks, tracks)
+            manifest = build_manifest(
+                playlist_name=str(playlist_name),
+                playlist_dir=out_dir,
+                source=source,
+                settings=self._manifest_settings(),
+                tracks=tracks,
+                previous_manifest=previous,
+            )
+            path = write_manifest(out_dir, manifest)
+            log.info("CONV: manifest generated: %s", path)
+        except Exception:
+            log.exception("CONV: failed generating playlist manifest")
+
+    @staticmethod
+    def _manifest_track_key(track: dict) -> str:
+        for field in ("track_uri", "source_url", "file"):
+            value = str(track.get(field) or "").strip().lower()
+            if value:
+                return f"{field}:{value}"
+        title = _norm_text(str(track.get("title") or ""))
+        artists = _norm_text(str(track.get("artists") or ""))
+        if title or artists:
+            return f"title:{artists}|{title}"
+        return ""
+
+    @classmethod
+    def _merge_manifest_tracks(cls, previous_tracks: list, new_tracks: list[dict]) -> list[dict]:
+        incoming_by_key: dict[str, dict] = {}
+        incoming_without_key: list[dict] = []
+        for track in new_tracks:
+            item = dict(track)
+            key = cls._manifest_track_key(item)
+            if key:
+                incoming_by_key[key] = item
+            else:
+                incoming_without_key.append(item)
+
+        merged: list[dict] = []
+        consumed: set[str] = set()
+        for track in previous_tracks:
+            if not isinstance(track, dict):
+                continue
+            key = cls._manifest_track_key(track)
+            if key and key in incoming_by_key:
+                merged.append(dict(incoming_by_key[key]))
+                consumed.add(key)
+            else:
+                merged.append(dict(track))
+
+        for key, track in incoming_by_key.items():
+            if key not in consumed:
+                merged.append(dict(track))
+        merged.extend(dict(track) for track in incoming_without_key)
+
+        for idx, track in enumerate(merged, start=1):
+            track["idx"] = idx
+        return merged
 
     def _list_matching_audio_files(self, out_dir: Path, base_name: str) -> list[Path]:
         files = [p for p in out_dir.glob(f"{base_name}.*") if p.is_file()]
@@ -399,26 +706,409 @@ class Converter:
             return "AIFF"
         return ext.upper()
 
-    def _pick_best_youtube_match(self, t: dict) -> dict | None:
-        query = self._build_search_terms(t)
-        candidates = self._search_youtube_candidates(query, self.match_candidates)
-        if not candidates:
-            return None
+    def _pick_best_youtube_match(self, t: dict) -> tuple[dict | None, str, str | None]:
+        """Returns (best_match, reject_reason, best_url_even_if_rejected)."""
+        queries = self._build_youtube_match_queries(t)
+        query = queries[0]
+        min_score = 0.58 if self.strict_match else 0.42
+        can_use_ai = self.ai_match_enabled and self._ai_match_advisor is not None
 
-        best: dict | None = None
-        best_score = -1.0
-        for cand in candidates:
-            score = self._score_match_candidate(t, cand)
-            if score > best_score:
-                best_score = score
-                best = dict(cand)
-                best["score"] = score
+        quick_candidates = self._search_youtube_candidates(query, 1)
+        quick_match = self._quick_accept_youtube_match(t, quick_candidates, min_score, can_use_ai=can_use_ai)
+        if quick_match:
+            return quick_match, "", None
+
+        if not quick_candidates:
+            ai_best, ai_reason = self._try_ai_youtube_match(
+                t=t,
+                original_query=query,
+                ranked_candidates=[],
+                min_score=min_score,
+                best_score=0.0,
+            )
+            if ai_best:
+                return self._ai_manual_validation_result(ai_best, ai_reason, min_score)
+            reason_lines = [
+                f"No YouTube results for query: {query!r}",
+                "The track title/artist may be too obscure, misspelled, or YouTube search timed out.",
+            ]
+            if ai_reason:
+                reason_lines.append(f"AI assist: {ai_reason}")
+            return None, "\n".join(reason_lines), None
+
+        candidates = self._search_youtube_candidates_multi(queries, self.match_candidates)
+        if not candidates:
+            ai_best, ai_reason = self._try_ai_youtube_match(
+                t=t,
+                original_query=query,
+                ranked_candidates=[],
+                min_score=min_score,
+                best_score=0.0,
+            )
+            if ai_best:
+                return self._ai_manual_validation_result(ai_best, ai_reason, min_score)
+            reason_lines = [
+                f"No YouTube results for query: {query!r}",
+                "The track title/artist may be too obscure or misspelled.",
+            ]
+            if ai_reason:
+                reason_lines.append(f"AI assist: {ai_reason}")
+            return None, "\n".join(reason_lines), None
+
+        n_total = len(candidates)
+        ranked, n_rejected_duration = self._rank_youtube_candidates(t, candidates)
+        best = ranked[0] if ranked else None
+        best_score = float(best.get("score") or -1.0) if best else -1.0
 
         if not best:
+            # All candidates were rejected by duration filter
+            src_ms = t.get("duration_ms")
+            if isinstance(src_ms, int) and src_ms > 0:
+                src_s = src_ms / 1000.0
+                lo = max(10, src_s * 0.45)
+                hi = max(src_s + 75, src_s * 1.45)
+                reason = (
+                    f"All {n_total} YouTube candidates rejected — duration too far from expected.\n"
+                    f"Expected: ~{src_s:.0f}s  |  Acceptable range: {lo:.0f}s – {hi:.0f}s\n"
+                    "Tip: check that the source track has a correct duration."
+                )
+            else:
+                lo = self.duration_min or 0
+                hi = self.duration_max or 0
+                reason = (
+                    f"All {n_total} YouTube candidates rejected by duration filter.\n"
+                    f"Configured range: {lo}s – {hi}s\n"
+                    "Tip: widen duration_min / duration_max in settings."
+                )
+            return None, reason, None
+
+        if best_score < min_score:
+            if not can_use_ai:
+                first_safe = self._first_confident_youtube_candidate(t, ranked)
+                if first_safe:
+                    return first_safe, "", None
+
+            ai_best, ai_reason = self._try_ai_youtube_match(
+                t=t,
+                original_query=query,
+                ranked_candidates=ranked,
+                min_score=min_score,
+                best_score=best_score,
+            )
+            if ai_best:
+                return self._ai_manual_validation_result(ai_best, ai_reason, min_score)
+
+            best_title = str(best.get("title") or "?")
+            best_channel = str(best.get("channel") or "")
+            best_url = str(best.get("url") or "")
+            cand_low = best_title.lower()
+            active_variants = [v for v in _BAD_VARIANTS if v in cand_low]
+            active_contexts = [v for v in _BAD_CONTEXTS if v in cand_low]
+            penalty_parts = active_variants + active_contexts
+            threshold_label = "strict (0.58)" if self.strict_match else "normal (0.42)"
+            reason_lines = [
+                f"Best YouTube candidate: \"{best_title}\"" + (f" — {best_channel}" if best_channel else ""),
+                f"Match score: {best_score:.2f}  |  Threshold: {threshold_label}",
+            ]
+            if penalty_parts:
+                reason_lines.append(f"Active penalties: {', '.join(penalty_parts)}")
+            if n_rejected_duration:
+                reason_lines.append(f"({n_rejected_duration}/{n_total} candidate(s) also rejected by duration)")
+            reason_lines.append("")
+            if self.strict_match:
+                reason_lines.append("Tip: disable 'strict' flag to lower the threshold to 0.42.")
+            elif self.safe_search:
+                reason_lines.append("Tip: disable 'safe' flag to allow variants like live/remix, or add artist details.")
+            if ai_reason:
+                reason_lines.append(f"AI assist: {ai_reason}")
+            return None, "\n".join(reason_lines), best_url or None
+
+        return best, "", None
+
+    def _quick_accept_youtube_match(
+        self,
+        t: dict,
+        candidates: list[dict],
+        min_score: float,
+        *,
+        can_use_ai: bool,
+    ) -> dict | None:
+        if not candidates:
             return None
-        if best_score < 0.58:
+        ranked, _ = self._rank_youtube_candidates(t, candidates)
+        if not ranked:
             return None
-        return best
+        best = ranked[0]
+        if float(best.get("score") or 0.0) >= max(min_score, 0.78):
+            best["accepted_by"] = "first_result_score"
+            return best
+        if can_use_ai:
+            return None
+        return self._first_confident_youtube_candidate(t, ranked)
+
+    def _first_confident_youtube_candidate(self, t: dict, ranked: list[dict]) -> dict | None:
+        first = next((cand for cand in ranked if int(cand.get("search_rank") or 0) == 1), None)
+        if not first:
+            return None
+        details = first.get("score_details")
+        if not isinstance(details, dict):
+            details = self._score_match_candidate_details(t, first)
+            first["score_details"] = details
+        score = float(first.get("score") or 0.0)
+        title_coverage = float(details.get("title_coverage") or 0.0)
+        artist_score = float(details.get("artist_score") or 0.0)
+        duration_score = float(details.get("duration_score") or 0.0)
+        penalties = float(details.get("penalties") or 0.0)
+
+        if penalties >= 0.14:
+            return None
+        if duration_score < 0.1:
+            return None
+        if score < 0.30:
+            return None
+        if title_coverage >= 0.95 and artist_score >= 0.5:
+            first["accepted_by"] = "first_result_title_artist"
+            return first
+        if title_coverage >= 0.82 and artist_score >= 0.8:
+            first["accepted_by"] = "first_result_artist_title"
+            return first
+        return None
+
+    def _ai_manual_validation_result(
+        self,
+        ai_best: dict,
+        ai_reason: str,
+        min_score: float,
+    ) -> tuple[None, str, str | None]:
+        ai_title = str(ai_best.get("title") or "?")
+        ai_channel = str(ai_best.get("channel") or "")
+        ai_url = str(ai_best.get("url") or "")
+        ai_score = float(ai_best.get("score") or 0.0)
+        ai_conf = ai_best.get("ai_confidence")
+        ai_reason_detail = str(ai_best.get("ai_reason") or ai_reason or "")
+        threshold_label = "strict (0.58)" if min_score >= 0.58 else "normal (0.42)"
+        reason_lines = [
+            f"AI suggested candidate: \"{ai_title}\"" + (f" — {ai_channel}" if ai_channel else ""),
+            f"Local match score: {ai_score:.2f}  |  Threshold: {threshold_label}",
+        ]
+        if isinstance(ai_conf, (int, float)):
+            reason_lines.append(f"AI confidence: {float(ai_conf):.2f}")
+        if ai_reason_detail:
+            reason_lines.append(f"AI reason: {ai_reason_detail}")
+        reason_lines.extend([
+            "",
+            "Manual validation required: open the failed track details and click Download only if this candidate is correct.",
+        ])
+        return None, "\n".join(reason_lines), ai_url or None
+
+    def _rank_youtube_candidates(self, t: dict, candidates: list[dict]) -> tuple[list[dict], int]:
+        ranked: list[dict] = []
+        n_rejected_duration = 0
+        for search_rank, cand in enumerate(candidates, start=1):
+            if not self._is_acceptable_candidate_duration(t, cand):
+                log.info(
+                    "CONV: reject candidate by duration: title=%r duration=%r track=%r",
+                    cand.get("title"),
+                    cand.get("duration_s"),
+                    t.get("title"),
+                )
+                n_rejected_duration += 1
+                continue
+            score = self._score_match_candidate(t, cand)
+            item = dict(cand)
+            item["score"] = score
+            item["score_details"] = self._score_match_candidate_details(t, cand)
+            item["search_rank"] = search_rank
+            ranked.append(item)
+        ranked.sort(key=lambda c: float(c.get("score") or 0.0), reverse=True)
+        return ranked, n_rejected_duration
+
+    def _try_ai_youtube_match(
+        self,
+        *,
+        t: dict,
+        original_query: str,
+        ranked_candidates: list[dict],
+        min_score: float,
+        best_score: float,
+    ) -> tuple[dict | None, str]:
+        if not self.ai_match_enabled or not self._ai_match_advisor:
+            return None, ""
+        if ranked_candidates and best_score < self.ai_match_gray_min:
+            return None, "skipped; heuristic score below AI gray zone"
+
+        first = self._ask_ai_match_advisor(
+            t=t,
+            candidates=ranked_candidates[:6],
+            query=original_query,
+            threshold=min_score,
+        )
+        best = self._apply_ai_match_advice(first, ranked_candidates, min_score=min_score)
+        if best:
+            return best, f"AI suggested candidate ({first.confidence:.2f})"
+
+        if first.action == "retry" and first.query:
+            retry_query = first.query[:160]
+            log.info("CONV: AI match retry query for %r -> %r", t.get("title"), retry_query)
+            retry_candidates = self._search_youtube_candidates(retry_query, self.match_candidates)
+            retry_ranked, _ = self._rank_youtube_candidates(t, retry_candidates)
+            if retry_ranked:
+                retry_best = retry_ranked[0]
+                if float(retry_best.get("score") or 0.0) >= min_score:
+                    retry_best["ai_confidence"] = first.confidence
+                    retry_best["ai_reason"] = first.reason
+                    return retry_best, "AI retry query found a candidate"
+                second = self._ask_ai_match_advisor(
+                    t=t,
+                    candidates=retry_ranked[:6],
+                    query=retry_query,
+                    threshold=min_score,
+                )
+                best = self._apply_ai_match_advice(second, retry_ranked, min_score=min_score)
+                if best:
+                    return best, f"AI suggested retry candidate ({second.confidence:.2f})"
+                return None, second.reason or "AI rejected retry candidates"
+            return None, "AI retry query returned no acceptable candidates"
+
+        return None, first.reason or "AI rejected candidates"
+
+    def _ask_ai_match_advisor(
+        self,
+        *,
+        t: dict,
+        candidates: list[dict],
+        query: str,
+        threshold: float,
+    ) -> AIMatchAdvice:
+        for i, cand in enumerate(candidates):
+            cand["ai_id"] = i
+        try:
+            advice = self._ai_match_advisor.advise(
+                track=t,
+                candidates=candidates,
+                query=query,
+                threshold=threshold,
+                strict=self.strict_match,
+            )
+            log.info(
+                "CONV: AI match advice action=%s candidate=%s confidence=%.2f reason=%s",
+                advice.action,
+                advice.candidate_id,
+                advice.confidence,
+                advice.reason,
+            )
+            return advice
+        except Exception as e:
+            log.warning("CONV: AI match advisor failed: %s", e)
+            return AIMatchAdvice(action="reject", reason=f"AI unavailable: {e}")
+
+    def _apply_ai_match_advice(self, advice: AIMatchAdvice, candidates: list[dict], *, min_score: float) -> dict | None:
+        if advice.action != "accept" or advice.candidate_id is None:
+            return None
+        if advice.confidence < self.ai_match_min_confidence:
+            log.info(
+                "CONV: AI suggestion ignored; confidence %.2f below %.2f",
+                advice.confidence,
+                self.ai_match_min_confidence,
+            )
+            return None
+        accept_floor = max(self.ai_match_gray_min, min_score - self.ai_match_accept_margin)
+        for cand in candidates:
+            if int(cand.get("ai_id", -1)) == advice.candidate_id:
+                score = float(cand.get("score") or 0.0)
+                if score < accept_floor:
+                    log.info(
+                        "CONV: AI suggestion ignored; heuristic score %.2f below AI floor %.2f",
+                        score,
+                        accept_floor,
+                    )
+                    return None
+                item = dict(cand)
+                item["ai_confidence"] = advice.confidence
+                item["ai_reason"] = advice.reason
+                return item
+        return None
+
+    def _is_acceptable_candidate_duration(self, t: dict, cand: dict) -> bool:
+        cand_s = cand.get("duration_s")
+        if not isinstance(cand_s, int) or cand_s <= 0:
+            return True
+
+        src_ms = t.get("duration_ms")
+        if isinstance(src_ms, int) and src_ms > 0:
+            src_s = src_ms / 1000.0
+            if cand_s > max(src_s + 75, src_s * 1.45):
+                return False
+            if cand_s < max(10, src_s * 0.45):
+                return False
+            return True
+
+        if self.duration_min and cand_s < self.duration_min:
+            return False
+        if self.duration_max and cand_s > self.duration_max:
+            return False
+        return True
+
+    @staticmethod
+    def _is_probable_soundcloud_set_url(url: str) -> bool:
+        low = (url or "").lower()
+        if low.startswith("soundcloud:set:"):
+            return True
+        if "soundcloud.com" not in low:
+            return False
+        try:
+            path = urlsplit(low).path.rstrip("/")
+        except Exception:
+            path = low
+        return (
+            "/sets/" in f"{path}/"
+            or path.endswith("/sets")
+            or "/playlists/" in f"{path}/"
+            or path.endswith("/playlists")
+        )
+
+    @staticmethod
+    def _normalize_source_url(url: str | None) -> str:
+        raw = (url or "").strip()
+        if raw.lower().startswith("soundcloud:"):
+            return ""
+        if "soundcloud.com" not in raw.lower():
+            return raw
+        try:
+            parts = urlsplit(raw)
+        except Exception:
+            return raw
+        query = parse_qs(parts.query)
+        if "in" in query:
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return raw
+
+    @staticmethod
+    def _title_artist_from_soundcloud_url(url: str) -> tuple[str, str]:
+        if "soundcloud.com" not in (url or "").lower():
+            return "", ""
+        try:
+            parts = [p for p in urlsplit(url).path.split("/") if p]
+        except Exception:
+            return "", ""
+        if len(parts) < 2:
+            return "", ""
+        artist = parts[0].replace("-", " ").strip()
+        title = parts[-1].replace("-", " ").strip()
+        return artist, title
+
+    def _infer_missing_track_fields_from_source_url(self, t: dict):
+        source_url = self._normalize_source_url(t.get("source_url") or "")
+        artist, title = self._title_artist_from_soundcloud_url(source_url)
+        if title and str(t.get("title") or "").strip().lower() in {"", "unknown"}:
+            t["title"] = title
+        if artist and str(t.get("artists") or "").strip().lower() in {"", "unknown"}:
+            t["artists"] = artist
+
+    @staticmethod
+    def _is_probable_bandcamp_album_url(url: str) -> bool:
+        low = (url or "").lower()
+        return ".bandcamp.com" in low and "/album/" in low
 
     def _search_youtube_candidates(self, query: str, limit: int) -> list[dict]:
         if self.cancel_event.is_set():
@@ -428,8 +1118,11 @@ class Converter:
             "--ignore-errors",
             "--skip-download",
             "--print-json",
-            f"ytsearch{limit}:{query}",
+            "--socket-timeout",
+            str(max(3, min(12, int(self.youtube_search_timeout_s)))),
         ]
+        cmd += self._ytdlp_cookie_args
+        cmd.append(f"ytsearch{limit}:{query}")
 
         startupinfo = None
         creationflags = 0
@@ -446,9 +1139,13 @@ class Converter:
                 text=True,
                 startupinfo=startupinfo,
                 creationflags=creationflags,
-                timeout=50,
+                timeout=self.youtube_search_timeout_s,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
+            log.warning("CONV: yt-dlp not found while searching YouTube")
+            return []
+        except subprocess.TimeoutExpired:
+            log.warning("CONV: YouTube search timed out after %.1fs for query=%r", self.youtube_search_timeout_s, query)
             return []
 
         out: list[dict] = []
@@ -487,7 +1184,23 @@ class Converter:
             )
         return out
 
+    def _search_youtube_candidates_multi(self, queries: list[str], limit: int) -> list[dict]:
+        seen: set[str] = set()
+        merged: list[dict] = []
+        per_query_limit = max(limit, 8)
+        for query in queries:
+            for cand in self._search_youtube_candidates(query, per_query_limit):
+                url = str(cand.get("url") or "")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                merged.append(cand)
+        return merged
+
     def _score_match_candidate(self, t: dict, cand: dict) -> float:
+        return float(self._score_match_candidate_details(t, cand)["score"])
+
+    def _score_match_candidate_details(self, t: dict, cand: dict) -> dict:
         src_title = _norm_text(str(t.get("title") or ""))
         src_artists = _norm_text(str(t.get("artists") or ""))
         src_primary_artist = _norm_text(str((str(t.get("artists") or "").split(",")[0]).strip()))
@@ -500,6 +1213,10 @@ class Converter:
         cand_hay = f"{cand_title} {cand_channel}".strip()
 
         title_ratio = SequenceMatcher(None, src_title, cand_title).ratio() if src_title and cand_title else 0.0
+        title_tokens = [tk for tk in src_title.split() if len(tk) > 1]
+        title_coverage = 0.0
+        if title_tokens and cand_title:
+            title_coverage = sum(1 for tk in title_tokens if tk in cand_title) / len(title_tokens)
 
         artist_score = 0.0
         if src_primary_artist:
@@ -535,10 +1252,34 @@ class Converter:
         cand_low = cand_title_raw.lower()
         for bad in _BAD_VARIANTS:
             if bad in cand_low and bad not in src_raw_title:
-                penalties += 0.08
+                penalties += 0.11
+        for bad in _BAD_CONTEXTS:
+            if bad in cand_low:
+                penalties += 0.07
 
-        score = (0.58 * title_ratio) + (0.27 * artist_score) + (0.20 * duration_score) - penalties
-        return max(0.0, min(1.0, score))
+        bonus = 0.0
+        if title_coverage >= 0.95 and artist_score >= 0.8:
+            bonus += 0.08
+        if "topic" in cand_channel.lower() and artist_score >= 0.8:
+            bonus += 0.03
+
+        score = (
+            (0.43 * title_ratio)
+            + (0.20 * title_coverage)
+            + (0.25 * artist_score)
+            + (0.18 * duration_score)
+            + bonus
+            - penalties
+        )
+        return {
+            "score": max(0.0, min(1.0, score)),
+            "title_ratio": round(title_ratio, 4),
+            "title_coverage": round(title_coverage, 4),
+            "artist_score": round(artist_score, 4),
+            "duration_score": round(duration_score, 4),
+            "bonus": round(bonus, 4),
+            "penalties": round(penalties, 4),
+        }
 
     def _rows_to_jobs(self, rows: list[dict]) -> list[dict]:
         jobs = []
@@ -582,6 +1323,17 @@ class Converter:
             query += " audio"
         return query
 
+    def _build_youtube_match_queries(self, t: dict) -> list[str]:
+        artist = (t.get("artists") or "").split(",")[0].strip()
+        title = t.get("title") or ""
+        base = f"{artist} {title}".strip()
+        if not base:
+            return [self._build_search_terms(t)]
+        queries = [base]
+        if self.deep_search:
+            queries.append(f"{base} audio")
+        return queries
+
     def _build_search_query(self, t: dict) -> str:
         query = self._build_search_terms(t)
         yts = f"ytsearch1:{query}"
@@ -616,6 +1368,7 @@ class Converter:
         ffdir = _find_ffmpeg_dir()
         if ffdir:
             cmd += ["--ffmpeg-location", ffdir]
+        cmd += self._ytdlp_cookie_args
         cmd.append(url)
         log.debug("CONV: yt-dlp cmd: %s", " ".join(shlex.quote(c) for c in cmd))
         return cmd
@@ -707,11 +1460,13 @@ class Converter:
             return 127
 
         assert proc.stdout is not None
+        self._set_ytdlp_tail(idx, [])
         try:
             for raw in proc.stdout:
                 line = raw.rstrip("\r\n")
                 if not line:
                     continue
+                self._append_ytdlp_tail(idx, line)
                 log.info("yt-dlp[%03d]: %s", idx, line)
                 on_progress(idx, line)
                 if cancel_event.is_set():
@@ -730,6 +1485,26 @@ class Converter:
             return proc.wait(timeout=20)
         except Exception:
             return 1
+
+    def _append_ytdlp_tail(self, idx: int, line: str):
+        with self._ytdlp_tail_lock:
+            tail = self._ytdlp_tail.setdefault(idx, [])
+            tail.append(line)
+            if len(tail) > 8:
+                del tail[:-8]
+
+    def _set_ytdlp_tail(self, idx: int, lines: list[str]):
+        with self._ytdlp_tail_lock:
+            self._ytdlp_tail[idx] = list(lines)[-8:]
+
+    def _last_ytdlp_detail(self, idx: int) -> str:
+        with self._ytdlp_tail_lock:
+            lines = list(self._ytdlp_tail.get(idx) or [])
+        useful = [
+            line for line in lines
+            if any(marker in line.lower() for marker in ("error", "warning", "unable", "forbidden", "private", "not available"))
+        ]
+        return "\n".join(useful or lines[-4:])
 
 
 # ========================================= HELPERS ==============================================

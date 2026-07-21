@@ -18,6 +18,11 @@ __Pycache__/
 *.pyd
 .Python
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 
@@ -27,6 +32,12 @@ venv/
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# Runtime logs / local scratch
+*.log
+logo_test.png
 
 # Assets
 icon/Music2MP3-icon.ai

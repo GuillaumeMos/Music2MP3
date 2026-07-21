@@ -1,9 +1,31 @@
 import unittest
+import csv
+import json
+import tempfile
+import time
+from pathlib import Path
 
 from converter import Converter, _looks_instrumental, _sanitize_filename
+from ai_matcher import AIMatchAdvice
+from library_manifest import MANIFEST_FILENAME, build_manifest, write_manifest
 
 
 class ConverterHelpersTests(unittest.TestCase):
+    def test_manifest_entry_persists_suggested_retry_url(self):
+        conv = Converter(config={})
+
+        conv._record_manifest_entry(
+            3,
+            {"title": "Track", "artists": "Artist"},
+            "failed",
+            None,
+            "MP3",
+            "Manual validation required",
+            suggested_url="https://youtu.be/suggested",
+        )
+
+        self.assertEqual(conv._manifest_entries[0]["suggested_url"], "https://youtu.be/suggested")
+
     def test_sanitize_filename_removes_illegal_chars(self):
         out = _sanitize_filename('  A/B:C*D?"E<F>G|  ')
         self.assertEqual(out, "A_B_C_D__E_F_G_")
@@ -73,6 +95,25 @@ class ConverterHelpersTests(unittest.TestCase):
         self.assertIn("--audio-format best", cmd_text)
         self.assertNotIn("FFmpegExtractAudio:-ar 44100", cmd_text)
 
+    def test_build_cmd_passes_cookies_file_to_ytdlp(self):
+        conv = Converter(config={"output_mode": "auto", "cookies_path": "/tmp/cookies.txt"})
+        cmd = conv._build_ytdlp_cmd("https://soundcloud.com/artist/track", "/tmp/out.%(ext)s", None)
+
+        self.assertIn("--cookies", cmd)
+        self.assertEqual(cmd[cmd.index("--cookies") + 1], "/tmp/cookies.txt")
+
+    def test_build_cmd_prefers_browser_cookies_auth(self):
+        conv = Converter(config={
+            "output_mode": "auto",
+            "cookies_path": "/tmp/cookies.txt",
+            "cookies_from_browser": "safari",
+        })
+        cmd = conv._build_ytdlp_cmd("https://soundcloud.com/artist/track", "/tmp/out.%(ext)s", None)
+
+        self.assertIn("--cookies-from-browser", cmd)
+        self.assertEqual(cmd[cmd.index("--cookies-from-browser") + 1], "safari")
+        self.assertNotIn("--cookies", cmd)
+
     def test_progress_parser_emits_converting_event(self):
         events = []
         conv = Converter(config={}, item_cb=lambda k, d: events.append((k, d)))
@@ -100,6 +141,631 @@ class ConverterHelpersTests(unittest.TestCase):
             "url": "https://youtu.be/bad",
         }
         self.assertGreater(conv._score_match_candidate(track, good), conv._score_match_candidate(track, bad))
+
+    def test_match_scoring_rewards_title_coverage_and_topic_channel(self):
+        conv = Converter(config={"strict_match": True})
+        track = {"title": "One More Time", "artists": "Daft Punk", "duration_ms": 320000}
+        official = {
+            "title": "Daft Punk - One More Time",
+            "channel": "Daft Punk - Topic",
+            "duration_s": 321,
+        }
+        weak = {
+            "title": "One More Time lyrics playlist",
+            "channel": "random uploader",
+            "duration_s": 321,
+        }
+
+        self.assertGreater(conv._score_match_candidate(track, official), conv._score_match_candidate(track, weak))
+
+    def test_duration_guard_rejects_hour_long_candidate_without_source_duration(self):
+        conv = Converter(config={"safe_search": True, "duration_min": 30, "duration_max": 600})
+
+        self.assertFalse(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist"},
+            {"title": "Artist - Track full set", "duration_s": 3600},
+        ))
+        self.assertTrue(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist"},
+            {"title": "Artist - Track", "duration_s": 240},
+        ))
+
+    def test_duration_guard_rejects_candidate_far_longer_than_spotify_duration(self):
+        conv = Converter(config={"safe_search": True})
+
+        self.assertFalse(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000},
+            {"title": "Artist - Track full set", "duration_s": 3600},
+        ))
+        self.assertTrue(conv._is_acceptable_candidate_duration(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000},
+            {"title": "Artist - Track", "duration_s": 185},
+        ))
+
+    def test_pick_best_youtube_match_skips_long_set_candidate(self):
+        class FakeSearchConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [
+                    {
+                        "title": "Artist - Track full set",
+                        "channel": "Artist",
+                        "duration_s": 3600,
+                        "url": "https://youtu.be/long",
+                    },
+                    {
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/short",
+                    },
+                ]
+
+        conv = FakeSearchConverter(config={"safe_search": True, "duration_max": 600})
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertEqual(best["url"], "https://youtu.be/short")
+
+    def test_pick_best_youtube_match_accepts_confident_first_result_under_threshold(self):
+        class FirstResultConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                self.search_limits.append(_limit)
+                return [
+                    {
+                        "title": "Artist - Track official audio",
+                        "channel": "Artist",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/first",
+                    },
+                    {
+                        "title": "weak unrelated",
+                        "channel": "random",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/weak",
+                    },
+                ][:_limit]
+
+            def _score_match_candidate(self, _track, cand):
+                return 0.35 if cand["url"].endswith("first") else 0.1
+
+            def _score_match_candidate_details(self, _track, cand):
+                if cand["url"].endswith("first"):
+                    return {
+                        "score": 0.35,
+                        "title_ratio": 0.35,
+                        "title_coverage": 0.96,
+                        "artist_score": 1.0,
+                        "duration_score": 0.8,
+                        "bonus": 0.0,
+                        "penalties": 0.0,
+                    }
+                return {
+                    "score": 0.1,
+                    "title_ratio": 0.1,
+                    "title_coverage": 0.1,
+                    "artist_score": 0.0,
+                    "duration_score": 0.8,
+                    "bonus": 0.0,
+                    "penalties": 0.0,
+                }
+
+        conv = FirstResultConverter(config={"safe_search": True})
+        conv.search_limits = []
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["url"], "https://youtu.be/first")
+        self.assertEqual(best["accepted_by"], "first_result_title_artist")
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertEqual(conv.search_limits, [1])
+
+    def test_pick_best_youtube_match_does_not_fast_accept_weak_first_result(self):
+        class MultiQueryConverter(Converter):
+            def _search_youtube_candidates(self, query, limit):
+                self.queries.append((query, limit))
+                if query.endswith(" audio"):
+                    return [{
+                        "title": "Kruelty & Death Code - DIS_GUSTING (Exproz Pro Remix)",
+                        "channel": "THE T0XIC MUSIC",
+                        "duration_s": 228,
+                        "url": "https://www.youtube.com/watch?v=BXnLK4U7n0s",
+                    }]
+                return [
+                    {
+                        "title": "Kruelty & Death Code - DIS_GUSTING (Exproz Pro Remix)",
+                        "channel": "THE T0XIC MUSIC",
+                        "duration_s": 228,
+                        "url": "https://www.youtube.com/watch?v=BXnLK4U7n0s",
+                    },
+                    {
+                        "title": "KRUELTY & DEATH CODE - DIS_GUSTING [EXPROZ_RMX] | OFFICIAL VIDEOCLIP",
+                        "channel": "KRUELTY ¹³",
+                        "duration_s": 206,
+                        "url": "https://www.youtube.com/watch?v=R2PHfHqj4IA",
+                    },
+                ][:limit]
+
+        conv = MultiQueryConverter(config={"safe_search": True, "deep_search": True, "match_candidates": 8})
+        conv.queries = []
+        best, reject_reason, best_url = conv._pick_best_youtube_match({
+            "title": "DIS_GUSTING [EXPROZ_RMX]",
+            "artists": "KRUELTY, DEATH CODE",
+            "duration_ms": 206000,
+        })
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["url"], "https://www.youtube.com/watch?v=R2PHfHqj4IA")
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertIn(("KRUELTY DIS_GUSTING [EXPROZ_RMX]", 1), conv.queries)
+        self.assertTrue(any(q.endswith(" audio") for q, _limit in conv.queries))
+
+    def test_ai_match_suggests_gray_zone_candidate_for_manual_validation(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="accept",
+                    candidate_id=0,
+                    confidence=0.88,
+                    reason="same artist and title",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track official audio",
+                    "channel": "Artist",
+                    "duration_s": 181,
+                    "url": "https://youtu.be/ai",
+                    "fake_score": 0.35,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/ai")
+
+    def test_ai_match_rejects_low_confidence_accept(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="accept",
+                    candidate_id=0,
+                    confidence=0.61,
+                    reason="probably same",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track official audio",
+                    "channel": "Artist",
+                    "duration_s": 181,
+                    "url": "https://youtu.be/ai",
+                    "fake_score": 0.35,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI assist", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/ai")
+
+    def test_ai_match_rejects_accept_below_heuristic_floor(self):
+        conv = Converter(config={"ai_match_enabled": True})
+        accepted = conv._apply_ai_match_advice(
+            AIMatchAdvice(action="accept", candidate_id=0, confidence=0.95, reason="same words"),
+            [{"ai_id": 0, "score": 0.25, "url": "https://youtu.be/weak"}],
+            min_score=0.42,
+        )
+
+        self.assertIsNone(accepted)
+
+    def test_ai_match_retry_query_suggests_heuristic_winner_for_manual_validation(self):
+        class FakeAdvisor:
+            def advise(self, **_kwargs):
+                return AIMatchAdvice(
+                    action="retry",
+                    query="Artist Track official audio",
+                    confidence=0.75,
+                    reason="try official audio query",
+                )
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, query, _limit):
+                if query == "Artist Track official audio":
+                    return [{
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 180,
+                        "url": "https://youtu.be/retry",
+                        "fake_score": 0.85,
+                    }]
+                return [{
+                    "title": "Track lyrics",
+                    "channel": "random",
+                    "duration_s": 180,
+                    "url": "https://youtu.be/weak",
+                    "fake_score": 0.31,
+                }]
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/retry")
+
+    def test_ai_match_retry_query_can_help_when_initial_search_has_no_results(self):
+        class FakeAdvisor:
+            def advise(self, **kwargs):
+                if not kwargs["candidates"]:
+                    return AIMatchAdvice(
+                        action="retry",
+                        query="Artist Track official audio",
+                        confidence=0.80,
+                        reason="try a cleaner artist title query",
+                    )
+                return AIMatchAdvice(action="reject", reason="not enough confidence")
+
+        class FakeAIConverter(Converter):
+            def _search_youtube_candidates(self, query, _limit):
+                if query == "Artist Track official audio":
+                    return [{
+                        "title": "Artist - Track",
+                        "channel": "Artist - Topic",
+                        "duration_s": 180,
+                        "url": "https://youtu.be/retry",
+                        "fake_score": 0.85,
+                    }]
+                return []
+
+            def _score_match_candidate(self, _track, cand):
+                return float(cand["fake_score"])
+
+        conv = FakeAIConverter(config={"safe_search": True, "ai_match_enabled": True})
+        conv._ai_match_advisor = FakeAdvisor()
+
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNone(best)
+        self.assertIn("AI suggested candidate", reject_reason)
+        self.assertIn("Manual validation required", reject_reason)
+        self.assertEqual(best_url, "https://youtu.be/retry")
+
+    def test_soundcloud_set_url_is_not_treated_as_single_track(self):
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets/demo"))
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets"))
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("soundcloud:set:123"))
+        self.assertFalse(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/track"))
+
+    def test_soundcloud_track_url_playlist_context_is_stripped(self):
+        self.assertEqual(
+            Converter._normalize_source_url("https://soundcloud.com/user/track?in=owner/sets/demo"),
+            "https://soundcloud.com/user/track",
+        )
+
+    def test_soundcloud_internal_uri_is_not_used_as_download_url(self):
+        self.assertEqual(Converter._normalize_source_url("soundcloud:track:123"), "")
+
+    def test_soundcloud_unknown_track_fields_are_inferred_from_url(self):
+        conv = Converter(config={})
+        track = {
+            "title": "Unknown",
+            "artists": "Unknown",
+            "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+        }
+
+        conv._infer_missing_track_fields_from_source_url(track)
+
+        self.assertEqual(track["artists"], "utr2")
+        self.assertEqual(track["title"], "aprd crazy kikker free download")
+
+    def test_ytdlp_failure_message_includes_tail_output(self):
+        class FailingConverter(Converter):
+            def _run_ytdlp_stream(self, _cmd, idx, on_progress, cancel_event):
+                self._set_ytdlp_tail(idx, [
+                    "[soundcloud] Downloading info JSON",
+                    "ERROR: [soundcloud] Unable to download JSON metadata: HTTP Error 403: Forbidden",
+                ])
+                return 1
+
+        events = []
+        conv = FailingConverter(config={"safe_search": True}, item_cb=lambda k, d: events.append((k, d)))
+        with tempfile.TemporaryDirectory() as tmp:
+            conv._process_one(
+                1,
+                {
+                    "title": "Unknown",
+                    "artists": "Unknown",
+                    "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+                },
+                str(Path(tmp) / "aprd.mp3"),
+                tmp,
+                "aprd",
+            )
+
+        error = [data for kind, data in events if kind == "error"][0]
+        self.assertIn("utr2 - aprd crazy kikker free download", error["message"])
+        self.assertIn("HTTP Error 403", error["message"])
+
+    def test_soundcloud_direct_failure_does_not_fallback_to_youtube_match(self):
+        class NoFallbackConverter(Converter):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+                self.search_calls = 0
+
+            def _search_youtube_candidates(self, _query, _limit):
+                self.search_calls += 1
+                return []
+
+            def _run_ytdlp_stream(self, cmd, idx, on_progress, cancel_event):
+                self.calls.append(cmd[-1])
+                self._set_ytdlp_tail(idx, [
+                    "ERROR: [soundcloud] Unable to download JSON metadata: HTTP Error 403: Forbidden",
+                ])
+                return 1
+
+        events = []
+        conv = NoFallbackConverter(config={"safe_search": True}, item_cb=lambda k, d: events.append((k, d)))
+        with tempfile.TemporaryDirectory() as tmp:
+            conv._process_one(
+                1,
+                {
+                    "title": "Unknown",
+                    "artists": "Unknown",
+                    "duration_ms": 180000,
+                    "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+                },
+                str(Path(tmp) / "aprd.mp3"),
+                tmp,
+                "aprd",
+            )
+
+        self.assertEqual(conv.calls, ["https://soundcloud.com/utr2/aprd-crazy-kikker-free-download"])
+        self.assertEqual(conv.search_calls, 0)
+        self.assertFalse(any(kind == "match" for kind, _data in events))
+        self.assertFalse(any(kind == "done" for kind, _data in events))
+        error = [data for kind, data in events if kind == "error"][0]
+        self.assertIn("SoundCloud direct download failed", error["message"])
+        self.assertNotIn("YouTube fallback", error["message"])
+        self.assertNotIn("best_url", error)
+
+    def test_bandcamp_album_url_is_not_treated_as_single_track(self):
+        self.assertTrue(Converter._is_probable_bandcamp_album_url("https://artist.bandcamp.com/album/demo"))
+        self.assertFalse(Converter._is_probable_bandcamp_album_url("https://artist.bandcamp.com/track/demo"))
+
+    def test_m3u_is_written_in_playlist_order_even_when_workers_finish_out_of_order(self):
+        class OutOfOrderConverter(Converter):
+            def _process_one(self, idx, _track, _dest_path, _out_dir, base_name):
+                if idx == 1:
+                    time.sleep(0.03)
+                with self._made_files_lock:
+                    self._made_files.append((idx, f"{base_name}.mp3"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"])
+                writer.writeheader()
+                writer.writerow({"Track Name": "One", "Artist Name(s)": "", "Album Name": "", "Duration (ms)": ""})
+                writer.writerow({"Track Name": "Two", "Artist Name(s)": "", "Album Name": "", "Duration (ms)": ""})
+
+            conv = OutOfOrderConverter(config={"generate_m3u": True, "concurrency": 2})
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(out_dir), "Demo"))
+
+            self.assertEqual((result_dir / "playlist.m3u8").read_text(encoding="utf-8").splitlines(), [
+                "One.mp3",
+                "Two.mp3",
+            ])
+
+    def test_convert_writes_playlist_manifest_with_source_info(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL", "Track URI"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "Album",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://www.youtube.com/watch?v=test",
+                    "Track URI": "",
+                })
+
+            conv = NoDownloadConverter(config={"safe_search": True, "generate_m3u": False})
+            result_dir = Path(conv.convert_from_csv(
+                str(csv_path),
+                str(out_dir),
+                "Demo",
+                source_info={"type": "spotify", "url": "https://open.spotify.com/playlist/demo", "name": "Demo"},
+            ))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["playlist_name"], "Demo")
+            self.assertEqual(manifest["source"]["type"], "spotify")
+            self.assertEqual(manifest["track_count"], 1)
+            self.assertEqual(manifest["tracks"][0]["status"], "done")
+            self.assertEqual(manifest["tracks"][0]["file"], "Artist - Track.mp3")
+
+    def test_sync_existing_playlist_does_not_create_playlist_subfolder(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            playlist_dir = Path(tmp) / "Existing"
+            csv_path = Path(tmp) / "playlist.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://www.youtube.com/watch?v=test",
+                })
+
+            conv = NoDownloadConverter(config={
+                "safe_search": True,
+                "generate_m3u": False,
+                "sync_existing_playlist": True,
+            })
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(playlist_dir), "Renamed From Source"))
+
+            self.assertEqual(result_dir, playlist_dir)
+            self.assertFalse((playlist_dir / "Renamed From Source").exists())
+
+    def test_convert_writes_match_details_to_manifest(self):
+        class MatchedConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                return [{
+                    "title": "Artist - Track",
+                    "channel": "Artist - Topic",
+                    "duration_s": 180,
+                    "url": "https://youtu.be/match",
+                }]
+
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "playlist.csv"
+            out_dir = Path(tmp) / "out"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "Track",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "Album",
+                    "Duration (ms)": "180000",
+                })
+
+            conv = MatchedConverter(config={"safe_search": True, "generate_m3u": False})
+            result_dir = Path(conv.convert_from_csv(str(csv_path), str(out_dir), "Demo"))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+            match = manifest["tracks"][0]["match"]
+
+            self.assertEqual(match["url"], "https://youtu.be/match")
+            self.assertGreater(match["score"], 0.42)
+            self.assertIn("title_ratio", match["score_details"])
+
+    def test_append_to_existing_playlist_merges_manifest_and_m3u(self):
+        class NoDownloadConverter(Converter):
+            def _run_ytdlp_stream(self, *args, **kwargs):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Existing"
+            existing_manifest = build_manifest(
+                playlist_name="Existing",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/existing", "name": "Existing"},
+                settings={"safe_search": True},
+                tracks=[{
+                    "idx": 1,
+                    "title": "Old",
+                    "artists": "Artist",
+                    "source_url": "https://soundcloud.com/user/old",
+                    "file": "Artist - Old.mp3",
+                    "status": "done",
+                    "format": "MP3",
+                }],
+            )
+            write_manifest(playlist_dir, existing_manifest)
+            (playlist_dir / "playlist.m3u8").write_text("Artist - Old.mp3\n", encoding="utf-8")
+
+            csv_path = root / "single.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "New",
+                    "Artist Name(s)": "Artist",
+                    "Album Name": "",
+                    "Duration (ms)": "180000",
+                    "Source URL": "https://soundcloud.com/user/new",
+                })
+
+            conv = NoDownloadConverter(config={
+                "safe_search": True,
+                "generate_m3u": True,
+                "append_to_existing_playlist": True,
+            })
+            result_dir = Path(conv.convert_from_csv(
+                str(csv_path),
+                str(playlist_dir),
+                None,
+                source_info={"type": "spotify", "url": "https://open.spotify.com/playlist/existing", "name": "Existing"},
+            ))
+            manifest = json.loads((result_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+            self.assertEqual(result_dir, playlist_dir)
+            self.assertEqual(manifest["playlist_name"], "Existing")
+            self.assertEqual(manifest["track_count"], 2)
+            self.assertEqual([t["title"] for t in manifest["tracks"]], ["Old", "New"])
+            self.assertEqual(
+                (playlist_dir / "playlist.m3u8").read_text(encoding="utf-8").splitlines(),
+                ["Artist - Old.mp3", "Artist - New.mp3"],
+            )
 
 
 if __name__ == "__main__":

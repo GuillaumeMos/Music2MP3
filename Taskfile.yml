@@ -24,12 +24,13 @@ tasks:
     cmds:
       - '{{.PIP}} install --upgrade pip'
       - '{{.PIP}} install -r requirements.txt'
+      - '{{.PYTHON}} devtools/prepare_qt_runtime.py'
 
   run:
-    desc: Lance l'application
+    desc: Lance l'application Qt
     deps: [install]
     cmds:
-      - '{{.PYTHON}} app.py'
+      - '{{.PYTHON}} qt_app.py'
 
   run:tk:
     desc: Lance l'UI Tk (legacy)
@@ -38,14 +39,15 @@ tasks:
       - '{{.PYTHON}} app.py'
 
   qt:install:
-    desc: Installe PySide6 pour l'UI Qt expérimentale
+    desc: Installe PySide6 pour l'UI Qt
     deps: [venv]
     cmds:
-      - '{{.PIP}} install PySide6'
+      - '{{.PIP}} install "PySide6>=6.10.3,<6.11"'
+      - '{{.PYTHON}} devtools/prepare_qt_runtime.py'
 
   run:qt:
-    desc: Lance l'UI Qt expérimentale
-    deps: [install, qt:install]
+    desc: Lance l'UI Qt
+    deps: [install]
     cmds:
       - '{{.PYTHON}} qt_app.py'
 
@@ -55,11 +57,17 @@ tasks:
     cmds:
       - '{{.PYTHON}} -m unittest discover -s tests -v'
 
+  test:live-downloads:
+    desc: Lance les tests live SoundCloud/Spotify (reseau + vrais downloads)
+    deps: [install]
+    cmds:
+      - 'MUSIC2MP3_LIVE_DOWNLOADS=1 {{.PYTHON}} -m unittest tests.test_live_downloads -v'
+
   compile:
     desc: Vérifie la syntaxe Python (compileall)
     deps: [venv]
     cmds:
-      - '{{.PYTHON}} -m compileall app.py qt_app.py gui.py converter.py spotify_auth.py token_store.py tests'
+      - '{{.PYTHON}} -m compileall ai_matcher.py app.py bandcamp_api.py config.py converter.py gui.py library_attention.py library_cleanup.py library_manifest.py log_viewer.py logging_setup.py qt_app.py qt_workers.py slskd_client.py soundcloud_api.py spotify_api.py spotify_auth.py token_store.py utils.py devtools/prepare_qt_runtime.py tests'
 
   check:
     desc: Exécute les vérifications de base (compile + tests)
@@ -69,7 +77,7 @@ tasks:
     desc: Installe les dépendances de build (PyInstaller)
     deps: [install]
     cmds:
-      - '{{.PIP}} install pyinstaller'
+      - '{{.PIP}} install "pyinstaller>=6.20.0"'
 
   build:current:
     desc: Build pour l'OS courant (Qt par défaut)
@@ -90,7 +98,7 @@ tasks:
     deps: [build:deps, qt:install]
     platforms: [windows]
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Windows.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-Windows.spec'
 
   build:windows:qt:
     desc: Build Windows Qt app
@@ -101,7 +109,7 @@ tasks:
     deps: [build:deps]
     platforms: [windows]
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Windows.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Windows.spec'
 
   build:macos:
     desc: Build macOS Qt app (default)
@@ -113,7 +121,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-macOS.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-macOS.spec'
 
   build:macos:qt:
     desc: Build macOS Qt app
@@ -131,7 +139,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Run 'task tools:install:macos' or add yt-dlp/yt-dlp"
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-macOS.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-macOS.spec'
 
   sign:macos:
     desc: Signe l'app macOS (Developer ID)
@@ -170,7 +178,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Qt-Linux.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Qt-Linux.spec'
 
   build:linux:qt:
     desc: Build Linux Qt app
@@ -186,7 +194,7 @@ tasks:
       - sh: test -f yt-dlp/yt-dlp || command -v yt-dlp >/dev/null 2>&1
         msg: "Missing yt-dlp. Add yt-dlp/yt-dlp or install yt-dlp in PATH."
     cmds:
-      - '{{.PYTHON}} -m PyInstaller -y Music2MP3-Linux.spec'
+      - '{{.PYTHON}} -m PyInstaller -y packaging/Music2MP3-Linux.spec'
 
   clean:
     desc: Nettoie les artefacts Python et build

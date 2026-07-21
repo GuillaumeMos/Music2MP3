@@ -4,6 +4,8 @@ import platform
 import sys
 from pathlib import Path
 
+from ai_matcher import DEFAULT_AI_MATCH_PROMPT
+
 
 APP_NAME = "Music2MP3"
 
@@ -48,6 +50,30 @@ _DEFAULT = {
     "output_mode": "manual",
     # Try multiple YouTube candidates and only keep confident matches.
     "strict_match": False,
+    "match_candidates": 4,
+    "youtube_search_timeout_s": 12.0,
+    # Optional Netscape cookies.txt passed to yt-dlp for protected/blocked sources.
+    "cookies_path": "",
+    # Optional browser cookie auth passed as yt-dlp --cookies-from-browser.
+    "cookies_from_browser": "",
+    "cookies_browser_profile": "",
+    # Guard against long mixes/sets when searching YouTube.
+    "safe_search": True,
+    # Optional Google/Vertex-assisted matching for gray-zone YouTube results.
+    "ai_match_enabled": False,
+    "ai_match_provider": "vertex",
+    "ai_match_model": "gemini-2.5-flash",
+    "ai_match_gray_min": 0.30,
+    "ai_match_min_confidence": 0.72,
+    "ai_match_accept_margin": 0.12,
+    "ai_match_timeout_s": 6.0,
+    "ai_match_prompt": DEFAULT_AI_MATCH_PROMPT,
+    # Backlog slskd integration. API key is stored in keyring, not config.json.
+    "slskd_enabled": False,
+    "slskd_host": "http://127.0.0.1:5030",
+    "slskd_timeout_s": 12.0,
+    "slskd_search_timeout_ms": 8000,
+    "slskd_result_limit": 12,
     # New unified output format (mp3, m4a, aac, wav, flac, aiff)
     "output_format": "mp3",
     # Remember last manual selection even when output_mode is "auto".
