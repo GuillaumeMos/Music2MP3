@@ -1,6 +1,6 @@
-# CLAUDE.md — Music2MP3
+# AGENTS.md — Music2MP3
 
-> Guide pour Claude Code (et tout autre agent IA) qui contribue à ce repo.
+> Guide pour Codex (et tout autre agent IA) qui contribue à ce repo.
 > **Lis ce fichier en entier avant toute modification.**
 > Si tu modifies l'archi ou la direction visuelle, **mets à jour ce fichier d'abord**.
 
@@ -202,6 +202,8 @@ Music2MP3/
 ├── soundcloud_api.py       # client SoundCloud via yt-dlp
 ├── bandcamp_api.py         # client Bandcamp via yt-dlp
 ├── slskd_client.py         # client slskd API + keychain API key
+├── library_attention.py    # agrégation globale des tracks à vérifier
+├── library_cleanup.py      # analyse + nettoyage réversible de la bibliothèque
 ├── library_manifest.py     # scan + manifest JSON de la bibliothèque locale
 ├── token_store.py          # wrapper keyring
 ├── config.py               # chargement/sauvegarde config.json
@@ -224,6 +226,8 @@ Music2MP3/
 ├── tests/
 │   ├── test_ai_matcher.py
 │   ├── test_converter_helpers.py
+│   ├── test_library_attention.py
+│   ├── test_library_cleanup.py
 │   ├── test_library_manifest.py
 │   ├── test_qt_app_smoke.py
 │   ├── test_slskd_client.py
@@ -278,6 +282,10 @@ Gère l'ensemble du pipeline de téléchargement :
 ### Library manifest
 
 `library_manifest.py` gère un fichier `music2mp3.manifest.json` par dossier de playlist, qui permet l'update incrémental. Le scan est récursif, trouve les dossiers audio legacy, et déduplique les manifests qui partagent la même source URL en gardant la playlist la plus complète.
+
+`library_cleanup.py` analyse la bibliothèque depuis un worker Qt avant toute mutation. Le nettoyage automatique est limité aux actions réversibles et sûres : fichiers audio orphelins ou posés à la racine, entrées de manifest qui référencent deux fois le même fichier, et playlists imbriquées sans conflit de nom. Les fichiers retirés sont déplacés sous `.music2mp3-cleanup/` avec un journal `cleanup.json`. Les morceaux binaires identiques partagés entre plusieurs playlists et les sources de playlist dupliquées sont signalés, jamais supprimés automatiquement.
+
+`library_attention.py` construit la vue globale **Needs attention** depuis les manifests : tracks en échec, fichiers attendus mais absents et propositions de match à valider. L'UI peut ouvrir directement la playlist concernée; les retries restent déclenchés depuis le détail du track, jamais automatiquement.
 
 ---
 
@@ -448,10 +456,10 @@ task notarize:macos  # notarytool + staple
 | Core download | ✅ Fonctionnel | yt-dlp + ffmpeg, formats manual/auto, M3U, incrémental |
 | Matching sécurisé | ✅ Fonctionnel | multi-candidats YouTube, durée, safe/strict/deep search |
 | Sources | ✅ MVP | Spotify OAuth PKCE, SoundCloud URL/secret, CSV |
-| Library locale | ✅ Avancé | manifest par playlist, scan root, sync selected, sync all avec erreurs partielles |
+| Library locale | ✅ Avancé | manifest par playlist, scan root, sync selected/all, nettoyage réversible avec prévisualisation |
 | UI Qt épurée | 🔄 Refonte en cours | thème sombre musical validé; simplification progressive des écrans |
-| Actions library | ✅ Avancé | rename, open folder, merge, export CSV, delete |
-| Gestion erreurs | ✅ Avancé | dialog d'erreur, meilleur candidat, retry manuel par URL |
+| Actions library | ✅ Avancé | rename, open folder, merge, export CSV, delete, clean library |
+| Gestion erreurs | ✅ Avancé | vue globale Needs attention, fichiers manquants, meilleur candidat, retry manuel par URL |
 | Build | ✅ OK | Taskfile + PyInstaller Qt par défaut |
 | Tests | ✅ Base solide | converter, manifest, backlog Bandcamp/slskd, Spotify/SoundCloud/auth, smoke Qt offscreen |
 
@@ -473,6 +481,7 @@ task notarize:macos  # notarytool + staple
 | Tests UI smoke Qt | ✅ |
 | Normalisation LF de `converter.py` | ✅ |
 | Agent IA de matching avec validation manuelle | ✅ |
+| Vue globale `Needs attention` | ✅ |
 | Soulseek/slskd assist MVP | ⏸️ Backlog |
 
 ### Backlog futur priorisé

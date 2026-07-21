@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from bandcamp_api import BandcampClient
 from converter import Converter
+from library_cleanup import analyze_library_cleanup
 from soundcloud_api import SoundCloudClient
 from spotify_api import SpotifyClient
 from spotify_auth import PKCEAuth
@@ -110,8 +111,12 @@ class PlaylistLoadWorker(QObject):
     def _load_soundcloud(self) -> dict:
         self.status.emit("Fetching playlist from SoundCloud...")
         sc = SoundCloudClient()
-        cookies_path = self.config.get("cookies_path")
-        rows, name = sc.fetch_playlist(self.url, cookies_path=cookies_path)
+        rows, name = sc.fetch_playlist(
+            self.url,
+            cookies_path=self.config.get("cookies_path"),
+            cookies_from_browser=self.config.get("cookies_from_browser"),
+            cookies_browser_profile=self.config.get("cookies_browser_profile"),
+        )
         tmp = self._write_temp_csv(
             rows,
             ["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)", "Source URL", "Track URI"],
@@ -142,3 +147,22 @@ class PlaylistLoadWorker(QObject):
             writer.writeheader()
             writer.writerows(rows)
         return tmp
+
+
+class LibraryCleanupWorker(QObject):
+    done = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, root_dir: str):
+        super().__init__()
+        self.root_dir = root_dir
+
+    @Slot()
+    def run(self):
+        try:
+            self.done.emit(analyze_library_cleanup(self.root_dir))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()

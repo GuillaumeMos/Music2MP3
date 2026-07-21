@@ -1,7 +1,7 @@
 # Music2MP3
 
 **Music2MP3** is a cross-platform, self-contained app (Windows `.exe`, macOS `.app`, Linux AppImage) that turns a playlist into local audio files.  
-You can either **load a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), **paste a SoundCloud playlist link** (public or private _secret_ URL — **no login needed**), or **paste a Bandcamp album/track link**.
+You can either **load a CSV** (Exportify / TuneMyMusic / others), **paste a Spotify playlist link** (OAuth PKCE – **no client secret**), or **paste a SoundCloud playlist link** (public or private _secret_ URL).
 
 The app downloads each track via **yt-dlp**. In **Manual** mode it resamples to **44.1 kHz** and saves to your chosen format (MP3, WAV, FLAC, AIFF, AAC, M4A – default MP3). In **Auto** mode it keeps the best available audio format from the source.
 
@@ -15,8 +15,6 @@ Everything is bundled—no Python or external installs required.
   Uses **OAuth PKCE** in your browser (scopes: `playlist-read-private`, `playlist-read-collaborative`). No client secret stored.
 - **Load from SoundCloud URL (no auth)**  
   Paste any **public playlist** or **private “secret link”** URL and it just works. No account login, no credentials.
-- **Load from Bandcamp URL (no auth)**  
-  Paste a Bandcamp album or track URL. The app expands album releases into per-track rows via yt-dlp.
 - **CSV still supported**  
   Any CSV with the usual headers (`Track Name`, `Artist Name(s)`, `Album Name`, `Duration (ms)`…) works (Exportify, TuneMyMusic…).
 - **Incremental updates**  
@@ -58,8 +56,8 @@ The **PySide6 / Qt** frontend is the default build target.
 
 - Run default app: `task run`
 - Run: `task run:qt`
-- Scope: Spotify/SoundCloud/Bandcamp/CSV loading + output options + live downloads panel
-- Library panel: choose a root folder, scan playlist manifests, open a playlist folder, or sync a selected Spotify/SoundCloud/Bandcamp/CSV-backed playlist.
+- Scope: Spotify/SoundCloud/CSV loading + output options + live downloads panel
+- Library panel: choose a root folder, scan playlist manifests, open a playlist folder, or sync a selected Spotify/SoundCloud/CSV-backed playlist.
 - Tk frontend is still available: `task run:tk`
 
 ### Option A — From a CSV
@@ -91,14 +89,7 @@ The **PySide6 / Qt** frontend is the default build target.
 3. The app parses the playlist and builds a temp CSV (with `Source URL` for each track).
 4. Choose an **output folder**, then click **Convert**.
 
-> Note: If some tracks are region-locked or not streamable, yt-dlp may fail those entries. You can optionally provide a cookies file in `config.json` to improve access when needed.
-
-### Option D — From a Bandcamp album or track URL (no auth)
-
-1. Copy a Bandcamp album or track URL, e.g. `https://artist.bandcamp.com/album/release`.
-2. Paste it and click **Load from Bandcamp**.
-3. The app parses the release and builds a temp CSV with `Source URL` for each track.
-4. Choose an **output folder**, then click **Convert**.
+> Note: If SoundCloud returns 403/private/region errors, open Settings and choose a browser under **Browser auth**. Music2MP3 will let yt-dlp read your existing SoundCloud browser session. A Netscape `cookies.txt` file is still supported as a fallback.
 
 ---
 
@@ -122,6 +113,10 @@ The **PySide6 / Qt** frontend is the default build target.
   Adds an audio-focused search hint. For multi-candidate scoring, enable Strict matching.
 - **Safe search**
   Enabled by default. Searches multiple YouTube candidates and rejects long mixes/sets or candidates whose duration is far from the source track.
+- **cookies.txt**
+  Optional yt-dlp cookies file for protected or blocked SoundCloud/YouTube links.
+- **Browser auth**
+  Optional yt-dlp `--cookies-from-browser` integration. Choose Safari, Chrome, Firefox, Brave, Edge, etc. to reuse your browser SoundCloud session without exporting cookies manually.
 - **Strict matching (safer, slower)**  
   Tries multiple YouTube candidates and keeps only confident matches using title/artist/duration scoring.
 - **Incremental update**  
@@ -152,8 +147,10 @@ In the Qt app, the **Library** panel already supports:
 - choosing/scanning a library root,
 - listing converted playlists from `music2mp3.manifest.json`,
 - opening the selected playlist folder,
-- manually syncing selected Spotify, SoundCloud, Bandcamp, or CSV-backed playlists,
-- syncing all eligible playlists with progress and partial-error handling.
+- manually syncing selected Spotify, SoundCloud, or CSV-backed playlists,
+- syncing all eligible playlists with progress and partial-error handling,
+- cleaning orphan files, duplicate manifest entries, and nested playlists with a recovery folder,
+- reviewing failed downloads, missing files, and suggested matches from the global **Needs attention** view.
 
 Current repo organization:
 - Root app entrypoints stay at the top level for PyInstaller compatibility.
@@ -170,7 +167,7 @@ Current repo organization:
   - Local redirect: `http://127.0.0.1:8765/callback`
   - Access token is kept in memory for the current session.
   - Refresh token is stored in your OS keychain when available (via `keyring`).
-- **SoundCloud and Bandcamp** usage requires **no authentication**:
+- **SoundCloud** usage requires **no authentication**:
   - Public playlists work out of the box.
   - SoundCloud private playlists shared via **secret links** also work (the token is in the URL).
 - **AI match assist** is optional:
@@ -187,7 +184,9 @@ Current repo organization:
 
 ## 💡 Notes
 
-- This tool **does not rip Spotify or SoundCloud directly**. Tracks are located on public sources (e.g., YouTube) via yt-dlp and then remuxed/re-encoded. Bandcamp URLs are handed to yt-dlp directly.
+- This tool **does not rip Spotify directly**. Tracks are located on public sources (e.g. YouTube or direct SoundCloud links) via yt-dlp and then remuxed/re-encoded.
+- Direct SoundCloud links are tried first when available. If SoundCloud returns a 403 or similar metadata error, Music2MP3 reports the SoundCloud error and does not retry through YouTube.
+- For persistent SoundCloud 403 errors, use **Browser auth** in Settings first. If browser cookie extraction is blocked by the OS, export browser cookies as a Netscape `cookies.txt` file and set it in Settings.
 - **FFmpeg** and **yt-dlp** are bundled in the releases; no installs needed.
 - Runtime settings are persisted per user:
   - Windows: `%APPDATA%\\Music2MP3\\config.json`
@@ -198,8 +197,13 @@ Current repo organization:
 - Click a downloaded track's match score to inspect score details and AI impact.
 - If a track fails, try:
   - **Safe search**, **Deep search**, **Strict matching**, or **AI match assist**,
+  - choosing **Browser auth** or adding a browser-exported **cookies.txt** file in Settings,
   - checking the URL availability,
   - or providing a **cookies** file in `config.json` (helps with region locks, age restrictions, etc.).
+
+### Backlog parked
+
+Bandcamp import and Soulseek/slskd assist are kept in the codebase for later, but they are not part of the active product path right now.
 
 ---
 
@@ -231,6 +235,21 @@ Or with Taskfile:
 - `task build:macos:tk` (Tk legacy)
 - `task build:linux` / `task build:linux:tk`
 
+Tests:
+- `task test` runs the offline unit/smoke suite.
+- `task test:live-downloads` runs opt-in SoundCloud/Spotify live download checks against real URLs.
+
+Live download tests use the provided SoundCloud playlist URL by default. Spotify live tests require `SPOTIFY_ACCESS_TOKEN`.
+
+```bash
+MUSIC2MP3_LIVE_SOUNDCLOUD_URL="https://soundcloud.com/guiggz-1/sets/dl-playlist/s-CgcmK2MGhwO?si=8a9d42cfc9024436906dfe6ab3d08bb1&utm_source=clipboard&utm_medium=text&utm_campaign=social_sharing" \
+MUSIC2MP3_COOKIES_FROM_BROWSER=safari task test:live-downloads
+
+SPOTIFY_ACCESS_TOKEN="..." \
+MUSIC2MP3_LIVE_SPOTIFY_URL="https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M" \
+task test:live-downloads
+```
+
 macOS signing/notarization (optional):
 - `task sign:macos` with `MACOS_SIGN_IDENTITY="Developer ID Application: ..."`
 - `task notarize:macos` with `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`
@@ -241,6 +260,8 @@ The specs include data files (ffmpeg, yt-dlp, icons, config) and produce the app
 
 ## 🧩 Troubleshooting
 
+- **Qt says the `cocoa` platform plugin cannot be found on macOS**
+  Use `task run` or `task run:qt`: the Taskfile prepares the local PySide6 plugin directory automatically. For a direct Python launch, run `.venv/bin/python devtools/prepare_qt_runtime.py` immediately before `.venv/bin/python qt_app.py`.
 - **“(Not Responding)” on Windows while downloading**  
   Long tasks run in worker threads; per-track progress should update. If you still see freezes, check GPU overlays/AV scanners.
 - **Age-restricted / region-locked videos**  

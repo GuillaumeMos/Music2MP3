@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
-import platform
 from typing import Dict, List, Tuple
 
 from config import resource_path
-from utils import run_quiet
+from utils import find_ytdlp_cmd, run_quiet
 
 
-def _find_ytdlp() -> str:
-    if platform.system() == "Windows":
-        cand = os.path.join(resource_path("yt-dlp"), "yt-dlp.exe")
-        return cand if os.path.isfile(cand) else "yt-dlp.exe"
-    cand = os.path.join(resource_path("yt-dlp"), "yt-dlp")
-    return cand if os.path.isfile(cand) else "yt-dlp"
+def _find_ytdlp_cmd() -> list[str]:
+    return find_ytdlp_cmd(resource_path)
 
 
 class BandcampClient:
@@ -70,19 +64,25 @@ class BandcampClient:
         }
 
     def _dump_bandcamp_json(self, url: str, cookies_path: str | None = None, flat: bool = False) -> Dict:
-        cmd = [
-            _find_ytdlp(),
+        cmd = _find_ytdlp_cmd()
+        if flat:
+            cmd += ["--flat-playlist"]
+        cmd += [
             "--dump-single-json",
             "--no-warnings",
             "-q",
             url,
         ]
-        if flat:
-            cmd.insert(1, "--flat-playlist")
         if cookies_path:
             cmd += ["--cookies", cookies_path]
 
-        proc = run_quiet(cmd, text=True, capture_output=True)
+        try:
+            proc = run_quiet(cmd, text=True, capture_output=True)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "yt-dlp is not available. Install it with `pip install yt-dlp` "
+                "or bundle the yt-dlp binary with the app."
+            ) from e
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr or "yt-dlp failed on Bandcamp URL")
         try:

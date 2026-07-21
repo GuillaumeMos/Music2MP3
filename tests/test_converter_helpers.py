@@ -11,6 +11,21 @@ from library_manifest import MANIFEST_FILENAME, build_manifest, write_manifest
 
 
 class ConverterHelpersTests(unittest.TestCase):
+    def test_manifest_entry_persists_suggested_retry_url(self):
+        conv = Converter(config={})
+
+        conv._record_manifest_entry(
+            3,
+            {"title": "Track", "artists": "Artist"},
+            "failed",
+            None,
+            "MP3",
+            "Manual validation required",
+            suggested_url="https://youtu.be/suggested",
+        )
+
+        self.assertEqual(conv._manifest_entries[0]["suggested_url"], "https://youtu.be/suggested")
+
     def test_sanitize_filename_removes_illegal_chars(self):
         out = _sanitize_filename('  A/B:C*D?"E<F>G|  ')
         self.assertEqual(out, "A_B_C_D__E_F_G_")
@@ -79,6 +94,25 @@ class ConverterHelpersTests(unittest.TestCase):
         cmd_text = " ".join(cmd)
         self.assertIn("--audio-format best", cmd_text)
         self.assertNotIn("FFmpegExtractAudio:-ar 44100", cmd_text)
+
+    def test_build_cmd_passes_cookies_file_to_ytdlp(self):
+        conv = Converter(config={"output_mode": "auto", "cookies_path": "/tmp/cookies.txt"})
+        cmd = conv._build_ytdlp_cmd("https://soundcloud.com/artist/track", "/tmp/out.%(ext)s", None)
+
+        self.assertIn("--cookies", cmd)
+        self.assertEqual(cmd[cmd.index("--cookies") + 1], "/tmp/cookies.txt")
+
+    def test_build_cmd_prefers_browser_cookies_auth(self):
+        conv = Converter(config={
+            "output_mode": "auto",
+            "cookies_path": "/tmp/cookies.txt",
+            "cookies_from_browser": "safari",
+        })
+        cmd = conv._build_ytdlp_cmd("https://soundcloud.com/artist/track", "/tmp/out.%(ext)s", None)
+
+        self.assertIn("--cookies-from-browser", cmd)
+        self.assertEqual(cmd[cmd.index("--cookies-from-browser") + 1], "safari")
+        self.assertNotIn("--cookies", cmd)
 
     def test_progress_parser_emits_converting_event(self):
         events = []
@@ -175,6 +209,103 @@ class ConverterHelpersTests(unittest.TestCase):
         self.assertEqual(reject_reason, "")
         self.assertIsNone(best_url)
         self.assertEqual(best["url"], "https://youtu.be/short")
+
+    def test_pick_best_youtube_match_accepts_confident_first_result_under_threshold(self):
+        class FirstResultConverter(Converter):
+            def _search_youtube_candidates(self, _query, _limit):
+                self.search_limits.append(_limit)
+                return [
+                    {
+                        "title": "Artist - Track official audio",
+                        "channel": "Artist",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/first",
+                    },
+                    {
+                        "title": "weak unrelated",
+                        "channel": "random",
+                        "duration_s": 181,
+                        "url": "https://youtu.be/weak",
+                    },
+                ][:_limit]
+
+            def _score_match_candidate(self, _track, cand):
+                return 0.35 if cand["url"].endswith("first") else 0.1
+
+            def _score_match_candidate_details(self, _track, cand):
+                if cand["url"].endswith("first"):
+                    return {
+                        "score": 0.35,
+                        "title_ratio": 0.35,
+                        "title_coverage": 0.96,
+                        "artist_score": 1.0,
+                        "duration_score": 0.8,
+                        "bonus": 0.0,
+                        "penalties": 0.0,
+                    }
+                return {
+                    "score": 0.1,
+                    "title_ratio": 0.1,
+                    "title_coverage": 0.1,
+                    "artist_score": 0.0,
+                    "duration_score": 0.8,
+                    "bonus": 0.0,
+                    "penalties": 0.0,
+                }
+
+        conv = FirstResultConverter(config={"safe_search": True})
+        conv.search_limits = []
+        best, reject_reason, best_url = conv._pick_best_youtube_match(
+            {"title": "Track", "artists": "Artist", "duration_ms": 180000}
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["url"], "https://youtu.be/first")
+        self.assertEqual(best["accepted_by"], "first_result_title_artist")
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertEqual(conv.search_limits, [1])
+
+    def test_pick_best_youtube_match_does_not_fast_accept_weak_first_result(self):
+        class MultiQueryConverter(Converter):
+            def _search_youtube_candidates(self, query, limit):
+                self.queries.append((query, limit))
+                if query.endswith(" audio"):
+                    return [{
+                        "title": "Kruelty & Death Code - DIS_GUSTING (Exproz Pro Remix)",
+                        "channel": "THE T0XIC MUSIC",
+                        "duration_s": 228,
+                        "url": "https://www.youtube.com/watch?v=BXnLK4U7n0s",
+                    }]
+                return [
+                    {
+                        "title": "Kruelty & Death Code - DIS_GUSTING (Exproz Pro Remix)",
+                        "channel": "THE T0XIC MUSIC",
+                        "duration_s": 228,
+                        "url": "https://www.youtube.com/watch?v=BXnLK4U7n0s",
+                    },
+                    {
+                        "title": "KRUELTY & DEATH CODE - DIS_GUSTING [EXPROZ_RMX] | OFFICIAL VIDEOCLIP",
+                        "channel": "KRUELTY ¹³",
+                        "duration_s": 206,
+                        "url": "https://www.youtube.com/watch?v=R2PHfHqj4IA",
+                    },
+                ][:limit]
+
+        conv = MultiQueryConverter(config={"safe_search": True, "deep_search": True, "match_candidates": 8})
+        conv.queries = []
+        best, reject_reason, best_url = conv._pick_best_youtube_match({
+            "title": "DIS_GUSTING [EXPROZ_RMX]",
+            "artists": "KRUELTY, DEATH CODE",
+            "duration_ms": 206000,
+        })
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["url"], "https://www.youtube.com/watch?v=R2PHfHqj4IA")
+        self.assertEqual(reject_reason, "")
+        self.assertIsNone(best_url)
+        self.assertIn(("KRUELTY DIS_GUSTING [EXPROZ_RMX]", 1), conv.queries)
+        self.assertTrue(any(q.endswith(" audio") for q, _limit in conv.queries))
 
     def test_ai_match_suggests_gray_zone_candidate_for_manual_validation(self):
         class FakeAdvisor:
@@ -339,7 +470,102 @@ class ConverterHelpersTests(unittest.TestCase):
 
     def test_soundcloud_set_url_is_not_treated_as_single_track(self):
         self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets/demo"))
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/sets"))
+        self.assertTrue(Converter._is_probable_soundcloud_set_url("soundcloud:set:123"))
         self.assertFalse(Converter._is_probable_soundcloud_set_url("https://soundcloud.com/user/track"))
+
+    def test_soundcloud_track_url_playlist_context_is_stripped(self):
+        self.assertEqual(
+            Converter._normalize_source_url("https://soundcloud.com/user/track?in=owner/sets/demo"),
+            "https://soundcloud.com/user/track",
+        )
+
+    def test_soundcloud_internal_uri_is_not_used_as_download_url(self):
+        self.assertEqual(Converter._normalize_source_url("soundcloud:track:123"), "")
+
+    def test_soundcloud_unknown_track_fields_are_inferred_from_url(self):
+        conv = Converter(config={})
+        track = {
+            "title": "Unknown",
+            "artists": "Unknown",
+            "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+        }
+
+        conv._infer_missing_track_fields_from_source_url(track)
+
+        self.assertEqual(track["artists"], "utr2")
+        self.assertEqual(track["title"], "aprd crazy kikker free download")
+
+    def test_ytdlp_failure_message_includes_tail_output(self):
+        class FailingConverter(Converter):
+            def _run_ytdlp_stream(self, _cmd, idx, on_progress, cancel_event):
+                self._set_ytdlp_tail(idx, [
+                    "[soundcloud] Downloading info JSON",
+                    "ERROR: [soundcloud] Unable to download JSON metadata: HTTP Error 403: Forbidden",
+                ])
+                return 1
+
+        events = []
+        conv = FailingConverter(config={"safe_search": True}, item_cb=lambda k, d: events.append((k, d)))
+        with tempfile.TemporaryDirectory() as tmp:
+            conv._process_one(
+                1,
+                {
+                    "title": "Unknown",
+                    "artists": "Unknown",
+                    "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+                },
+                str(Path(tmp) / "aprd.mp3"),
+                tmp,
+                "aprd",
+            )
+
+        error = [data for kind, data in events if kind == "error"][0]
+        self.assertIn("utr2 - aprd crazy kikker free download", error["message"])
+        self.assertIn("HTTP Error 403", error["message"])
+
+    def test_soundcloud_direct_failure_does_not_fallback_to_youtube_match(self):
+        class NoFallbackConverter(Converter):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+                self.search_calls = 0
+
+            def _search_youtube_candidates(self, _query, _limit):
+                self.search_calls += 1
+                return []
+
+            def _run_ytdlp_stream(self, cmd, idx, on_progress, cancel_event):
+                self.calls.append(cmd[-1])
+                self._set_ytdlp_tail(idx, [
+                    "ERROR: [soundcloud] Unable to download JSON metadata: HTTP Error 403: Forbidden",
+                ])
+                return 1
+
+        events = []
+        conv = NoFallbackConverter(config={"safe_search": True}, item_cb=lambda k, d: events.append((k, d)))
+        with tempfile.TemporaryDirectory() as tmp:
+            conv._process_one(
+                1,
+                {
+                    "title": "Unknown",
+                    "artists": "Unknown",
+                    "duration_ms": 180000,
+                    "source_url": "https://soundcloud.com/utr2/aprd-crazy-kikker-free-download",
+                },
+                str(Path(tmp) / "aprd.mp3"),
+                tmp,
+                "aprd",
+            )
+
+        self.assertEqual(conv.calls, ["https://soundcloud.com/utr2/aprd-crazy-kikker-free-download"])
+        self.assertEqual(conv.search_calls, 0)
+        self.assertFalse(any(kind == "match" for kind, _data in events))
+        self.assertFalse(any(kind == "done" for kind, _data in events))
+        error = [data for kind, data in events if kind == "error"][0]
+        self.assertIn("SoundCloud direct download failed", error["message"])
+        self.assertNotIn("YouTube fallback", error["message"])
+        self.assertNotIn("best_url", error)
 
     def test_bandcamp_album_url_is_not_treated_as_single_track(self):
         self.assertTrue(Converter._is_probable_bandcamp_album_url("https://artist.bandcamp.com/album/demo"))

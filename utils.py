@@ -1,8 +1,61 @@
 # utils.py
 import os
 import platform
+import shutil
 import subprocess
+import sys
 import tkinter as tk
+
+YTDLP_COOKIE_BROWSERS = ("", "safari", "chrome", "firefox", "brave", "edge", "chromium", "opera", "vivaldi", "whale")
+
+
+def find_ytdlp_cmd(resource_path_func=None) -> list[str]:
+    """
+    Resolve yt-dlp as a command prefix.
+
+    Priority:
+    - bundled binary next to the packaged app,
+    - executable next to the current Python interpreter,
+    - executable available on PATH,
+    - installed Python module in the current interpreter.
+    """
+    exe = "yt-dlp.exe" if platform.system() == "Windows" else "yt-dlp"
+    candidates: list[str] = []
+    if resource_path_func:
+        candidates.extend([
+            os.path.join(resource_path_func("yt-dlp"), exe),
+            resource_path_func(exe),
+        ])
+    candidates.append(os.path.join(os.path.dirname(sys.executable), exe))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return [candidate]
+
+    for name in ("yt-dlp", "yt-dlp.exe"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def build_ytdlp_cookie_args(config: dict | None) -> list[str]:
+    """
+    Build yt-dlp cookie/auth arguments from config.
+
+    Prefer browser cookies when configured because they avoid manual cookies.txt
+    exports. Fall back to a Netscape cookies file for portable builds.
+    """
+    cfg = config or {}
+    browser = str(cfg.get("cookies_from_browser") or "").strip().lower()
+    profile = str(cfg.get("cookies_browser_profile") or "").strip()
+    if browser:
+        spec = f"{browser}:{profile}" if profile else browser
+        return ["--cookies-from-browser", spec]
+    cookies_path = str(cfg.get("cookies_path") or "").strip()
+    if cookies_path:
+        return ["--cookies", cookies_path]
+    return []
 
 
 # -----------------------------

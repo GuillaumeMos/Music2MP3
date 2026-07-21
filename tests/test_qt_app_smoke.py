@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -162,7 +163,7 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
-    def test_manifest_skipped_tracks_show_skipped_not_cancelled(self):
+    def test_manifest_skipped_tracks_with_files_show_done(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             playlist_dir = root / "Warehouse"
@@ -194,7 +195,7 @@ class QtAppSmokeTests(unittest.TestCase):
                 window._on_playlist_item_clicked(0)
                 state_item = window.table.item(0, 4)
                 self.assertIsNotNone(state_item)
-                self.assertIn("skipped", state_item.text())
+                self.assertIn("done", state_item.text())
                 self.assertNotIn("cancelled", state_item.text())
             finally:
                 window.close()
@@ -260,6 +261,26 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
+    def test_retry_item_events_are_remapped_to_original_failed_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            window = self._make_window(root)
+            try:
+                window._ensure_row(25, "Missing Track", "Artist")
+                window._set_row_state(25, "queued")
+
+                window._on_retry_item(25, "init", {"idx": 1, "title": "Artist - Missing Track", "format": "MP3"})
+                window._on_retry_item(25, "done", {"idx": 1, "format": "MP3", "file": "Artist - Missing Track.mp3"})
+
+                self.assertIn(25, window._rows)
+                self.assertNotIn(1, window._rows)
+                self.assertEqual(window._rows[25]["state"], "done")
+                self.assertEqual(window.table.rowCount(), 1)
+                self.assertEqual(window.table.item(0, 4).text(), "● done")
+            finally:
+                window.close()
+                window.deleteLater()
+
     def test_local_scan_button_chooses_root_and_selects_playlist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -304,19 +325,181 @@ class QtAppSmokeTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
-    def test_sync_buttons_are_in_library_header(self):
+    def test_startup_prefers_library_root_over_stale_output_dir(self):
+        app = _app()
+        original_load_config = qt_app.load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            stale = Path(tmp) / "stale"
+            root.mkdir()
+            stale.mkdir()
+            qt_app.load_config = lambda: {
+                "default_output_dir": str(stale),
+                "library_root": str(root),
+                "output_format": "mp3",
+                "concurrency": 3,
+            }
+            try:
+                with patch("qt_app.QTimer.singleShot"):
+                    window = qt_app.QtMusic2MP3Window()
+            finally:
+                qt_app.load_config = original_load_config
+            try:
+                app.processEvents()
+                self.assertEqual(Path(window.output_folder).resolve(), root.resolve())
+                self.assertEqual(Path(window.config["default_output_dir"]).resolve(), root.resolve())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_choose_library_root_updates_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chosen = root / "Library"
+            chosen.mkdir()
+            window = self._make_window(root / "old")
+            try:
+                with patch("qt_app.QFileDialog.getExistingDirectory", return_value=str(chosen)):
+                    window._choose_library_root()
+                    _app().processEvents()
+
+                self.assertEqual(Path(window.library_root).resolve(), chosen.resolve())
+                self.assertEqual(Path(window.output_folder).resolve(), chosen.resolve())
+                self.assertEqual(Path(window.config["default_output_dir"]).resolve(), chosen.resolve())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_library_actions_use_explicit_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             window = self._make_window(root)
             try:
-                self.assertIn("Sync selected playlist", window.sync_btn.toolTip())
+                self.assertEqual(window.sync_btn.text(), "Sync selected")
+                self.assertIn("selected playlist", window.sync_btn.toolTip())
+                self.assertEqual(window.sync_all_btn.text(), "Sync all")
                 self.assertEqual(window.sync_all_btn.toolTip(), "Sync all playlists: no playlists with a saved URL")
-                self.assertLessEqual(window.sync_btn.height(), 24)
-                self.assertLessEqual(window.sync_all_btn.height(), 24)
-                self.assertEqual(window.library_scan_btn.toolTip(), "Scan library root")
+                self.assertGreaterEqual(window.sync_btn.minimumHeight(), 28)
+                self.assertGreaterEqual(window.sync_all_btn.minimumHeight(), 28)
+                self.assertEqual(window.library_scan_btn.text(), "Rescan folders")
+                self.assertEqual(window.library_scan_btn.toolTip(), "Rescan the library folder for local playlists")
+                self.assertEqual(window.library_cleanup_btn.text(), "Clean library")
+                self.assertIn("orphan files", window.library_cleanup_btn.toolTip())
             finally:
                 window.close()
                 window.deleteLater()
+
+    def test_library_cleanup_summary_explains_safe_and_shared_items(self):
+        report = {
+            "orphan_files": ["/library/Playlist/old.mp3"],
+            "loose_root_files": ["/library/loose.mp3"],
+            "duplicate_track_entries": [{"playlist_name": "Playlist", "indexes": [2]}],
+            "nested_playlists": [
+                {"playlist_dir": "/library/Parent/Child", "target_dir": "/library/Child", "can_flatten": True},
+                {"playlist_dir": "/library/Parent/Other", "target_dir": "/library/Other", "can_flatten": False},
+            ],
+            "exact_duplicate_copies": 4,
+            "exact_duplicate_bytes": 12 * 1024 * 1024,
+            "duplicate_sources": [["/library/One", "/library/Two"]],
+            "errors": [],
+        }
+        headline, details = qt_app.QtMusic2MP3Window._library_cleanup_summary(report)
+
+        self.assertIn("4 safe cleanup action(s)", headline)
+        self.assertIn("Shared copies kept: 4 (12.0 MiB)", headline)
+        self.assertIn("Nested playlist conflicts: 1", headline)
+        self.assertIn("old.mp3", details)
+
+    def test_library_cleanup_analysis_runs_in_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = self._make_window(Path(tmp))
+            try:
+                with patch.object(window, "_present_library_cleanup_report") as present:
+                    window._start_library_cleanup()
+                    cleanup_thread = window._cleanup_thread
+                    self.assertIsNotNone(cleanup_thread)
+                    deadline = time.monotonic() + 3
+                    while cleanup_thread.isRunning() and time.monotonic() < deadline:
+                        _app().processEvents()
+                        time.sleep(0.01)
+                    _app().processEvents()
+
+                self.assertFalse(cleanup_thread.isRunning())
+                present.assert_called_once()
+                self.assertIsNone(window._cleanup_worker)
+                self.assertIsNone(window._cleanup_thread)
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_needs_attention_counts_and_opens_failed_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Problem Playlist"
+            manifest = build_manifest(
+                playlist_name="Problem Playlist",
+                playlist_dir=playlist_dir,
+                source={"type": "spotify", "url": "https://open.spotify.com/playlist/problems"},
+                settings={},
+                tracks=[
+                    {
+                        "idx": 7,
+                        "title": "Needs Review",
+                        "artists": "Artist",
+                        "status": "failed",
+                        "file": "",
+                        "error": "AI suggested candidate. Manual validation required.",
+                        "suggested_url": "https://youtu.be/review",
+                    },
+                    {
+                        "idx": 8,
+                        "title": "Missing File",
+                        "artists": "Artist",
+                        "status": "done",
+                        "file": "Missing File.mp3",
+                    },
+                ],
+            )
+            write_manifest(playlist_dir, manifest)
+            window = self._make_window(root)
+            try:
+                self.assertEqual(window.needs_attention_btn.text(), "Needs attention · 2")
+                self.assertEqual(window.needs_attention_btn.objectName(), "attentionButtonActive")
+                self.assertEqual(window._attention_items[0]["kind"], "review")
+
+                with (
+                    patch("qt_app.NeedsAttentionDialog") as dialog_cls,
+                    patch.object(window, "_show_error_dialog") as show_error,
+                ):
+                    dialog = dialog_cls.return_value
+                    dialog.exec.return_value = qt_app.QDialog.DialogCode.Accepted
+                    dialog.selected_item.return_value = dict(window._attention_items[0])
+                    window._show_needs_attention()
+
+                show_error.assert_called_once_with(7)
+                self.assertEqual(window._selected_playlist_idx, 0)
+                self.assertEqual(window._errors[7][2], "https://youtu.be/review")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_needs_attention_dialog_exposes_selected_item(self):
+        dialog = qt_app.NeedsAttentionDialog([{
+            "playlist_name": "Playlist",
+            "track_idx": 4,
+            "title": "Track",
+            "artists": "Artist",
+            "kind": "failed",
+            "issue": "Download failed",
+            "error": "yt-dlp failed",
+            "candidate_url": "https://youtu.be/retry",
+        }])
+        try:
+            self.assertEqual(dialog.selected_item()["track_idx"], 4)
+            self.assertEqual(dialog.table.item(0, 3).text(), "Retry")
+        finally:
+            dialog.close()
+            dialog.deleteLater()
 
     def test_hover_tooltips_describe_icon_and_flag_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -333,7 +516,24 @@ class QtAppSmokeTests(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
-    def test_bandcamp_manifest_is_syncable(self):
+    def test_quick_options_show_their_state_in_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = self._make_window(Path(tmp))
+            try:
+                self.assertEqual(window.flag_btns["incremental_update"].text(), "Incremental  ON")
+                self.assertEqual(window.flag_btns["safe_search"].text(), "Safe search  ON")
+                self.assertEqual(window.flag_btns["ai_match_enabled"].text(), "AI assist  OFF")
+                self.assertEqual(window.flag_btns["generate_m3u"].text(), "M3U  ON")
+                self.assertEqual(window.flag_btns["prefix_numbers"].text(), "Number files  OFF")
+
+                with patch.object(window, "_save_config"):
+                    window._toggle_flag("safe_search")
+                self.assertEqual(window.flag_btns["safe_search"].text(), "Safe search  OFF")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_bandcamp_manifest_is_not_syncable_while_source_is_backlogged(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             playlist_dir = root / "Bandcamp Release"
@@ -353,9 +553,9 @@ class QtAppSmokeTests(unittest.TestCase):
             window = self._make_window(root)
             try:
                 self.assertEqual(len(window.library_items), 1)
-                self.assertTrue(window._manifest_is_syncable(window.library_items[0]))
+                self.assertFalse(window._manifest_is_syncable(window.library_items[0]))
                 window._on_playlist_item_clicked(0)
-                self.assertTrue(window.sync_btn.isEnabled())
+                self.assertFalse(window.sync_btn.isEnabled())
             finally:
                 window.close()
                 window.deleteLater()
@@ -487,6 +687,50 @@ class QtAppSmokeTests(unittest.TestCase):
                 self.assertIsNone(window._session_playlist)
                 self.assertEqual(len(window._playlist_item_widgets), len(window.library_items))
                 self.assertEqual([w._name_lbl.text() for w in window._playlist_item_widgets], ["Test"])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_done_after_fresh_conversion_selects_downloaded_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playlist_dir = root / "Fresh Playlist"
+            manifest = build_manifest(
+                playlist_name="Fresh Playlist",
+                playlist_dir=playlist_dir,
+                source={
+                    "type": "spotify",
+                    "url": "https://open.spotify.com/playlist/fresh",
+                    "name": "Fresh Playlist",
+                },
+                settings={},
+                tracks=[
+                    {
+                        "idx": 1,
+                        "title": "Downloaded Track",
+                        "artists": "Artist",
+                        "status": "done",
+                        "format": "MP3",
+                        "file": "Artist - Downloaded Track.mp3",
+                    }
+                ],
+            )
+            write_manifest(playlist_dir, manifest)
+            (playlist_dir / "Artist - Downloaded Track.mp3").write_bytes(b"audio")
+
+            window = self._make_window(root)
+            try:
+                window._session_playlist = {"name": "Fresh Playlist", "source_type": "spotify", "count": 1}
+                window._selected_playlist_idx = -1
+                window._ensure_row(1, "Downloaded Track", "Artist")
+                window._total_tracks = 1
+
+                window._on_done(str(playlist_dir))
+
+                self.assertIsNone(window._session_playlist)
+                self.assertEqual(Path(window._selected_library_manifest()["playlist_dir"]).resolve(), playlist_dir.resolve())
+                self.assertEqual(window.table.rowCount(), 1)
+                self.assertEqual(window.table.item(0, 4).text(), "● done")
             finally:
                 window.close()
                 window.deleteLater()
@@ -728,13 +972,51 @@ class QtAppSmokeTests(unittest.TestCase):
             window = self._make_window(root)
             try:
                 window._load_csv_file(str(csv_path))
-                window._on_playlist_item_clicked(-1)
 
                 self.assertEqual(window.csv_path, str(csv_path))
                 self.assertEqual(window.loaded_source_info["type"], "csv")
+                self.assertEqual(window._session_playlist["count"], 1)
                 self.assertEqual(window.table.rowCount(), 1)
+                self.assertEqual(window.table.item(0, 0).text(), "01")
                 self.assertTrue(window.convert_btn.isEnabled())
                 self.assertEqual(window.hero_title_label.text(), "session")
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_remote_source_load_previews_tracks_without_extra_click(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "spotify.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Track Name", "Artist Name(s)", "Album Name", "Duration (ms)"],
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Track Name": "DIS_GUSTING [EXPROZ_RMX]",
+                    "Artist Name(s)": "KRUELTY, DEATH CODE",
+                    "Album Name": "",
+                    "Duration (ms)": "206000",
+                })
+
+            window = self._make_window(root)
+            try:
+                window._on_source_loaded({
+                    "csv_path": str(csv_path),
+                    "playlist_name": "Hard Techno",
+                    "count": 1,
+                    "source": "Spotify",
+                    "source_type": "spotify",
+                    "source_url": "https://open.spotify.com/playlist/demo",
+                })
+
+                self.assertEqual(window._selected_playlist_idx, -1)
+                self.assertEqual(window.table.rowCount(), 1)
+                self.assertEqual(window.table.item(0, 0).text(), "01")
+                self.assertEqual(window.hero_title_label.text(), "Hard Techno")
+                self.assertTrue(window.convert_btn.isEnabled())
             finally:
                 window.close()
                 window.deleteLater()
@@ -859,9 +1141,13 @@ class QtAppSmokeTests(unittest.TestCase):
                 "ai_match_enabled": False,
                 "ai_match_model": "gemini-2.5-flash",
                 "ai_match_prompt": "Custom prompt",
+                "cookies_path": "/tmp/cookies.txt",
+                "cookies_from_browser": "safari",
+                "cookies_browser_profile": "",
             })
         try:
             self.assertIn("keychain", dlg.ai_key_edit.placeholderText().lower())
+            self.assertFalse(hasattr(dlg, "slskd_key_edit"))
             dlg.ai_enabled_cb.setChecked(True)
             dlg.ai_key_edit.setText("test-google-key")
 
@@ -871,10 +1157,22 @@ class QtAppSmokeTests(unittest.TestCase):
             self.assertEqual(values["ai_match_provider"], "vertex")
             self.assertEqual(values["ai_match_model"], "gemini-2.5-flash")
             self.assertEqual(values["ai_match_prompt"], "Custom prompt")
+            self.assertEqual(values["cookies_path"], "/tmp/cookies.txt")
+            self.assertEqual(values["cookies_from_browser"], "safari")
+            self.assertEqual(values["cookies_browser_profile"], "")
             self.assertEqual(values["_ai_api_key"], "test-google-key")
+            self.assertNotIn("slskd_enabled", values)
+            self.assertNotIn("_slskd_api_key", values)
         finally:
             dlg.close()
             dlg.deleteLater()
+
+    def test_soulseek_query_from_track_uses_artist_and_title(self):
+        query = qt_app.QtMusic2MP3Window._soulseek_query_from_track({
+            "title": "Track",
+            "artists": ["Artist", "Guest"],
+        })
+        self.assertEqual(query, "Artist Guest Track")
 
 
 if __name__ == "__main__":

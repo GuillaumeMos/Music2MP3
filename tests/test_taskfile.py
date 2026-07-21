@@ -12,6 +12,12 @@ class TaskfileTests(unittest.TestCase):
         self.assertNotIn(" app.py", run_block)
         self.assertIn(" app.py", tk_block)
 
+    def test_install_prepares_qt_runtime(self):
+        text = Path("Taskfile.yml").read_text(encoding="utf-8")
+        install_block = _task_block(text, "install")
+
+        self.assertIn("devtools/prepare_qt_runtime.py", install_block)
+
 
 def _task_block(text: str, task_name: str) -> str:
     lines = text.splitlines()
